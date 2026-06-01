@@ -26,6 +26,7 @@ import torch
 
 from Model.model import RDTForCausalLM
 from Model.posttrain.logprobs import token_logprobs_with_mask
+from Model.posttrain.masking import completion_mask_excluding_tool_results
 
 
 def group_normalized_advantages(
@@ -60,6 +61,8 @@ class GRPOConfig:
     max_new_tokens: int = 64
     temperature: float = 1.0
     top_p: float | None = None
+    tool_result_open_ids: list[int] | None = None
+    tool_result_close_ids: list[int] | None = None
 
 
 def grpo_loss(
@@ -178,6 +181,12 @@ def grpo_step(
 
     for idx, prompt in enumerate(prompts):
         seqs, mask = sample_group(policy, prompt, cfg, eos_id=eos_id, pad_id=pad_id)
+        if cfg.tool_result_open_ids and cfg.tool_result_close_ids:
+            # Externally injected tool-result tokens were not sampled by the
+            # policy -> exclude them from the RL objective.
+            mask = completion_mask_excluding_tool_results(
+                mask, seqs, cfg.tool_result_open_ids, cfg.tool_result_close_ids
+            )
         responses = [decode(seqs[g, prompt.shape[0]:]) for g in range(seqs.shape[0])]
         rewards = reward_fn(responses, idx).float()
         adv = group_normalized_advantages(rewards, cfg.group_size)
