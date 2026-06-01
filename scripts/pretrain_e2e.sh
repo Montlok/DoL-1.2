@@ -28,6 +28,11 @@
 #   CONFIG          train_rdt config (default two_stage_pretrain)
 #   MAX_STEPS       training steps (default 100000)
 #   TRAIN_ARGS      extra args forwarded verbatim to scripts/train_rdt
+#   MIX_MANIFEST    optional token-weighted mix manifest (JSON). When set, the
+#                   packed shards are built from a weighted mixture of the
+#                   sources it lists (hitting target language/domain token
+#                   proportions) instead of a plain concatenation. See
+#                   Tokenizer/tools/build_corpus_mix.py for the schema.
 
 set -euo pipefail
 
@@ -49,6 +54,7 @@ MAX_STEPS="${MAX_STEPS:-100000}"
 PRECISION="${PRECISION:-bf16}"
 MAMBA="${MAMBA:-auto}"
 TRAIN_ARGS="${TRAIN_ARGS:-}"
+MIX_MANIFEST="${MIX_MANIFEST:-}"
 
 if [ "$SMOKE" = "1" ]; then
     # Tiny, fast, dependency-light defaults for the local self-test.
@@ -79,6 +85,7 @@ ALL_JSONL="$CORPUS_DIR/all.jsonl"
 MORPHBPE_JSON="$TOK_DIR/morphbpe.json"
 GENERAL_JSON="$TOK_DIR/general.json"
 SHARD_JSONL="$DATA_DIR/shard-00.jsonl"
+MIX_REPORT="$DATA_DIR/mix-report.json"
 
 log() { printf '\n==> %s\n' "$*"; }
 
@@ -165,7 +172,10 @@ else
         fi
     done
 fi
-cat "$MN_JSONL" "$GENERAL_JSONL" > "$ALL_JSONL"
+if [ -z "$MIX_MANIFEST" ]; then
+    # Default: plain concatenation (byte-proportional mixture).
+    cat "$MN_JSONL" "$GENERAL_JSONL" > "$ALL_JSONL"
+fi
 echo "mn lines:      $(wc -l < "$MN_JSONL")"
 echo "general lines: $(wc -l < "$GENERAL_JSONL")"
 
@@ -192,6 +202,23 @@ if [ -s "$BUNDLE_DIR/config.json" ]; then
 else
     python3 -m Tokenizer.tools.build_unified_tokenizer \
         --morphbpe "$MORPHBPE_JSON" --general "$GENERAL_JSON" --output "$BUNDLE_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 2b: token-weighted corpus mix (optional)
+# ---------------------------------------------------------------------------
+if [ -n "$MIX_MANIFEST" ]; then
+    log "[2b] building token-weighted corpus mix"
+    if [ -s "$ALL_JSONL" ]; then
+        echo "weighted mix already built, skipping"
+    else
+        # Measure exact tokens with the freshly built bundle, then up/down-sample
+        # each source to hit the manifest's target language/domain proportions.
+        python3 -m Tokenizer.tools.build_corpus_mix \
+            --manifest "$MIX_MANIFEST" --output "$ALL_JSONL" \
+            --tokenizer-bundle "$BUNDLE_DIR" --report "$MIX_REPORT"
+        echo "mix report: $MIX_REPORT"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

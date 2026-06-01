@@ -20,6 +20,14 @@ to ``--output``:
   python -m Tokenizer.tools.prepare_corpus --source wiki \
       --lang ja --limit 20000 --output ja.jsonl
 
+  # Any local parquet dataset (FineMath, OpenWebMath, ...) by text column
+  python -m Tokenizer.tools.prepare_corpus --source parquet \
+      --input "FINEMATH(DO NOT GIT IT)" --text-column text --output math.jsonl
+
+  # Any local .jsonl dataset (e.g. MC2 Mongolian) by text field
+  python -m Tokenizer.tools.prepare_corpus --source jsonl \
+      --input mc2_mn.jsonl --text-column text --output mn_extra.jsonl
+
 The output feeds ``build_morphbpe`` (Mongolian) and ``build_general_bpe``
 (everything else), and later ``build_pretraining_data``.
 """
@@ -229,6 +237,69 @@ def _iter_wiki_local(root: str, lang: str, date: str, limit: int) -> Iterator[st
                     return
 
 
+def _iter_parquet(root: str, text_column: str, limit: int) -> Iterator[str]:
+    """Stream the ``text_column`` from arbitrary local parquet shards.
+
+    ``root`` is a parquet file or a directory of ``*.parquet`` shards (searched
+    recursively). Reading parquet directly keeps generic HF datasets (FineMath,
+    OpenWebMath, MC2, ...) on the offline path that avoids throttled streaming.
+    """
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise SystemExit(
+            f"Missing dependency for --source parquet: {exc}"
+        ) from exc
+
+    if os.path.isdir(root):
+        shards = sorted(glob.glob(os.path.join(root, "**", "*.parquet"), recursive=True))
+    elif root.endswith(".parquet"):
+        shards = [root]
+    else:
+        shards = sorted(glob.glob(root))
+    if not shards:
+        raise SystemExit(f"No parquet shards found under {root!r}")
+
+    count = 0
+    for shard in shards:
+        pf = pq.ParquetFile(shard)
+        if text_column not in pf.schema_arrow.names:
+            raise SystemExit(
+                f"Column {text_column!r} not in {shard!r}; "
+                f"available: {pf.schema_arrow.names}"
+            )
+        for batch in pf.iter_batches(batch_size=1000, columns=[text_column]):
+            for value in batch.column(text_column):
+                text = _clean(str(value.as_py() or ""))
+                if len(text) < _MIN_CHARS:
+                    continue
+                yield text
+                count += 1
+                if limit and count >= limit:
+                    return
+
+
+def _iter_jsonl_text(path: str, text_column: str, limit: int) -> Iterator[str]:
+    """Stream ``text_column`` from a local ``.jsonl`` file (one object/line)."""
+    count = 0
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = _clean(str(obj.get(text_column, "") or ""))
+            if len(text) < _MIN_CHARS:
+                continue
+            yield text
+            count += 1
+            if limit and count >= limit:
+                return
+
+
 def _write(out_path: str, texts: Iterable[str], append: bool) -> int:
     mode = "a" if append else "w"
     written = 0
@@ -243,13 +314,20 @@ def _write(out_path: str, texts: Iterable[str], append: bool) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--source", required=True, choices=["mongolian", "chinese", "wiki"]
+        "--source",
+        required=True,
+        choices=["mongolian", "chinese", "wiki", "parquet", "jsonl"],
     )
-    parser.add_argument("--input", help="root dir/file for mongolian|chinese")
+    parser.add_argument("--input", help="root dir/file for the chosen source")
     parser.add_argument("--output", required=True, help="output JSONL")
     parser.add_argument("--lang", help="wiki language code (en/ja/zh/mn/...)")
     parser.add_argument("--limit", type=int, default=20000, help="wiki doc cap")
     parser.add_argument("--wiki-date", default="20231101", help="wiki snapshot")
+    parser.add_argument(
+        "--text-column",
+        default="text",
+        help="column/field holding the text for --source parquet|jsonl",
+    )
     parser.add_argument(
         "--append", action="store_true", help="append instead of overwrite"
     )
@@ -263,6 +341,14 @@ def main() -> None:
         if not args.input:
             parser.error("--source chinese requires --input")
         texts = _iter_chinese(args.input)
+    elif args.source == "parquet":
+        if not args.input:
+            parser.error("--source parquet requires --input")
+        texts = _iter_parquet(args.input, args.text_column, args.limit)
+    elif args.source == "jsonl":
+        if not args.input:
+            parser.error("--source jsonl requires --input")
+        texts = _iter_jsonl_text(args.input, args.text_column, args.limit)
     else:
         if not args.lang:
             parser.error("--source wiki requires --lang")
