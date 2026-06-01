@@ -8,7 +8,7 @@ import unittest
 
 import torch
 
-from Model.config import RDTConfig
+from Model.config import RDTConfig, TrainingConfig
 from Model.model import RDTForCausalLM
 from Model.posttrain.dpo import DPOConfig, dpo_loss, dpo_step
 
@@ -73,10 +73,10 @@ class DPOStepTest(unittest.TestCase):
         cfg = DPOConfig(beta=0.1)
         loss, m = dpo_step(policy, reference, chosen, cmask, rejected, rmask, cfg)
         # Policy starts equal to reference -> loss is exactly log(2).
-        self.assertAlmostEqual(float(loss), math.log(2), places=4)
+        self.assertAlmostEqual(float(loss.detach()), math.log(2), places=4)
         loss.backward()
         grads = [p.grad for p in policy.parameters() if p.grad is not None]
-        self.assertTrue(len(grads) > 0)
+        self.assertGreater(len(grads), 0)
 
     def test_reference_has_no_grad(self):
         policy, reference = self._models()
@@ -103,6 +103,26 @@ class DPOStepTest(unittest.TestCase):
             DPOConfig(length_normalize=True),
         )
         self.assertFalse(torch.allclose(plain, normed))
+
+    def test_training_reference_helper_freezes_independent_copy(self):
+        from scripts.train_dpo import _build_reference_model
+
+        policy = RDTForCausalLM(_cfg())
+        reference = _build_reference_model(
+            policy,
+            _cfg(),
+            TrainingConfig(parallel="single", max_steps=1, warmup_steps=0),
+            local_rank=0,
+            device=torch.device("cpu"),
+        )
+
+        self.assertFalse(reference.training)
+        self.assertFalse(reference.reverse_loss_enabled)
+        self.assertTrue(all(not p.requires_grad for p in reference.parameters()))
+        first_policy = next(policy.parameters())
+        first_reference = next(reference.parameters())
+        self.assertIsNot(first_policy, first_reference)
+        self.assertTrue(torch.equal(first_policy, first_reference))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import unittest
 
 import torch
 
-from Model.config import RDTConfig
+from Model.config import RDTConfig, TrainingConfig
 from Model.model import RDTForCausalLM
 from Model.posttrain.grpo import (
     GRPOConfig,
@@ -227,6 +227,26 @@ class GRPOIntegrationTest(unittest.TestCase):
 
         self.assertEqual(next(rank0)[0]["id"], 0)
         self.assertEqual(next(rank1)[0]["id"], 0)
+
+    def test_training_reference_helper_freezes_independent_copy(self):
+        from scripts.train_grpo import _build_reference_model
+
+        policy = RDTForCausalLM(_cfg())
+        reference = _build_reference_model(
+            policy,
+            _cfg(),
+            TrainingConfig(parallel="single", max_steps=1, warmup_steps=0),
+            local_rank=0,
+            device=torch.device("cpu"),
+        )
+
+        self.assertFalse(reference.training)
+        self.assertFalse(reference.reverse_loss_enabled)
+        self.assertTrue(all(not p.requires_grad for p in reference.parameters()))
+        first_policy = next(policy.parameters())
+        first_reference = next(reference.parameters())
+        self.assertIsNot(first_policy, first_reference)
+        self.assertTrue(torch.equal(first_policy, first_reference))
 
 
 if __name__ == "__main__":

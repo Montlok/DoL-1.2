@@ -235,6 +235,7 @@ def _save_checkpoint(
     try:
         os.symlink(step_dir.name, latest)
     except OSError:
+        # Some filesystems disallow symlinks; the step dir remains valid.
         pass
     return step_dir
 

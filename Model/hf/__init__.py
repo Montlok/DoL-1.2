@@ -17,6 +17,7 @@ try:
     AutoConfig.register("rdt", RDTHFConfig)
     AutoModelForCausalLM.register(RDTHFConfig, RDTForCausalLMHF)
 except ValueError:
+    # Transformers raises when repeated imports register the same classes.
     pass
 
 __all__ = ["RDTHFConfig", "RDTForCausalLMHF"]

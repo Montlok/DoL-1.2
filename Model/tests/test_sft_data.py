@@ -55,7 +55,7 @@ class TemplateTest(unittest.TestCase):
         ]
         text = render_text(msgs)
         self.assertIn(ROLE_SENTINELS["user"], text)
-        self.assertTrue(text.index("hi") < text.index("yo"))
+        self.assertLess(text.index("hi"), text.index("yo"))
 
 
 class SFTMaskingTest(unittest.TestCase):

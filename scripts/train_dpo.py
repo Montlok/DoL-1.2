@@ -3,7 +3,7 @@
 """RDT Direct Preference Optimization (DPO) training entry point.
 
 Production-usable offline alignment. Loads a policy from an SFT checkpoint,
-clones a frozen reference from the same weights, and optimizes the DPO loss over
+builds a frozen reference from the same weights, and optimizes the DPO loss over
 a preference JSONL (``{messages|prompt, chosen, rejected}``). Reuses the
 project's optimizer/scheduler/checkpoint utilities and the SFT-consistent
 preference masking.
@@ -18,7 +18,6 @@ Usage::
 """
 
 import argparse
-import copy
 import os
 import sys
 import time
@@ -231,6 +230,32 @@ def _maybe_init_from_checkpoint(model: RDTForCausalLM, path: str) -> None:
         print(f"[init] loaded {path} (missing={len(missing)} unexpected={len(unexpected)})")
 
 
+def _build_reference_model(
+    policy: RDTForCausalLM,
+    model_cfg: RDTConfig,
+    train_cfg: TrainingConfig,
+    local_rank: int,
+    device: torch.device,
+) -> torch.nn.Module:
+    reference = RDTForCausalLM(model_cfg)
+    reference.load_state_dict(policy.state_dict())
+    reference.reverse_loss_enabled = False
+    reference.eval()
+    for param in reference.parameters():
+        param.requires_grad_(False)
+
+    if (
+        train_cfg.parallel == "fsdp"
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        return apply_parallelism(reference, train_cfg, local_rank).eval()
+
+    # DDP does not shard parameters and can reject modules with no trainable
+    # parameters, so a frozen reference only benefits from FSDP wrapping.
+    return reference.to(device).eval()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     rc = _validate_args(args)
@@ -248,14 +273,12 @@ def main(argv: list[str] | None = None) -> int:
 
     policy = RDTForCausalLM(model_cfg)
     _maybe_init_from_checkpoint(policy, args.init_checkpoint)
-    policy = policy.to(device)
-    # Frozen reference: a snapshot of the initial (SFT) policy.
-    reference = copy.deepcopy(policy).to(device).eval()
-    for param in reference.parameters():
-        param.requires_grad_(False)
     # DPO scores only the explicit objective; drop the reverse auxiliary loss.
     policy.reverse_loss_enabled = False
-    reference.reverse_loss_enabled = False
+    reference = _build_reference_model(
+        policy, model_cfg, train_cfg, local_rank, device
+    )
+    policy = policy.to(device)
 
     optimizer = build_optimizer(policy, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)

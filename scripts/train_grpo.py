@@ -3,7 +3,7 @@
 """RDT GRPO (Group Relative Policy Optimization) training entry point.
 
 Production-usable online RL with **verifiable** rewards (no reward model). Loads
-a policy from an SFT/DPO checkpoint, clones a frozen reference, samples a group
+a policy from an SFT/DPO checkpoint, builds a frozen reference, samples a group
 of responses per prompt via the native ``generate()``, scores them with
 rule-based rewards (exact/numeric match, Mongolian script purity, ``<think>``
 format), normalizes advantages within each group, and takes a clipped
@@ -20,7 +20,6 @@ Usage::
 """
 
 import argparse
-import copy
 import os
 import sys
 import time
@@ -214,6 +213,32 @@ def _maybe_init_from_checkpoint(model: RDTForCausalLM, path: str) -> None:
         print(f"[init] loaded {path} (missing={len(missing)} unexpected={len(unexpected)})")
 
 
+def _build_reference_model(
+    policy: RDTForCausalLM,
+    model_cfg: RDTConfig,
+    train_cfg: TrainingConfig,
+    local_rank: int,
+    device: torch.device,
+) -> torch.nn.Module:
+    reference = RDTForCausalLM(model_cfg)
+    reference.load_state_dict(policy.state_dict())
+    reference.reverse_loss_enabled = False
+    reference.eval()
+    for param in reference.parameters():
+        param.requires_grad_(False)
+
+    if (
+        train_cfg.parallel == "fsdp"
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        return apply_parallelism(reference, train_cfg, local_rank).eval()
+
+    # DDP does not shard parameters and can reject modules with no trainable
+    # parameters, so a frozen reference only benefits from FSDP wrapping.
+    return reference.to(device).eval()
+
+
 def _iter_prompt_batches(
     dataset,
     batch_size: int,
@@ -267,12 +292,11 @@ def main(argv: list[str] | None = None) -> int:
 
     policy = RDTForCausalLM(model_cfg)
     _maybe_init_from_checkpoint(policy, args.init_checkpoint)
-    policy = policy.to(device)
-    reference = copy.deepcopy(policy).to(device).eval()
-    for param in reference.parameters():
-        param.requires_grad_(False)
     policy.reverse_loss_enabled = False
-    reference.reverse_loss_enabled = False
+    reference = _build_reference_model(
+        policy, model_cfg, train_cfg, local_rank, device
+    )
+    policy = policy.to(device)
 
     optimizer = build_optimizer(policy, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)
