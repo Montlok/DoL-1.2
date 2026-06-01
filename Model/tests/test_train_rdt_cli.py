@@ -65,6 +65,27 @@ class TrainRdtCliGuardsTest(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("zero shards", stderr.getvalue())
 
+    def test_empty_eval_shard_glob_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+
+            data = os.path.join(tmp, "train.jsonl")
+            with open(data, "w", encoding="utf-8") as fh:
+                fh.write(
+                    '{"input_ids":[2,3],"attention_mask":[1,1],'
+                    '"labels":[-100,3]}\n'
+                )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = train_rdt.main([
+                    "--config", "tiny",
+                    "--output", tmp,
+                    "--data", data,
+                    "--eval-data", f"{tmp}/no_eval_shards_*.jsonl",
+                ])
+            self.assertEqual(rc, 2)
+            self.assertIn("--eval-data", stderr.getvalue())
+
     def test_smoke_runs_without_data(self) -> None:
         # --smoke explicitly opts into the synthetic batch generator.
         with tempfile.TemporaryDirectory() as tmp:

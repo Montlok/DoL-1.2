@@ -27,6 +27,7 @@
 #   MAX_LENGTH      packed sequence length for shards (default 2048)
 #   CONFIG          train_rdt config (default two_stage_pretrain)
 #   MAX_STEPS       training steps (default 100000)
+#   MAMBA           Mamba backend for train_rdt (default official; smoke naive)
 #   TRAIN_ARGS      extra args forwarded verbatim to scripts/train_rdt
 #   MIX_MANIFEST    optional token-weighted mix manifest (JSON). When set, the
 #                   packed shards are built from a weighted mixture of the
@@ -52,7 +53,7 @@ MAX_LENGTH="${MAX_LENGTH:-2048}"
 CONFIG="${CONFIG:-two_stage_pretrain}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 PRECISION="${PRECISION:-bf16}"
-MAMBA="${MAMBA:-auto}"
+MAMBA="${MAMBA:-official}"
 TRAIN_ARGS="${TRAIN_ARGS:-}"
 MIX_MANIFEST="${MIX_MANIFEST:-}"
 

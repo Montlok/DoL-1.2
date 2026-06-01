@@ -332,6 +332,7 @@ def build_dataloader(
     pad_id: int = PAD_ID,
     ignore_index: int = IGNORE_INDEX,
     infinite: bool = True,
+    drop_last: bool = True,
     image_processor: Any = None,
     omvt_cfg: Any = None,
 ) -> DataLoader:
@@ -371,7 +372,7 @@ def build_dataloader(
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
         collate_fn=collator,
-        drop_last=True,
+        drop_last=drop_last,
         persistent_workers=cfg.num_workers > 0,
     )
 

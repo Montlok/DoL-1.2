@@ -3,8 +3,10 @@
 import unittest
 
 import torch
+import torch.nn as nn
 
 from Model.config import RDTConfig
+import Model.layers.mamba3_layer as mamba3_layer
 from Model.model import RDTForCausalLM
 
 
@@ -204,6 +206,29 @@ class GenerateTest(unittest.TestCase):
             prompt, max_new_tokens=4, greedy=True, recurrent_steps=2, use_cache=True
         )
         self.assertTrue(torch.equal(free, cached))
+
+    def test_use_cache_rejects_official_mamba_backend_early(self):
+        class FakeOfficialMamba3(nn.Module):
+            def __init__(self, **kwargs):
+                super().__init__()
+
+            def forward(self, x):
+                return x
+
+        old = mamba3_layer.OfficialMamba3
+        mamba3_layer.OfficialMamba3 = FakeOfficialMamba3
+        try:
+            cfg = _cfg()
+            cfg.core_type = "two_stage"
+            cfg.stage1_mamba_layers = 1
+            cfg.stage2_attn_layers = 1
+            cfg.use_official_mamba = True
+            model = RDTForCausalLM(cfg)
+            prompt = torch.tensor([[cfg.bos_id, 300, 301]])
+            with self.assertRaisesRegex(NotImplementedError, "NaiveSSM"):
+                model.generate(prompt, max_new_tokens=1, use_cache=True)
+        finally:
+            mamba3_layer.OfficialMamba3 = old
 
     def test_sampling_respects_top_k_one_equals_greedy(self):
         torch.manual_seed(0)

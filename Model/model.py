@@ -56,6 +56,11 @@ class RDTForCausalLM(nn.Module):
         else:
             self.reverse_head = None
 
+        # Runtime toggle: alignment phases (SFT/DPO/GRPO) disable the
+        # bidirectional reverse-LM auxiliary loss so it does not pollute the
+        # supervised/preference gradient. Pretraining keeps it enabled.
+        self.reverse_loss_enabled = True
+
         self.apply(self._init_weights)
 
         if cfg.tie_word_embeddings:
@@ -238,7 +243,7 @@ class RDTForCausalLM(nn.Module):
         loss = forward
         parts = {"forward": float(forward.detach())}
 
-        if self.reverse_head is not None:
+        if self.reverse_head is not None and self.reverse_loss_enabled:
             rev_logits = self.reverse_head(h)
             reverse = self._reverse_loss(rev_logits, labels)
             loss = loss + self.cfg.reverse_loss_weight * reverse
@@ -262,7 +267,7 @@ class RDTForCausalLM(nn.Module):
         loss = forward
         parts = {"forward": float(forward.detach())}
 
-        if self.reverse_head is not None:
+        if self.reverse_head is not None and self.reverse_loss_enabled:
             reverse = self._chunked_reverse_loss(
                 h,
                 labels,
@@ -604,6 +609,12 @@ class RDTForCausalLM(nn.Module):
         if use_cache and self.cfg.core_type != "two_stage":
             raise NotImplementedError(
                 "use_cache=True is only supported for core_type='two_stage'"
+            )
+        if use_cache and self.cfg.use_official_mamba:
+            raise NotImplementedError(
+                "use_cache=True requires the NaiveSSM fallback backend; "
+                "official Mamba kernels are not steppable by the decode cache. "
+                "Pass --mamba=naive for cached decoding or use_cache=False."
             )
 
         cfg = self.cfg

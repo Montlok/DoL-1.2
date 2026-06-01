@@ -26,7 +26,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from Model.config import (
+from Model.config import (  # noqa: E402
     PAD_ID,
     RDTConfig,
     TrainingConfig,
@@ -37,19 +37,20 @@ from Model.config import (
     two_stage_pretrain_config,
     two_stage_tiny_config,
 )
-from Model.model import RDTForCausalLM
+from Model.model import RDTForCausalLM  # noqa: E402
 from Model.layers.mamba3_layer import official_available  # noqa: E402
-from Model.training import (
+from Model.training import (  # noqa: E402
     PretrainingCollator,
     RankZeroLogger,
     TrainState,
+    add_multimodal_args,
     apply_parallelism,
     build_dataloader,
     build_image_processor,
     build_omvt_cfg,
-    add_multimodal_args,
     build_optimizer,
     build_scheduler,
+    evaluate,
     init_distributed,
     is_main_process,
     resume_state,
@@ -100,6 +101,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--eval-every", type=int, default=1000)
+    p.add_argument("--eval-max-batches", type=int, default=32)
     p.add_argument("--bptt-window", type=int, default=None)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--dist-backend", choices=["nccl", "gloo"], default="nccl")
@@ -201,6 +204,8 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         output_dir=args.output,
         save_every=args.save_every,
         log_every=args.log_every,
+        eval_every=args.eval_every,
+        eval_max_batches=args.eval_max_batches,
         bptt_window=args.bptt_window,
         seed=args.seed,
         resume=args.resume,
@@ -258,7 +263,43 @@ def _validate_args(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.eval_data:
+            eval_shards = _resolve_shards(args.eval_data)
+            if not eval_shards:
+                print(
+                    f"scripts/train_rdt: --eval-data resolved zero shards: "
+                    f"{args.eval_data!r}",
+                    file=sys.stderr,
+                )
+                return 2
     return 0
+
+
+def _evaluate_distributed(
+    model,
+    eval_loader,
+    train_cfg: TrainingConfig,
+    *,
+    device: torch.device,
+) -> dict[str, float]:
+    metrics = evaluate(
+        model,
+        eval_loader,
+        train_cfg,
+        device=device,
+        max_batches=train_cfg.eval_max_batches,
+    )
+    tokens = float(metrics["eval_tokens"])
+    loss_sum = float(metrics["eval_loss"]) * tokens
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        packed = torch.tensor([loss_sum, tokens], device=device, dtype=torch.float64)
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+        loss_sum = float(packed[0].item())
+        tokens = float(packed[1].item())
+    return {
+        "eval_loss": loss_sum / max(1.0, tokens),
+        "eval_tokens": tokens,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -317,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.smoke:
         batch_iter = _smoke_batches(model_cfg, train_cfg)
+        eval_loader = None
     else:
         dataloader = build_dataloader(
             train_cfg.train_data,
@@ -328,6 +370,19 @@ def main(argv: list[str] | None = None) -> int:
             omvt_cfg=omvt_cfg,
         )
         batch_iter = iter(dataloader)
+        eval_loader = None
+        if train_cfg.eval_data:
+            eval_loader = build_dataloader(
+                train_cfg.eval_data,
+                replace(train_cfg, shuffle_buffer=0),
+                world_size=world_size,
+                rank=rank,
+                pad_id=PAD_ID,
+                infinite=False,
+                drop_last=False,
+                image_processor=build_image_processor(args),
+                omvt_cfg=omvt_cfg,
+            )
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=train_cfg.tensorboard)
     t0 = time.time()
@@ -351,6 +406,21 @@ def main(argv: list[str] | None = None) -> int:
                 logger.log(state.step, {**metrics, "throughput": throughput_str(tokens_window, dt)})
                 t0 = time.time()
                 tokens_window = 0
+
+            if (
+                eval_loader is not None
+                and train_cfg.eval_every
+                and state.step % train_cfg.eval_every == 0
+            ):
+                logger.log(
+                    state.step,
+                    _evaluate_distributed(
+                        model,
+                        eval_loader,
+                        train_cfg,
+                        device=device,
+                    ),
+                )
 
             if (
                 train_cfg.save_every

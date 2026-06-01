@@ -8,7 +8,12 @@ import tempfile
 import unittest
 
 from Tokenizer.morphbpe import MorphBPETrainer
-from Tokenizer.pretraining import IGNORE_INDEX, PretrainingDataBuilder, pack_samples
+from Tokenizer.pretraining import (
+    IGNORE_INDEX,
+    PretrainingDataBuilder,
+    iter_pack_samples,
+    pack_samples,
+)
 from Tokenizer.unified.bundle import TokenizerBundle
 
 
@@ -160,6 +165,26 @@ class PretrainingBuilderTest(unittest.TestCase):
         self.assertEqual(len(packed[0].word_pos), len(packed[0].input_ids))
         self.assertGreater(max(packed[0].word_pos), max(first.word_pos))
 
+    def test_iter_pack_samples_matches_list_pack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = build_smoke_bundle(tmp)
+            builder = PretrainingDataBuilder(
+                bundle, max_length=64, add_bos=False, add_eos=False
+            )
+            samples = [
+                builder.encode_text("hello"),
+                builder.encode_text("test"),
+                builder.encode_text("ᠮᠣᠩᠭᠣᠯ"),
+            ]
+            kwargs = {
+                "max_length": 64,
+                "pad_id": bundle.tokenizer.vocab["<pad>"],
+                "eos_id": bundle.tokenizer.vocab["<eos>"],
+            }
+            eager = pack_samples(samples, **kwargs)
+            streamed = list(iter_pack_samples(iter(samples), **kwargs))
+        self.assertEqual(eager, streamed)
+
     def test_pack_samples_can_pad_to_max_length(self):
         with tempfile.TemporaryDirectory() as tmp:
             bundle = build_smoke_bundle(tmp)
@@ -286,6 +311,43 @@ class PretrainingBuilderTest(unittest.TestCase):
         self.assertEqual(len(row["input_ids"]), len(row["morph_depth"]))
         self.assertEqual(len(row["input_ids"]), 16)
         self.assertEqual(row["labels"][-1], IGNORE_INDEX)
+
+    def test_build_pretraining_data_cli_can_rotate_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = build_smoke_bundle(tmp)
+            bundle_dir = os.path.join(tmp, "bundle")
+            bundle.save_dir(bundle_dir)
+            inp = os.path.join(tmp, "input.jsonl")
+            out = os.path.join(tmp, "out.jsonl")
+            with open(inp, "w", encoding="utf-8") as f:
+                for text in ("ᠮᠣᠩᠭᠣᠯ", "hello"):
+                    f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "Tokenizer.tools.build_pretraining_data",
+                    "--tokenizer-bundle",
+                    bundle_dir,
+                    "--input",
+                    inp,
+                    "--output",
+                    out,
+                    "--max-length",
+                    "64",
+                    "--shard-sample-budget",
+                    "1",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            summary = json.loads(proc.stdout)
+            shards = summary["shards"]
+        self.assertEqual(summary["num_samples"], 2)
+        self.assertEqual(len(shards), 2)
+        self.assertTrue(shards[0].endswith("out-00000.jsonl"))
+        self.assertTrue(shards[1].endswith("out-00001.jsonl"))
 
 
 if __name__ == "__main__":

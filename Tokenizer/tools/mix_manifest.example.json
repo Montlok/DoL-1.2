@@ -16,13 +16,13 @@
     {"path": "DO NOT GIT IT/WIKIPEDIA(DO NOT GIT IT)/20231101.zh/*.parquet",
      "lang": "zh", "domain": "general", "weight": 0.13, "text_column": "text", "min_chars": 50},
 
-    {"_comment_zhihu": "知乎问答 — colloquial, opinionated Chinese web text for 'vitality'/register diversity so the model is not stiff/encyclopedic-only.",
+    {"_comment_zh_web": "Chinese web Q&A text for colloquial register diversity.",
      "path": "DO NOT GIT IT/CHINESE_WEB(DO NOT GIT IT)/zhihu/*.parquet",
      "lang": "zh", "domain": "web", "weight": 0.05, "text_column": "RESPONSE", "min_chars": 80},
 
-    {"_comment_gov_mn": "内蒙古政府蒙文门户 mgl.nmg.gov.cn (crawled) — official/formal traditional-Mongolian register.",
-     "path": "DO NOT GIT IT/gov_crawl/mgl_gov.jsonl",
-     "lang": "mn", "domain": "official", "weight": 0.05, "text_column": "text", "min_chars": 80},
+    {"_comment_mn_web": "Traditional Mongolian public web text for formal register coverage.",
+     "path": "DO NOT GIT IT/MONGOLIAN_WEB(DO NOT GIT IT)/formal_mn.jsonl",
+     "lang": "mn", "domain": "general", "weight": 0.05, "text_column": "text", "min_chars": 80},
 
     {"path": "DO NOT GIT IT/WIKIPEDIA(DO NOT GIT IT)/20231101.en/*.parquet",
      "lang": "en", "domain": "general", "weight": 0.06, "text_column": "text", "min_chars": 50},
