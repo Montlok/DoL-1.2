@@ -34,14 +34,25 @@ as forbidden merge boundaries only when the stemmer confidence meets the
 configured threshold. Low-confidence analyses are treated as lexical words,
 which prevents false roots like splitting `ᠮᠣᠩᠭᠣᠯ` at final `ᠯ`.
 The trainer also ignores non-Mongolian whitespace-delimited words in mixed
-corpora; Chinese, English, punctuation, and byte fallback tracks are trained
+corpora; all non-Mongolian text is handled by the general byte-level BPE track
 outside MorphBPE. The JSON output follows `serialization.SCHEMA_VERSION == 1`.
 
 ## 3. Build the unified tokenizer
 
-Combine MorphBPE + HF zh + HF en + misc byte fallback through
-`Tokenizer.tools.build_unified_tokenizer` (or programmatically via
-`build_unified_vocab` + `DualTrackTokenizer`).
+Train the general multilingual byte-level BPE track, then combine it with
+MorphBPE through `Tokenizer.tools.build_unified_tokenizer` (or programmatically
+via `build_unified_vocab` + `DualTrackTokenizer`):
+
+```bash
+python3 -m Tokenizer.tools.build_general_bpe \
+    --input general.jsonl --output general.json --vocab-size 40000
+python3 -m Tokenizer.tools.build_unified_tokenizer \
+    --morphbpe morphbpe.json --general general.json --output bundle/
+```
+
+The general track is byte-level, so Chinese, English, Japanese, Cyrillic, digits
+and punctuation all encode without `<unk>`. Omitting `--general` falls back to a
+training-free minimal byte-level model.
 
 ## 4. Encode mixed text
 

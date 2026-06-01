@@ -42,9 +42,7 @@ _FALLBACK_SPECIAL_TOKENS = {
 _FALLBACK_SEGMENT = {
     "special": (0, 256),
     "mongolian": (256, 24576),
-    "chinese": (24576, 49152),
-    "english": (49152, 63488),
-    "misc": (63488, 65536),
+    "general": (24576, 65536),
 }
 
 try:

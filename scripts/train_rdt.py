@@ -34,8 +34,11 @@ from Model.config import (
     pretrain_config,
     small_config,
     tiny_config,
+    two_stage_pretrain_config,
+    two_stage_tiny_config,
 )
 from Model.model import RDTForCausalLM
+from Model.layers.mamba3_layer import official_available  # noqa: E402
 from Model.training import (
     PretrainingCollator,
     RankZeroLogger,
@@ -61,6 +64,8 @@ CONFIG_CHOICES = {
     "small": small_config,
     "base": base_config,
     "pretrain": pretrain_config,
+    "two_stage_tiny": two_stage_tiny_config,
+    "two_stage_pretrain": two_stage_pretrain_config,
 }
 
 
@@ -73,6 +78,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--resume", default="")
     p.add_argument("--dist", choices=["single", "ddp", "fsdp"], default="single")
     p.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
+    p.add_argument(
+        "--mamba",
+        choices=["auto", "official", "naive"],
+        default="auto",
+        help=(
+            "Mamba backend selection. 'auto' (default) uses the official CUDA "
+            "mamba_ssm kernel when importable and otherwise falls back to the "
+            "pure-PyTorch NaiveSSM with a warning; 'official' forces the CUDA "
+            "kernel (errors if mamba_ssm is missing); 'naive' forces the "
+            "fallback. Keeps one-click runs working on hosts without mamba_ssm."
+        ),
+    )
     p.add_argument("--seq-len", type=int, default=None)
     p.add_argument("--micro-batch-size", type=int, default=1)
     p.add_argument("--grad-accum-steps", type=int, default=1)
@@ -110,12 +127,41 @@ def _tri_to_bool(value: str) -> bool | None:
     return value == "on"
 
 
+def _resolve_mamba_backend(cfg: RDTConfig, mode: str) -> RDTConfig:
+    """Apply the ``--mamba`` override so one-click runs survive hosts that lack
+    the CUDA ``mamba_ssm`` kernel.
+
+    * ``official`` forces ``use_official_mamba=True`` (model construction will
+      raise a clear error if the kernel is unimportable).
+    * ``naive`` forces the pure-PyTorch fallback.
+    * ``auto`` keeps the config's request when the kernel is importable, and
+      otherwise downgrades to the fallback with a loud warning instead of
+      crashing at model construction.
+    """
+
+    if mode == "official":
+        return replace(cfg, use_official_mamba=True)
+    if mode == "naive":
+        return replace(cfg, use_official_mamba=False)
+
+    if cfg.use_official_mamba and not official_available():
+        sys.stderr.write(
+            "WARNING: --mamba=auto requested the official mamba_ssm kernel but "
+            "it is not importable (no CUDA build?); falling back to NaiveSSM. "
+            "This is correct but much slower; install mamba-ssm or pass "
+            "--mamba=official to fail fast on a CUDA host.\n"
+        )
+        return replace(cfg, use_official_mamba=False)
+    return cfg
+
+
 def _build_model_cfg(args: argparse.Namespace) -> RDTConfig:
     cfg = CONFIG_CHOICES[args.config]()
     if args.seq_len is not None:
         cfg = replace(cfg, max_seq_len=args.seq_len)
     if args.smoke and args.seq_len is None:
         cfg = replace(cfg, max_seq_len=64)
+    cfg = _resolve_mamba_backend(cfg, args.mamba)
     return cfg
 
 

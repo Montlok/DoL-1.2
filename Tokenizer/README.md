@@ -1,7 +1,9 @@
 # Tokenizer
 
-Routed multi-track tokenizer scaffold for traditional Mongolian, Chinese,
-English, misc byte fallback, and multimodal placeholders.
+Routed two-track tokenizer for traditional Mongolian (MorphBPE) and a general
+multilingual byte-level BPE covering Chinese, English, Japanese and Cyrillic,
+plus multimodal placeholders. Byte-level coverage means non-Mongolian text never
+falls back to `<unk>`.
 
 ## Run tests
 
@@ -15,15 +17,46 @@ python3 -m unittest discover Tokenizer
 python3 -m Tokenizer.unified.dual_tokenizer segment "ᠮᠣᠩᠭᠣᠯ 中文 test <image>"
 ```
 
-## Build MorphBPE and unified tokenizer
+## Build MorphBPE, the general BPE, and the unified tokenizer
 
 ```bash
-python3 -m Tokenizer.tools.build_morphbpe --input corpus.jsonl --output morphbpe.json --vocab-size 4096
-python3 -m Tokenizer.tools.build_unified_tokenizer morphbpe.json unified_tokenizer.json
+# 1. Normalize heterogeneous corpora into UTF-8 JSONL ({"text": ...})
+python3 -m Tokenizer.tools.prepare_corpus --source mongolian \
+    --input "1000 traditional_mongolian_corpus(DO NOT GIT IT)" --output mn.jsonl
+python3 -m Tokenizer.tools.prepare_corpus --source chinese \
+    --input "CHINESE(DO NOT GIT IT)" --output general.jsonl
+python3 -m Tokenizer.tools.prepare_corpus --source wiki \
+    --lang ja --limit 20000 --output general.jsonl --append
+
+# 2. Train the two tracks
+python3 -m Tokenizer.tools.build_morphbpe --input mn.jsonl \
+    --output morphbpe.json --vocab-size 24000
+python3 -m Tokenizer.tools.build_general_bpe --input general.jsonl \
+    --output general.json --vocab-size 40000
+
+# 3. Assemble + validate the unified bundle
+python3 -m Tokenizer.tools.build_unified_tokenizer \
+    --morphbpe morphbpe.json --general general.json --output bundle/
 ```
 
-The unified build command needs `transformers` for real HF vocab extraction; if
-it is missing, the tool exits with a clear dependency error.
+The general BPE trainer needs `tokenizers`; corpus preparation from Wikipedia
+needs `datasets`. Install both with `pip install -e '.[tokenizer-build]'`. If
+`--general` is omitted, a training-free minimal byte-level fallback is used.
+
+## One-click first pretraining
+
+```bash
+# Local self-test (seconds, CPU, synthetic corpus, NaiveSSM fallback)
+SMOKE=1 scripts/pretrain_e2e.sh
+
+# Real run (set the corpus paths to your local data)
+MN_CORPUS="1000 traditional_mongolian_corpus(DO NOT GIT IT)" \
+CN_CORPUS="CHINESE(DO NOT GIT IT)" \
+scripts/pretrain_e2e.sh
+```
+
+The script is stage-gated and idempotent: corpus prep → tokenizer training →
+packed shards → data gate → two-stage mHC pretraining (`two_stage_pretrain`).
 
 ## Use MultimodalProcessor
 

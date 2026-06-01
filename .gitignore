@@ -14,3 +14,10 @@ wandb/
 logs/
 *.pt
 *.bin
+
+# corpora (DO NOT COMMIT — user data)
+*DO NOT GIT IT*/
+1000 traditional_mongolian_corpus（DO NOT GIT IT）/
+CHINESE(DO NOT GIT IT)/
+WIKIPEDIA(DO NOT GIT IT)/
+cookies.txt

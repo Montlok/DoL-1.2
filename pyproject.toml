@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "llm4mglian-tokenizer"
 version = "0.8.0"
-description = "Tokenizer and recurrent-depth transformer for Mongolian + zh/en + multimodal"
+description = "Tokenizer and recurrent-depth transformer for Mongolian + zh/en/ja + multimodal"
 readme = "Tokenizer/README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -14,6 +14,7 @@ dependencies = []
 
 [project.optional-dependencies]
 hf = ["transformers>=4.40", "tokenizers>=0.19"]
+tokenizer-build = ["tokenizers>=0.19", "datasets>=2.0"]
 eval = ["sentencepiece>=0.2"]
 model = ["torch>=2.1"]
 train = ["torch>=2.1", "mamba-ssm>=2.2"]

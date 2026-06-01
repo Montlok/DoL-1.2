@@ -111,11 +111,20 @@ class NaiveSSM(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache=None,
     ) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError("x must have shape [B, L, d_model]")
         if x.shape[-1] != self.d_model:
             raise ValueError(f"expected d_model={self.d_model}, got {x.shape[-1]}")
+
+        if cache is not None:
+            if attn_mask is not None and not bool(attn_mask.all()):
+                raise ValueError(
+                    "NaiveSSM cached decode requires an all-ones attn_mask "
+                    "(no padding); pad-free generation only"
+                )
+            return self._forward_cached(x, cache)
 
         bsz, seq_len, _ = x.shape
         dtype = x.dtype
@@ -189,6 +198,91 @@ class NaiveSSM(nn.Module):
 
         return self.out_proj(y)
 
+    def _forward_cached(self, x: torch.Tensor, cache) -> torch.Tensor:
+        """Bit-exact incremental scan over ``x`` (``[B, m, d_model]``).
+
+        Reuses ``cache.conv_window`` (last ``d_conv - 1`` pre-conv columns) and
+        ``cache.ssm_state`` so that processing the prompt in one call followed
+        by single-token steps reproduces the full :meth:`forward` scan exactly.
+        Both fields are updated in place.
+        """
+
+        bsz, m, _ = x.shape
+        dtype = x.dtype
+        k = self.d_conv
+
+        xz = self.in_proj(x)
+        u_pre, z = xz.chunk(2, dim=-1)
+
+        u_t = u_pre.transpose(1, 2)  # [B, d_inner, m]
+
+        if k > 1:
+            if cache.conv_window is None:
+                window = u_t.new_zeros(bsz, self.d_inner, k - 1)
+            else:
+                window = cache.conv_window
+            conv_in = torch.cat([window, u_t], dim=2)  # [B, d_inner, (k-1)+m]
+            cache.conv_window = conv_in[..., -(k - 1):]
+        else:
+            conv_in = u_t
+
+        conv_out = F.conv1d(
+            conv_in,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            padding=0,
+            groups=self.d_inner,
+        )  # [B, d_inner, m]
+        u = F.silu(conv_out.transpose(1, 2))  # [B, m, d_inner]
+
+        params = self.x_proj(u)
+        dt, b_param, c_param = params.split(
+            [self.nheads, self.d_state, self.d_state],
+            dim=-1,
+        )
+        dt = F.softplus(self.dt_proj(dt))
+
+        u_h = u.reshape(bsz, m, self.nheads, self.headdim)
+        dt_h = dt.reshape(bsz, m, self.nheads, self.headdim)
+
+        a = -torch.exp(self.A_log.float())
+
+        if cache.ssm_state is None:
+            state = torch.zeros(
+                bsz,
+                self.nheads,
+                self.headdim,
+                self.d_state,
+                device=x.device,
+                dtype=torch.float32,
+            )
+        else:
+            state = cache.ssm_state
+
+        ys: list[torch.Tensor] = []
+        for t in range(m):
+            dt_t = dt_h[:, t].float()
+            u_tt = u_h[:, t].float()
+            b_t = b_param[:, t].float().view(bsz, 1, 1, self.d_state)
+            c_t = c_param[:, t].float().view(bsz, 1, 1, self.d_state)
+
+            da = torch.exp(dt_t.unsqueeze(-1) * a.view(1, self.nheads, 1, self.d_state))
+            bu = dt_t.unsqueeze(-1) * b_t * u_tt.unsqueeze(-1)
+
+            state = state * da + bu
+
+            y_t = (state * c_t).sum(dim=-1)
+            y_t = y_t + self.D.view(1, self.nheads, 1) * u_tt
+            ys.append(y_t)
+
+        cache.ssm_state = state
+
+        y = torch.stack(ys, dim=1)
+        y = y.reshape(bsz, m, self.d_inner).to(dtype)
+        y = y * F.silu(z)
+
+        return self.out_proj(y)
+
 
 class Mamba3Layer(nn.Module):
     def __init__(
@@ -258,10 +352,23 @@ class Mamba3Layer(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache=None,
         **kwargs,
     ) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError("x must have shape [B, L, d_model]")
+
+        if cache is not None:
+            if not isinstance(self.mamba, NaiveSSM):
+                raise NotImplementedError(
+                    "incremental decode cache is only supported with the "
+                    "NaiveSSM fallback backend; the official Mamba kernels are "
+                    "not steppable here"
+                )
+            residual = x
+            mamba_input = self.norm(residual)
+            y = self.mamba(mamba_input, attn_mask=attn_mask, cache=cache)
+            return residual + y
 
         mask = None
         if attn_mask is not None:

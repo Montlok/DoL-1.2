@@ -98,6 +98,7 @@ class MorphologicalRoPE(nn.Module):
         word_pos: torch.Tensor | None = None,
         morph_depth: torch.Tensor | None = None,
         device=None,
+        pos_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if seq_len <= 0:
             raise ValueError("seq_len must be positive")
@@ -106,7 +107,7 @@ class MorphologicalRoPE(nn.Module):
             device = self._device()
 
         if not self.use_morphological or word_pos is None:
-            return self._standard(seq_len, device)
+            return self._standard(seq_len, device, pos_offset=pos_offset)
 
         if word_pos.ndim != 2:
             raise ValueError("word_pos must have shape [B, L]")
@@ -132,13 +133,17 @@ class MorphologicalRoPE(nn.Module):
         emb = torch.cat([word, morph], dim=-1)
         return emb.cos(), emb.sin()
 
-    def _standard(self, seq_len: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    def _standard(
+        self, seq_len: int, device, pos_offset: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         freqs = (
             self.freqs.to(device=device)
             if hasattr(self, "freqs")
             else _build_freqs(self.rope_dim, self.theta, device=device)
         )
-        pos = torch.arange(seq_len, dtype=torch.float32, device=device)
+        pos = torch.arange(
+            pos_offset, pos_offset + seq_len, dtype=torch.float32, device=device
+        )
         angles = pos.unsqueeze(-1) * freqs.unsqueeze(0)
         emb = self._angles_to_emb(angles)
         return emb.cos(), emb.sin()

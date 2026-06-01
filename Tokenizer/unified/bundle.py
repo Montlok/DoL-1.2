@@ -7,19 +7,20 @@ import json
 import os
 import shutil
 from dataclasses import asdict, dataclass
-from typing import Any
 
+from Tokenizer.generic_bpe import GeneralBPEModel
 from Tokenizer.morphbpe import MorphBPETokenizer
 from Tokenizer.multimodal import MultimodalProcessor
 from Tokenizer.traditional_mongolian.stemmer import MongolStemmer
 
 from .dual_tokenizer import DualTrackTokenizer
-from .vocab import SPECIAL_TOKENS, build_misc_tokens, build_unified_vocab
+from .vocab import SPECIAL_TOKENS, build_unified_vocab
 
 
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2
 CONFIG_NAME = "config.json"
 MORPHBPE_NAME = "morphbpe.json"
+GENERAL_NAME = "general.json"
 VOCAB_NAME = "vocab.json"
 
 
@@ -27,58 +28,10 @@ VOCAB_NAME = "vocab.json"
 class TokenizerBundleConfig:
     version: int
     morphbpe_file: str
-    zh_source: str
-    en_source: str
+    general_file: str = ""
     patch_size: int = 14
     merge_size: int = 2
     temporal_patch_size: int = 2
-    use_smoke_hf: bool = False
-
-
-class _SmokeHFTokenizer:
-    def __init__(self, vocab: dict[str, int]):
-        self._vocab = dict(vocab)
-        self._id_to_token = {idx: tok for tok, idx in self._vocab.items()}
-
-    def get_vocab(self) -> dict[str, int]:
-        return dict(self._vocab)
-
-    def convert_ids_to_tokens(self, local_id: int) -> str:
-        return self._id_to_token.get(local_id, str(local_id))
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        return [local_id for local_id, _start, _end in self._tokenize(text)]
-
-    def __call__(
-        self,
-        text: str,
-        add_special_tokens: bool = False,
-        return_offsets_mapping: bool = False,
-    ) -> dict[str, list[Any]]:
-        pieces = self._tokenize(text)
-        result: dict[str, list[Any]] = {
-            "input_ids": [local_id for local_id, _start, _end in pieces]
-        }
-        if return_offsets_mapping:
-            result["offset_mapping"] = [(start, end) for _id, start, end in pieces]
-        return result
-
-    def _tokenize(self, text: str) -> list[tuple[int, int, int]]:
-        out: list[tuple[int, int, int]] = []
-        cursor = 0
-        ordered = sorted(self._vocab, key=len, reverse=True)
-        while cursor < len(text):
-            match = None
-            for token in ordered:
-                if token and text.startswith(token, cursor):
-                    match = token
-                    break
-            if match is None:
-                cursor += 1
-                continue
-            out.append((self._vocab[match], cursor, cursor + len(match)))
-            cursor += len(match)
-        return out
 
 
 class TokenizerBundle:
@@ -100,22 +53,18 @@ class TokenizerBundle:
     def from_files(
         cls,
         morphbpe_path: str,
-        zh_source: str = "Qwen/Qwen2.5-0.5B",
-        en_source: str = "meta-llama/Llama-3.2-1B",
+        general_path: str | None = None,
         patch_size: int = 14,
         merge_size: int = 2,
         temporal_patch_size: int = 2,
-        use_smoke_hf: bool = False,
     ) -> "TokenizerBundle":
         config = TokenizerBundleConfig(
             version=BUNDLE_VERSION,
             morphbpe_file=morphbpe_path,
-            zh_source=zh_source,
-            en_source=en_source,
+            general_file=general_path or "",
             patch_size=patch_size,
             merge_size=merge_size,
             temporal_patch_size=temporal_patch_size,
-            use_smoke_hf=use_smoke_hf,
         )
         return cls._build(config, morphbpe_path=morphbpe_path, vocab=None)
 
@@ -128,7 +77,15 @@ class TokenizerBundle:
         with open(vocab_path, "r", encoding="utf-8") as f:
             vocab = {str(token): int(idx) for token, idx in json.load(f).items()}
         morphbpe_path = os.path.join(path, config.morphbpe_file)
-        return cls._build(config, morphbpe_path=morphbpe_path, vocab=vocab)
+        general_path = (
+            os.path.join(path, config.general_file) if config.general_file else None
+        )
+        return cls._build(
+            config,
+            morphbpe_path=morphbpe_path,
+            vocab=vocab,
+            general_path=general_path,
+        )
 
     @classmethod
     def _build(
@@ -136,17 +93,21 @@ class TokenizerBundle:
         config: TokenizerBundleConfig,
         morphbpe_path: str,
         vocab: dict[str, int] | None,
+        general_path: str | None = None,
     ) -> "TokenizerBundle":
         stemmer = MongolStemmer()
         morphbpe = MorphBPETokenizer.from_file(morphbpe_path, stemmer)
-        if vocab is None:
-            zh_hf, en_hf, zh_tokens, en_tokens = _load_hf_tracks(config)
-            vocab = build_unified_vocab(
-                morphbpe.vocab, zh_tokens, en_tokens, build_misc_tokens()
-            )
+
+        gen_path = general_path if general_path is not None else config.general_file
+        if gen_path:
+            general = GeneralBPEModel.load(gen_path)
         else:
-            zh_hf, en_hf = _load_hf_from_vocab(config, vocab)
-        tokenizer = DualTrackTokenizer(vocab, morphbpe, zh_hf, en_hf)
+            general = GeneralBPEModel.minimal()
+
+        if vocab is None:
+            vocab = build_unified_vocab(morphbpe.vocab, general.get_vocab())
+
+        tokenizer = DualTrackTokenizer(vocab, morphbpe, general)
         processor = MultimodalProcessor(
             tokenizer,
             patch_size=config.patch_size,
@@ -157,6 +118,7 @@ class TokenizerBundle:
 
     def save_dir(self, path: str) -> None:
         os.makedirs(path, exist_ok=True)
+
         dest_morphbpe = os.path.join(path, MORPHBPE_NAME)
         source_morphbpe = self.config.morphbpe_file
         if os.path.abspath(source_morphbpe) != os.path.abspath(dest_morphbpe):
@@ -164,15 +126,25 @@ class TokenizerBundle:
                 shutil.copyfile(source_morphbpe, dest_morphbpe)
             else:
                 self.tokenizer.morphbpe.save(dest_morphbpe)
+
+        dest_general = os.path.join(path, GENERAL_NAME)
+        source_general = self.config.general_file
+        if (
+            source_general
+            and os.path.exists(source_general)
+            and os.path.abspath(source_general) != os.path.abspath(dest_general)
+        ):
+            shutil.copyfile(source_general, dest_general)
+        else:
+            self.tokenizer.general.save(dest_general)
+
         config = TokenizerBundleConfig(
             version=self.config.version,
             morphbpe_file=MORPHBPE_NAME,
-            zh_source=self.config.zh_source,
-            en_source=self.config.en_source,
+            general_file=GENERAL_NAME,
             patch_size=self.config.patch_size,
             merge_size=self.config.merge_size,
             temporal_patch_size=self.config.temporal_patch_size,
-            use_smoke_hf=self.config.use_smoke_hf,
         )
         with open(os.path.join(path, CONFIG_NAME), "w", encoding="utf-8") as f:
             json.dump(asdict(config), f, ensure_ascii=False, indent=2)
@@ -221,11 +193,14 @@ class TokenizerBundle:
         for token, expected_id in SPECIAL_TOKENS.items():
             actual = self.tokenizer.vocab.get(token)
             if actual != expected_id:
-                issues.append(f"special token {token!r} has id {actual}, expected {expected_id}")
+                issues.append(
+                    f"special token {token!r} has id {actual}, expected {expected_id}"
+                )
         if "<unk>" not in self.tokenizer.morphbpe.vocab:
             issues.append("morphbpe vocab is missing <unk>")
         try:
-            result = self.encode_with_spans("ᠮᠣᠩᠭᠣᠯ 文字 test 🙂", add_bos=True, add_eos=True)
+            text = "\u182e\u1822\u1828\u182d\u1822\u182f 文字 test \U0001f642"
+            result = self.encode_with_spans(text, add_bos=True, add_eos=True)
             if len(result.input_ids) != len(result.tokens):
                 issues.append("encode_with_spans produced mismatched ids/tokens")
         except Exception as exc:  # pragma: no cover - reported as validation issue.
@@ -243,65 +218,3 @@ class TokenizerBundle:
         except Exception as exc:  # pragma: no cover - reported as validation issue.
             issues.append(f"multimodal smoke failed: {exc}")
         return issues
-
-
-def _load_hf_tracks(
-    config: TokenizerBundleConfig,
-) -> tuple[Any, Any, list[str], list[str]]:
-    if config.use_smoke_hf:
-        zh_tokens = ["文", "字", "这", "张", "图", "中"]
-        en_tokens = ["test", "hello", "abc", "def", "text"]
-        return (
-            _SmokeHFTokenizer({tok: idx for idx, tok in enumerate(zh_tokens)}),
-            _SmokeHFTokenizer({tok: idx for idx, tok in enumerate(en_tokens)}),
-            zh_tokens,
-            en_tokens,
-        )
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:
-        raise ImportError(
-            "transformers is required when use_smoke_hf=False; "
-            "install transformers or build with --smoke-hf"
-        ) from exc
-
-    from .dual_tokenizer import extract_hf_vocab_tokens
-
-    zh_tokens, _ = extract_hf_vocab_tokens(config.zh_source, "zh", 15000)
-    en_tokens, _ = extract_hf_vocab_tokens(config.en_source, "en", 8000)
-    return (
-        AutoTokenizer.from_pretrained(config.zh_source),
-        AutoTokenizer.from_pretrained(config.en_source),
-        zh_tokens,
-        en_tokens,
-    )
-
-
-def _load_hf_from_vocab(
-    config: TokenizerBundleConfig, vocab: dict[str, int]
-) -> tuple[Any, Any]:
-    if config.use_smoke_hf:
-        return (
-            _SmokeHFTokenizer(_track_vocab_from_unified(vocab, "zh")),
-            _SmokeHFTokenizer(_track_vocab_from_unified(vocab, "en")),
-        )
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:
-        raise ImportError(
-            "transformers is required when use_smoke_hf=False; "
-            "install transformers or use a smoke-HF bundle"
-        ) from exc
-    return (
-        AutoTokenizer.from_pretrained(config.zh_source),
-        AutoTokenizer.from_pretrained(config.en_source),
-    )
-
-
-def _track_vocab_from_unified(vocab: dict[str, int], lang: str) -> dict[str, int]:
-    prefix = f"{lang}▁"
-    ordered = sorted(
-        ((token[len(prefix):], idx) for token, idx in vocab.items() if token.startswith(prefix)),
-        key=lambda item: item[1],
-    )
-    return {token: local_id for local_id, (token, _global_id) in enumerate(ordered)}

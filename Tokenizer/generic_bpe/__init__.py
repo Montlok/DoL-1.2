@@ -7,10 +7,11 @@ from .byte_fallback import (
     encode_byte_fallback,
     is_byte_token,
 )
-from .hf_track import HFTrackTokenizer
+from .general_bpe import GeneralBPEModel, GeneralBPETrainer
 
 __all__ = [
-    "HFTrackTokenizer",
+    "GeneralBPEModel",
+    "GeneralBPETrainer",
     "byte_token",
     "decode_byte_token",
     "decode_bytes",

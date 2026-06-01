@@ -13,7 +13,7 @@ class TokenLike(Protocol):
     end: int
 
 
-WORD_TRACKS = {"mn", "zh", "en"}
+WORD_TRACKS = {"mn", "general"}
 
 
 def derive_morph_info_from_tokens(
@@ -22,8 +22,12 @@ def derive_morph_info_from_tokens(
     """Derive word position and intra-word subtoken depth from encoded tokens.
 
     Mongolian MorphBPE pieces that are contiguous in the original text share a
-    word position and advance morph_depth. Chinese/English BPE pieces use the
-    same convention. Spaces, specials, and punctuation reset the current word.
+    word position and advance morph_depth. General byte-level BPE pieces use the
+    same convention. Only ``mn`` and ``general`` are word tracks; punctuation is
+    routed to a separate ``general_punct`` track (see
+    ``dual_tokenizer._general_piece_track``), so spaces, specials, and
+    punctuation all reset the current word -- ``hello,world`` and ``这。图`` keep
+    one word per side of the punctuation instead of gluing them together.
     """
 
     word_positions: list[int] = []
