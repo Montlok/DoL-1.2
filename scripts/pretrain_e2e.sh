@@ -209,9 +209,14 @@ fi
 # ---------------------------------------------------------------------------
 if [ -n "$MIX_MANIFEST" ]; then
     log "[2b] building token-weighted corpus mix"
-    if [ -s "$ALL_JSONL" ]; then
+    # Idempotency keys on the mix report, not on all.jsonl: the report is only
+    # ever written by build_corpus_mix, so a stale plain-cat all.jsonl from a
+    # prior unweighted run is correctly rebuilt instead of silently reused.
+    if [ -s "$MIX_REPORT" ] && [ -s "$ALL_JSONL" ]; then
         echo "weighted mix already built, skipping"
     else
+        # Drop any stale concat output so the mixer always owns all.jsonl here.
+        rm -f "$ALL_JSONL"
         # Measure exact tokens with the freshly built bundle, then up/down-sample
         # each source to hit the manifest's target language/domain proportions.
         python3 -m Tokenizer.tools.build_corpus_mix \

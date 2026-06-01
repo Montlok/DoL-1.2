@@ -85,6 +85,23 @@ def _resolve_parquet_shards(path: str) -> list[str]:
     return sorted(p for p in glob.glob(path) if p.endswith(".parquet"))
 
 
+def _resolve_text_files(path: str) -> list[str]:
+    """Resolve a jsonl/txt source to concrete files (file, dir, or glob).
+
+    Mirrors the parquet handling so a manifest may point ``path`` at a single
+    file, a directory of shards, or a glob pattern.
+    """
+    if os.path.isfile(path):
+        return [path]
+    if os.path.isdir(path):
+        return sorted(
+            p
+            for ext in ("*.jsonl", "*.json", "*.txt")
+            for p in glob.glob(os.path.join(path, "**", ext), recursive=True)
+        )
+    return sorted(glob.glob(path))
+
+
 def _iter_source_texts(path: str, fmt: str, text_column: str) -> Iterator[str]:
     """Yield cleaned, non-empty texts from a source in any supported format."""
     if fmt == "parquet":
@@ -106,24 +123,32 @@ def _iter_source_texts(path: str, fmt: str, text_column: str) -> Iterator[str]:
                     if len(text) >= _MIN_CHARS:
                         yield text
     elif fmt == "txt":
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                text = _clean(line)
-                if len(text) >= _MIN_CHARS:
-                    yield text
+        files = _resolve_text_files(path)
+        if not files:
+            raise SystemExit(f"No text files found under {path!r}")
+        for fp in files:
+            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    text = _clean(line)
+                    if len(text) >= _MIN_CHARS:
+                        yield text
     else:  # jsonl
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                text = _clean(str(obj.get(text_column, "") or ""))
-                if len(text) >= _MIN_CHARS:
-                    yield text
+        files = _resolve_text_files(path)
+        if not files:
+            raise SystemExit(f"No jsonl files found under {path!r}")
+        for fp in files:
+            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = _clean(str(obj.get(text_column, "") or ""))
+                    if len(text) >= _MIN_CHARS:
+                        yield text
 
 
 @dataclass

@@ -57,6 +57,51 @@ class ManifestTest(unittest.TestCase):
         self.assertEqual(SourceSpec.from_raw({"path": "x.txt"}).fmt, "txt")
 
 
+class GlobSourceTest(unittest.TestCase):
+    def test_jsonl_glob_expands(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_jsonl(os.path.join(tmp, "a.jsonl"), ["alpha"])
+            _write_jsonl(os.path.join(tmp, "b.jsonl"), ["beta"])
+            texts = sorted(
+                _iter_source_texts(os.path.join(tmp, "*.jsonl"), "jsonl", "text")
+            )
+            self.assertEqual(texts, ["alpha", "beta"])
+
+    def test_jsonl_directory_expands(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_jsonl(os.path.join(tmp, "a.jsonl"), ["one", "two"])
+            texts = sorted(_iter_source_texts(tmp, "jsonl", "text"))
+            self.assertEqual(texts, ["one", "two"])
+
+    def test_txt_glob_expands(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "a.txt"), "w", encoding="utf-8") as fh:
+                fh.write("line-a\n")
+            with open(os.path.join(tmp, "b.txt"), "w", encoding="utf-8") as fh:
+                fh.write("line-b\n")
+            texts = sorted(
+                _iter_source_texts(os.path.join(tmp, "*.txt"), "txt", "text")
+            )
+            self.assertEqual(texts, ["line-a", "line-b"])
+
+    def test_missing_glob_raises(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                list(
+                    _iter_source_texts(
+                        os.path.join(tmp, "nope-*.jsonl"), "jsonl", "text"
+                    )
+                )
+
+
 class EmitCountsTest(unittest.TestCase):
     def test_subsample_expectation(self) -> None:
         import random
