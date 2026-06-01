@@ -1,0 +1,39 @@
+{
+  "_comment": "Example mix manifest for Daffodils pretraining. Paths point at the gitignored 'DO NOT GIT IT/' corpus drops and are illustrative — adjust to your local layout. Weights follow plan.md: Mongolian-dominant trilingual + ~12% STEM/reasoning. Per-source cleaning keys (min_chars/strip_url_lines/keep_lines) are opt-in.",
+  "total_tokens": 20000000000,
+  "max_epochs": 4,
+  "seed": 0,
+  "sources": [
+    {"path": "DO NOT GIT IT/MC2_MONGOLIAN(DO NOT GIT IT)/mn-crawl-only-release-20231127.jsonl",
+     "lang": "mn", "domain": "literature", "weight": 0.40, "text_column": "text", "min_chars": 50},
+
+    {"path": "DO NOT GIT IT/1000 traditional_mongolian_corpus（DO NOT GIT IT）",
+     "lang": "mn", "domain": "literature", "weight": 0.10, "format": "txt", "min_chars": 20},
+
+    {"path": "DO NOT GIT IT/MONGOLIAN_SYNTH(DO NOT GIT IT)/seed_mn.txt",
+     "lang": "mn", "domain": "stem", "weight": 0.04, "format": "txt", "min_chars": 20},
+
+    {"path": "DO NOT GIT IT/WIKIPEDIA(DO NOT GIT IT)/20231101.zh/*.parquet",
+     "lang": "zh", "domain": "general", "weight": 0.18, "text_column": "text", "min_chars": 50},
+
+    {"path": "DO NOT GIT IT/WIKIPEDIA(DO NOT GIT IT)/20231101.en/*.parquet",
+     "lang": "en", "domain": "general", "weight": 0.06, "text_column": "text", "min_chars": 50},
+
+    {"path": "DO NOT GIT IT/WIKIPEDIA(DO NOT GIT IT)/20231101.ja/*.parquet",
+     "lang": "ja", "domain": "general", "weight": 0.05, "text_column": "text", "min_chars": 50},
+
+    {"path": "DO NOT GIT IT/FINEMATH(DO NOT GIT IT)/finemath-4plus/*.parquet",
+     "lang": "en", "domain": "math", "weight": 0.07, "text_column": "text"},
+
+    {"path": "DO NOT GIT IT/OPENWEBMATH(DO NOT GIT IT)/data/*.parquet",
+     "lang": "en", "domain": "math", "weight": 0.05, "text_column": "text", "strip_url_lines": true},
+
+    {"path": "DO NOT GIT IT/CHINESE_MATH(DO NOT GIT IT)/gsm8k_zh/train.parquet",
+     "lang": "zh", "domain": "math", "weight": 0.03, "text_column": "question_zh-cn", "min_chars": 10},
+
+    {"_disabled_comment": "Tsinghua is a line-aligned zh/en bilingual web corpus with heavy boilerplate; if used, keep_lines='zh' extracts the Chinese side. Wiki/zh is higher quality, so it is the primary Chinese source above.",
+     "path": "DO NOT GIT IT/CHINESE(DO NOT GIT IT)/TsinghuaBilingualCorpus/*.txt",
+     "lang": "zh", "domain": "general", "weight": 0.02, "format": "txt",
+     "keep_lines": "zh", "min_chars": 12}
+  ]
+}
