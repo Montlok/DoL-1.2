@@ -6,7 +6,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from dataclasses import asdict, dataclass
+import warnings
+from dataclasses import asdict, dataclass, fields
 
 from Tokenizer.generic_bpe import GeneralBPEModel
 from Tokenizer.morphbpe import MorphBPETokenizer
@@ -32,6 +33,36 @@ class TokenizerBundleConfig:
     patch_size: int = 14
     merge_size: int = 2
     temporal_patch_size: int = 2
+
+
+# Config keys written by pre-v2 bundles that no longer map to any field. They
+# are dropped (with a warning) when loading so old bundles still open.
+_LEGACY_CONFIG_KEYS = {"zh_source", "en_source", "use_smoke_hf"}
+
+
+def _config_from_raw(raw: dict) -> "TokenizerBundleConfig":
+    """Build a config from a possibly-legacy ``config.json`` dict.
+
+    Older bundles stored ``zh_source``/``en_source``/``use_smoke_hf``; those
+    keys are ignored so previously generated bundles keep loading after the
+    schema narrowed. Genuinely unknown keys still raise.
+    """
+
+    known = {f.name for f in fields(TokenizerBundleConfig)}
+    unknown = set(raw) - known
+    legacy = unknown & _LEGACY_CONFIG_KEYS
+    if legacy:
+        warnings.warn(
+            "ignoring legacy tokenizer-bundle config keys "
+            f"{sorted(legacy)} from a pre-v2 bundle; they are no longer used.",
+            stacklevel=2,
+        )
+    other_unknown = unknown - _LEGACY_CONFIG_KEYS
+    if other_unknown:
+        raise TypeError(
+            f"unknown tokenizer-bundle config keys: {sorted(other_unknown)}"
+        )
+    return TokenizerBundleConfig(**{k: v for k, v in raw.items() if k in known})
 
 
 class TokenizerBundle:
@@ -73,7 +104,7 @@ class TokenizerBundle:
         config_path = os.path.join(path, CONFIG_NAME)
         vocab_path = os.path.join(path, VOCAB_NAME)
         with open(config_path, "r", encoding="utf-8") as f:
-            config = TokenizerBundleConfig(**json.load(f))
+            config = _config_from_raw(json.load(f))
         with open(vocab_path, "r", encoding="utf-8") as f:
             vocab = {str(token): int(idx) for token, idx in json.load(f).items()}
         morphbpe_path = os.path.join(path, config.morphbpe_file)

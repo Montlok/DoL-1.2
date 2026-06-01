@@ -63,10 +63,16 @@ def build_unified_vocab(
     for token, _local_id in sorted(morphbpe_vocab.items(), key=lambda x: x[1]):
         if token in SPECIAL_TOKENS:
             continue
-        if next_id >= mn_hi:
-            break
         if token in unified:
             continue
+        if next_id >= mn_hi:
+            raise ValueError(
+                "MorphBPE vocabulary overflows its id segment "
+                f"[{mn_lo}, {mn_hi}) (capacity {mn_hi - mn_lo}); more "
+                "non-special Mongolian tokens remain. Reduce the MorphBPE vocab "
+                "size so it fits — silently truncating would emit <unk> and "
+                "break the no-<unk> guarantee."
+            )
         unified[token] = next_id
         next_id += 1
 
@@ -75,10 +81,16 @@ def build_unified_vocab(
     for token, _local_id in sorted(general_vocab.items(), key=lambda x: x[1]):
         if token in SPECIAL_TOKENS:
             continue
-        if next_id >= gen_hi:
-            break
         if token in unified:
             continue
+        if next_id >= gen_hi:
+            raise ValueError(
+                "general BPE vocabulary overflows its id segment "
+                f"[{gen_lo}, {gen_hi}) (capacity {gen_hi - gen_lo}); more "
+                "non-special general tokens remain. Reduce the general BPE "
+                "vocab size so it fits — silently truncating would emit <unk> "
+                "and break the no-<unk> guarantee for non-Mongolian text."
+            )
         unified[token] = next_id
         next_id += 1
 

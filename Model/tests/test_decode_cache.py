@@ -229,6 +229,28 @@ class CacheRejectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.generate(ids, max_new_tokens=10, greedy=True, use_cache=True)
 
+    def test_cached_generation_rejects_prompt_at_capacity(self):
+        # Prompt already at max_seq_len with max_new_tokens=1 must be rejected
+        # up front (it would otherwise return a sequence of max_seq_len + 1).
+        torch.manual_seed(0)
+        cfg = _two_stage_cfg()
+        object.__setattr__(cfg, "max_seq_len", 8)
+        model = RDTForCausalLM(cfg).eval()
+        ids = torch.randint(300, 320, (1, 8))
+        with self.assertRaises(ValueError):
+            model.generate(ids, max_new_tokens=1, greedy=True, use_cache=True)
+
+    def test_cached_generation_rejects_padded_prompt(self):
+        # The incremental cache cannot mask padding, so a padded prompt must be
+        # rejected rather than silently corrupting cached keys/values.
+        torch.manual_seed(0)
+        cfg = _two_stage_cfg()
+        model = RDTForCausalLM(cfg).eval()
+        ids = torch.randint(300, 320, (1, 4))
+        ids[0, -1] = cfg.pad_id
+        with self.assertRaises(ValueError):
+            model.generate(ids, max_new_tokens=2, greedy=True, use_cache=True)
+
 
 if __name__ == "__main__":
     unittest.main()

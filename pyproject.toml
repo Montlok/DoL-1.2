@@ -10,7 +10,10 @@ readme = "Tokenizer/README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "KeikaJames" }]
-dependencies = []
+# `tokenizers` is required to load/encode any tokenizer bundle
+# (GeneralBPEModel.load()/.minimal() and TokenizerBundle.from_dir()), so it is
+# a base runtime dependency, not optional.
+dependencies = ["tokenizers>=0.19"]
 
 [project.optional-dependencies]
 hf = ["transformers>=4.40", "tokenizers>=0.19"]

@@ -592,6 +592,26 @@ class RDTForCausalLM(nn.Module):
         if use_cache:
             from Model.inference.cache import DecodeCache
 
+            # The incremental cache prefills every prompt position into the
+            # MLA/Mamba state with an all-ones mask, so a padded prompt would
+            # fold pad embeddings into the cache and change logits for shorter
+            # rows. Reject padded prompts (use the cache-free path for those).
+            if pad_id is not None and bool((input_ids == pad_id).any()):
+                raise ValueError(
+                    "use_cache=True requires pad-free prompts; the incremental "
+                    "cache cannot mask padding. Use use_cache=False for padded "
+                    "batches."
+                )
+            # The cache has no eviction, so the whole run must fit in context.
+            # Guard up front (counting the tokens about to be appended) instead
+            # of generating one token past the limit before raising.
+            if input_ids.shape[1] + max_new_tokens > cfg.max_seq_len:
+                raise ValueError(
+                    "cached generation requires L + max_new_tokens <= "
+                    f"max_seq_len ({cfg.max_seq_len}); got L={input_ids.shape[1]}"
+                    f" + max_new_tokens={max_new_tokens}. Reduce max_new_tokens "
+                    "or use use_cache=False."
+                )
             decode_cache = DecodeCache()
 
         try:
@@ -601,11 +621,6 @@ class RDTForCausalLM(nn.Module):
                         step_ids = seq
                     else:
                         step_ids = seq[:, -1:]
-                    if seq.shape[1] > cfg.max_seq_len:
-                        raise ValueError(
-                            "cached generation exceeded max_seq_len; reduce "
-                            "max_new_tokens or use use_cache=False"
-                        )
                     mask = (seq != pad_id).long()
                     word_pos, morph_depth = self._default_morph_info(seq, mask)
                     m = step_ids.shape[1]
