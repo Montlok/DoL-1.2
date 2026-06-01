@@ -74,8 +74,12 @@ def build_sft_example(
             labels.append(eos_id)
 
     if max_seq_len is not None and len(input_ids) > max_seq_len:
-        input_ids = input_ids[:max_seq_len]
-        labels = labels[:max_seq_len]
+        input_ids, labels = truncate_preserving_supervision(
+            input_ids,
+            labels,
+            max_seq_len=max_seq_len,
+            ignore_index=ignore_index,
+        )
 
     attention_mask = [1] * len(input_ids)
     return {
@@ -83,6 +87,42 @@ def build_sft_example(
         "attention_mask": attention_mask,
         "labels": labels,
     }
+
+
+def truncate_preserving_supervision(
+    input_ids: list[int],
+    labels: list[int],
+    *,
+    max_seq_len: int,
+    ignore_index: int = IGNORE_INDEX,
+) -> tuple[list[int], list[int]]:
+    """Truncate from the left while preserving supervised completion tokens.
+
+    SFT/DPO rows often have long prompts and short assistant completions. Plain
+    right-truncation can drop the assistant turn entirely, yielding an all-masked
+    row that trains no objective. Keep the suffix ending at the last supervised
+    token instead, so at least the completion/EOS remains supervised.
+    """
+
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive")
+    if len(input_ids) != len(labels):
+        raise ValueError("input_ids and labels must align")
+    if len(input_ids) <= max_seq_len:
+        return list(input_ids), list(labels)
+
+    supervised = [idx for idx, label in enumerate(labels) if label != ignore_index]
+    if not supervised:
+        return list(input_ids[-max_seq_len:]), list(labels[-max_seq_len:])
+
+    last_supervised = supervised[-1]
+    start = max(0, last_supervised + 1 - max_seq_len)
+    end = start + max_seq_len
+    return list(input_ids[start:end]), list(labels[start:end])
+
+
+def has_supervised_tokens(example: dict[str, list[int]], ignore_index: int = IGNORE_INDEX) -> bool:
+    return any(label != ignore_index for label in example.get("labels", []))
 
 
 def generation_prompt_ids(
@@ -126,8 +166,9 @@ class SFTChatDataset(Dataset):
         ignore_index: int = IGNORE_INDEX,
         max_seq_len: int | None = None,
     ) -> None:
-        self._rows = [
-            build_sft_example(
+        self._rows = []
+        for messages in iter_chat_jsonl(path):
+            row = build_sft_example(
                 messages,
                 encode,
                 eos_id=eos_id,
@@ -135,8 +176,10 @@ class SFTChatDataset(Dataset):
                 ignore_index=ignore_index,
                 max_seq_len=max_seq_len,
             )
-            for messages in iter_chat_jsonl(path)
-        ]
+            if has_supervised_tokens(row, ignore_index):
+                self._rows.append(row)
+        if not self._rows:
+            raise ValueError("SFTChatDataset contains no supervised tokens")
 
     def __len__(self) -> int:
         return len(self._rows)
@@ -148,7 +191,9 @@ class SFTChatDataset(Dataset):
 __all__ = [
     "build_sft_example",
     "generation_prompt_ids",
+    "has_supervised_tokens",
     "iter_chat_jsonl",
     "SFTChatDataset",
     "TURN_SUFFIX",
+    "truncate_preserving_supervision",
 ]

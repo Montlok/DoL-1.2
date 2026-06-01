@@ -71,6 +71,10 @@ def build_preference_example(
 
     chosen_ids, chosen_mask = _one(chosen)
     rejected_ids, rejected_mask = _one(rejected)
+    if not any(chosen_mask):
+        raise ValueError("chosen response has no supervised completion tokens")
+    if not any(rejected_mask):
+        raise ValueError("rejected response has no supervised completion tokens")
     return {
         "chosen_input_ids": chosen_ids,
         "chosen_completion_mask": chosen_mask,

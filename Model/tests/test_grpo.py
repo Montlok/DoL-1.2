@@ -51,6 +51,8 @@ class AdvantageTest(unittest.TestCase):
     def test_bad_group_size_raises(self):
         with self.assertRaises(ValueError):
             group_normalized_advantages(torch.zeros(5), group_size=2)
+        with self.assertRaises(ValueError):
+            group_normalized_advantages(torch.zeros(1), group_size=1)
 
 
 class GRPOLossTest(unittest.TestCase):
@@ -181,6 +183,50 @@ class GRPOIntegrationTest(unittest.TestCase):
         # With lr=0 the params are unchanged but a backward pass succeeded.
         for b, p in zip(before, policy.parameters()):
             self.assertTrue(torch.equal(b, p))
+
+    def test_reward_fn_cpu_tensor_is_accepted(self):
+        torch.manual_seed(0)
+        from Model.posttrain.grpo import grpo_compute_loss
+
+        policy = RDTForCausalLM(_cfg())
+        policy.reverse_loss_enabled = False
+        ref = RDTForCausalLM(_cfg())
+        ref.load_state_dict(policy.state_dict())
+        for p in ref.parameters():
+            p.requires_grad_(False)
+
+        prompts = [torch.randint(30, 200, (3,))]
+
+        def reward_fn(_responses, _idx):
+            return torch.tensor([0.0, 1.0], device="cpu")
+
+        def decode(ids):
+            return "x" * int((ids != 0).sum())
+
+        cfg = GRPOConfig(group_size=2, max_new_tokens=2, recurrent_steps=1)
+        loss, metrics = grpo_compute_loss(policy, ref, prompts, reward_fn, decode, cfg, pad_id=0)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("loss", metrics)
+
+    def test_prompt_batches_are_rank_sharded(self):
+        from scripts.train_grpo import _iter_prompt_batches
+
+        dataset = [{"id": idx, "prompt_ids": [idx]} for idx in range(6)]
+        rank0 = _iter_prompt_batches(dataset, 2, rank=0, world_size=2)
+        rank1 = _iter_prompt_batches(dataset, 2, rank=1, world_size=2)
+
+        self.assertEqual([row["id"] for row in next(rank0)], [0, 2])
+        self.assertEqual([row["id"] for row in next(rank1)], [1, 3])
+
+    def test_prompt_batches_replicate_when_shards_are_too_few(self):
+        from scripts.train_grpo import _iter_prompt_batches
+
+        dataset = [{"id": 0, "prompt_ids": [0]}]
+        rank0 = _iter_prompt_batches(dataset, 1, rank=0, world_size=2)
+        rank1 = _iter_prompt_batches(dataset, 1, rank=1, world_size=2)
+
+        self.assertEqual(next(rank0)[0]["id"], 0)
+        self.assertEqual(next(rank1)[0]["id"], 0)
 
 
 if __name__ == "__main__":

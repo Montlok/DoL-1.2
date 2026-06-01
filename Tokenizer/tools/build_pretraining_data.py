@@ -5,15 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-from typing import Iterable
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from Tokenizer.pretraining import (
     IGNORE_INDEX,
     EncodedSample,
     PretrainingDataBuilder,
     encoded_sample_to_dict,
-    pack_samples,
+    iter_pack_samples,
 )
 from Tokenizer.unified.bundle import TokenizerBundle
 
@@ -32,31 +33,139 @@ def _iter_samples(
                 yield builder.encode_text(line, metadata={"type": "text"})
 
 
-def _summary(samples: Iterable[dict], unk_id: int, skipped_empty: int) -> dict:
-    rows = list(samples)
-    lengths = [len(row["input_ids"]) for row in rows]
-    total_tokens = sum(lengths)
-    unk_count = sum(row["input_ids"].count(unk_id) for row in rows)
-    supervised_tokens = sum(
-        1 for row in rows for label in row["labels"] if int(label) != IGNORE_INDEX
-    )
-    max_morph_depth = max(
-        (
-            max((int(value) for value in row.get("morph_depth", [])), default=0)
-            for row in rows
-        ),
-        default=0,
-    )
-    return {
-        "num_samples": len(rows),
-        "skipped_empty": skipped_empty,
-        "avg_len": (total_tokens / len(rows)) if rows else 0.0,
-        "max_len": max(lengths) if lengths else 0,
-        "unk_rate": (unk_count / total_tokens) if total_tokens else 0.0,
-        "supervised_tokens": supervised_tokens,
-        "supervised_rate": (supervised_tokens / total_tokens) if total_tokens else 0.0,
-        "max_morph_depth": max_morph_depth,
-    }
+@dataclass
+class _BuildSummary:
+    unk_id: int
+    skipped_empty: int = 0
+    num_samples: int = 0
+    total_tokens: int = 0
+    unk_count: int = 0
+    supervised_tokens: int = 0
+    max_len: int = 0
+    max_morph_depth: int = 0
+    shards: list[str] = field(default_factory=list)
+
+    def add_row(self, row: dict) -> None:
+        length = len(row["input_ids"])
+        self.num_samples += 1
+        self.total_tokens += length
+        self.max_len = max(self.max_len, length)
+        self.unk_count += row["input_ids"].count(self.unk_id)
+        self.supervised_tokens += sum(
+            1 for label in row["labels"] if int(label) != IGNORE_INDEX
+        )
+        self.max_morph_depth = max(
+            self.max_morph_depth,
+            max((int(value) for value in row.get("morph_depth", [])), default=0),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "num_samples": self.num_samples,
+            "skipped_empty": self.skipped_empty,
+            "avg_len": (
+                self.total_tokens / self.num_samples if self.num_samples else 0.0
+            ),
+            "max_len": self.max_len,
+            "unk_rate": (
+                self.unk_count / self.total_tokens if self.total_tokens else 0.0
+            ),
+            "supervised_tokens": self.supervised_tokens,
+            "supervised_rate": (
+                self.supervised_tokens / self.total_tokens
+                if self.total_tokens
+                else 0.0
+            ),
+            "max_morph_depth": self.max_morph_depth,
+            "shards": self.shards,
+        }
+
+
+class _JsonlShardWriter:
+    """Bounded-memory JSONL writer with optional token/sample rotation."""
+
+    def __init__(
+        self,
+        output: str,
+        *,
+        token_budget: int = 0,
+        sample_budget: int = 0,
+    ) -> None:
+        if token_budget < 0 or sample_budget < 0:
+            raise ValueError("shard budgets must be non-negative")
+        self.output = Path(output)
+        self.token_budget = int(token_budget)
+        self.sample_budget = int(sample_budget)
+        self.rotate = bool(self.token_budget or self.sample_budget)
+        self._fh = None
+        self._shard_idx = 0
+        self._cur_tokens = 0
+        self._cur_samples = 0
+        self.paths: list[str] = []
+
+    def __enter__(self) -> "_JsonlShardWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+        if exc_type is None and self._fh is None and not self.paths:
+            path = self._path_for_idx(0)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+            self.paths.append(str(path))
+
+    def _path_for_idx(self, idx: int) -> Path:
+        if not self.rotate:
+            return self.output
+        if self.output.suffix:
+            return self.output.with_name(
+                f"{self.output.stem}-{idx:05d}{self.output.suffix}"
+            )
+        return self.output / f"shard-{idx:05d}.jsonl"
+
+    def _open_next(self) -> None:
+        self.close()
+        path = self._path_for_idx(self._shard_idx)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = path.open("w", encoding="utf-8")
+        self.paths.append(str(path))
+        self._cur_tokens = 0
+        self._cur_samples = 0
+        self._shard_idx += 1
+
+    def _would_exceed(self, row_tokens: int) -> bool:
+        if self._cur_samples == 0:
+            return False
+        if self.sample_budget and self._cur_samples >= self.sample_budget:
+            return True
+        return bool(
+            self.token_budget and self._cur_tokens + row_tokens > self.token_budget
+        )
+
+    def write(self, row: dict) -> None:
+        row_tokens = len(row["input_ids"])
+        if self._fh is None or self._would_exceed(row_tokens):
+            self._open_next()
+        assert self._fh is not None
+        self._fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._cur_tokens += row_tokens
+        self._cur_samples += 1
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+
+def _nonempty_samples(
+    samples: Iterable[EncodedSample],
+    summary: _BuildSummary,
+) -> Iterator[EncodedSample]:
+    for sample in samples:
+        if not sample.input_ids:
+            summary.skipped_empty += 1
+            continue
+        yield sample
 
 
 def main() -> None:
@@ -77,33 +186,60 @@ def main() -> None:
         default=None,
         help="packed sequence length; defaults to --max-length",
     )
+    parser.add_argument(
+        "--shard-token-budget",
+        type=int,
+        default=0,
+        help=(
+            "rotate output shards after roughly this many tokens; 0 keeps the "
+            "single-file --output behaviour"
+        ),
+    )
+    parser.add_argument(
+        "--shard-sample-budget",
+        type=int,
+        default=0,
+        help=(
+            "rotate output shards after this many emitted rows; 0 disables this "
+            "rotation limit"
+        ),
+    )
     args = parser.parse_args()
 
     bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
     builder = PretrainingDataBuilder(bundle, max_length=args.max_length)
-    samples = list(_iter_samples(args.input, builder))
-    skipped_empty = sum(1 for sample in samples if not sample.input_ids)
-    samples = [sample for sample in samples if sample.input_ids]
+    if args.shard_token_budget < 0 or args.shard_sample_budget < 0:
+        parser.error("shard budgets must be non-negative")
+
+    summary = _BuildSummary(unk_id=bundle.tokenizer.unk_id)
+    samples: Iterable[EncodedSample] = _nonempty_samples(
+        _iter_samples(args.input, builder), summary
+    )
     if args.pack:
-        samples = pack_samples(
+        samples = iter_pack_samples(
             samples,
             max_length=args.pack_max_length or args.max_length,
             pad_id=bundle.tokenizer.vocab["<pad>"],
             eos_id=bundle.tokenizer.vocab["<eos>"],
             pad_to_max_length=args.pad_to_max_length,
         )
-    rows = [encoded_sample_to_dict(sample) for sample in samples]
+    else:
+        samples = iter(samples)
 
-    out_dir = os.path.dirname(args.output)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with _JsonlShardWriter(
+        args.output,
+        token_budget=args.shard_token_budget,
+        sample_budget=args.shard_sample_budget,
+    ) as writer:
+        for sample in samples:
+            row = encoded_sample_to_dict(sample)
+            writer.write(row)
+            summary.add_row(row)
+    summary.shards = list(writer.paths)
 
     print(
         json.dumps(
-            _summary(rows, bundle.tokenizer.unk_id, skipped_empty), ensure_ascii=False
+            summary.to_dict(), ensure_ascii=False
         )
     )
 

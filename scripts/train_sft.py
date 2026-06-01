@@ -24,11 +24,11 @@ import argparse
 import os
 import sys
 import time
-from itertools import cycle
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -165,7 +165,13 @@ def _smoke_loader(train_cfg: TrainingConfig) -> DataLoader:
     return DataLoader(rows, batch_size=train_cfg.micro_batch_size, collate_fn=collator)
 
 
-def _real_loader(args: argparse.Namespace, train_cfg: TrainingConfig) -> DataLoader:
+def _real_loader(
+    args: argparse.Namespace,
+    train_cfg: TrainingConfig,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+) -> DataLoader:
     from Tokenizer.unified.bundle import TokenizerBundle
 
     bundle = TokenizerBundle.from_dir(args.tokenizer)
@@ -176,14 +182,38 @@ def _real_loader(args: argparse.Namespace, train_cfg: TrainingConfig) -> DataLoa
         bos_id=BOS_ID,
         max_seq_len=train_cfg.seq_len,
     )
+    sampler = (
+        DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=False,
+        )
+        if world_size > 1
+        else None
+    )
     collator = PretrainingCollator(max_seq_len=train_cfg.seq_len)
     return DataLoader(
         dataset,
         batch_size=train_cfg.micro_batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=args.num_workers,
         collate_fn=collator,
     )
+
+
+def _infinite_loader(loader: DataLoader):
+    epoch = 0
+    sampler = getattr(loader, "sampler", None)
+    while True:
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+        for batch in loader:
+            yield batch
+        epoch += 1
 
 
 def _validate_args(args: argparse.Namespace) -> int:
@@ -226,8 +256,12 @@ def main(argv: list[str] | None = None) -> int:
             train_cfg.resume, model, optimizer, scheduler, state=state
         )
 
-    loader = _smoke_loader(train_cfg) if args.smoke else _real_loader(args, train_cfg)
-    batch_iter = cycle(loader)
+    loader = (
+        _smoke_loader(train_cfg)
+        if args.smoke
+        else _real_loader(args, train_cfg, rank=rank, world_size=world_size)
+    )
+    batch_iter = _infinite_loader(loader)
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=False)
     t0 = time.time()

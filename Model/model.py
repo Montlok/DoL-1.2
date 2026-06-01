@@ -610,6 +610,12 @@ class RDTForCausalLM(nn.Module):
             raise NotImplementedError(
                 "use_cache=True is only supported for core_type='two_stage'"
             )
+        if use_cache and self.cfg.use_official_mamba:
+            raise NotImplementedError(
+                "use_cache=True requires the NaiveSSM fallback backend; "
+                "official Mamba kernels are not steppable by the decode cache. "
+                "Pass --mamba=naive for cached decoding or use_cache=False."
+            )
 
         cfg = self.cfg
         eos_id = cfg.eos_id if eos_id is None else eos_id

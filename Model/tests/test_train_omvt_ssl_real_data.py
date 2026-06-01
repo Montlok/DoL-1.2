@@ -61,6 +61,47 @@ class TrainOMVTSSLRealDataTest(unittest.TestCase):
                 ]
             )
             self.assertEqual(rc, 0)
+            ckpt = tmp_p / "out" / "latest" / "omvt_ssl.pt"
+            self.assertTrue(ckpt.exists())
+
+            from Model.config import OMVTConfig, RDTConfig
+            from Model.model import RDTForCausalLM
+            from Model.omvt import OMVTInjector
+            from scripts.train_vlm_align import _load_omvt_init
+
+            rdt_cfg = RDTConfig(
+                d_model=32,
+                n_heads=4,
+                head_dim=8,
+                kv_lora_rank=8,
+                rope_head_dim=4,
+                nope_head_dim=4,
+                ffn_hidden=64,
+                ffn_multiple=32,
+                n_prelude=1,
+                n_coda=1,
+                mamba_per_block=1,
+                attn_per_block=1,
+                recurrent_steps=2,
+                mamba_d_state=8,
+                mamba_expand=2,
+                mamba_headdim=16,
+                use_official_mamba=False,
+                max_seq_len=16,
+            )
+            omvt_cfg = OMVTConfig(
+                image_size=32,
+                d_vision=64,
+                vertical_patch=(16, 8),
+                horizontal_patch=(8, 16),
+                square_patch=(8, 8),
+                layout_patch=(32, 32),
+                compress_to=3,
+            )
+            model = RDTForCausalLM(rdt_cfg)
+            model.vision._omvt_cfg = omvt_cfg
+            model.vision.omvt = OMVTInjector(rdt_cfg, omvt_cfg)
+            _load_omvt_init(model, str(tmp_p / "out" / "latest"))
 
 
 if __name__ == "__main__":  # pragma: no cover

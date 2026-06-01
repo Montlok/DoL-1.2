@@ -43,6 +43,19 @@ class BuildPreferenceTest(unittest.TestCase):
         prefix = sum(1 for _ in range(min(len(c), len(r))) if c[_] == r[_])
         self.assertGreater(prefix, 0)
 
+    def test_long_prompt_truncation_keeps_completion_mask(self):
+        ex = build_preference_example(
+            [{"role": "user", "content": "u" * 80}],
+            "yes",
+            "no",
+            _encode,
+            eos_id=EOS_ID,
+            max_seq_len=12,
+        )
+        self.assertGreater(sum(ex["chosen_completion_mask"]), 0)
+        self.assertGreater(sum(ex["rejected_completion_mask"]), 0)
+        self.assertEqual(ex["chosen_input_ids"][-1], EOS_ID)
+
 
 class CollateTest(unittest.TestCase):
     def test_collate_pads_and_builds_attention(self):

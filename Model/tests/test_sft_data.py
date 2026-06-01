@@ -118,6 +118,26 @@ class SFTMaskingTest(unittest.TestCase):
         sup = _supervised_text(ex)
         self.assertEqual(sup, "A1A2")
 
+    def test_long_prompt_truncation_preserves_assistant_supervision(self):
+        msgs = [
+            {"role": "user", "content": "U" * 80},
+            {"role": "assistant", "content": "OK"},
+        ]
+        ex = build_sft_example(msgs, _encode, eos_id=EOS, bos_id=BOS, max_seq_len=12)
+        self.assertLessEqual(len(ex["input_ids"]), 12)
+        self.assertGreater(sum(1 for lab in ex["labels"] if lab != IGNORE_INDEX), 0)
+        self.assertIn("OK", _supervised_text(ex))
+        self.assertEqual(ex["labels"][-1], EOS)
+
+    def test_dataset_rejects_all_masked_rows(self):
+        rows = [{"messages": [{"role": "user", "content": "no assistant"}]}]
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+            path = fh.name
+        with self.assertRaises(ValueError):
+            SFTChatDataset(path, _encode, eos_id=EOS, bos_id=BOS)
+
     def test_generation_prompt_ends_with_assistant_header(self):
         msgs = [{"role": "user", "content": "hi"}]
         ids = generation_prompt_ids(msgs, _encode, bos_id=BOS)

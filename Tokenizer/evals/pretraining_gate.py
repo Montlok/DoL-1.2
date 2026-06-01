@@ -31,10 +31,11 @@ def run_gate(
         failures.append({"scope": "bundle", "message": issue})
 
     builder = PretrainingDataBuilder(bundle, max_length=max_length)
-    samples: list[EncodedSample] = []
+    num_samples = 0
     total_tokens = 0
     unk_count = 0
     supervised_tokens = 0
+    max_len_seen = 0
     max_morph_depth = 0
     for idx, obj in enumerate(_iter_input(input_path)):
         if _is_encoded_row(obj):
@@ -53,7 +54,8 @@ def run_gate(
             except Exception as exc:
                 failures.append({"sample": idx, "message": f"encode failed: {exc}"})
                 continue
-        samples.append(sample)
+        num_samples += 1
+        max_len_seen = max(max_len_seen, len(sample.input_ids))
         total_tokens += len(sample.input_ids)
         unk_count += sample.input_ids.count(bundle.tokenizer.unk_id)
         supervised_tokens += sum(1 for label in sample.labels if label != IGNORE_INDEX)
@@ -65,10 +67,10 @@ def run_gate(
         "supervised_tokens": supervised_tokens,
         "supervised_rate": (supervised_tokens / total_tokens) if total_tokens else 0.0,
         "unk_rate": (unk_count / total_tokens) if total_tokens else 0.0,
-        "max_len": max((len(sample.input_ids) for sample in samples), default=0),
+        "max_len": max_len_seen,
         "max_morph_depth": max_morph_depth,
     }
-    if not samples:
+    if not num_samples:
         failures.append({"scope": "dataset", "message": "no valid samples"})
     if metrics["unk_rate"] > max_unk_rate:
         failures.append(
@@ -89,7 +91,7 @@ def run_gate(
         )
     return {
         "passed": not failures,
-        "num_samples": len(samples),
+        "num_samples": num_samples,
         "metrics": metrics,
         "failures": failures,
     }

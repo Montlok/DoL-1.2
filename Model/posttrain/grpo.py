@@ -29,6 +29,32 @@ from Model.posttrain.logprobs import token_logprobs_with_mask
 from Model.posttrain.masking import completion_mask_excluding_tool_results
 
 
+def _unwrap_model(model):
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
+def _is_fsdp(model) -> bool:
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        return isinstance(model, FSDP)
+    except ImportError:  # pragma: no cover
+        return False
+
+
+def _generate(model, *args, **kwargs):
+    if _is_fsdp(model):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        with FSDP.summon_full_params(
+            model, recurse=True, writeback=False
+        ):
+            return _unwrap_model(model).generate(*args, **kwargs)
+    return _unwrap_model(model).generate(*args, **kwargs)
+
+
 def group_normalized_advantages(
     rewards: torch.Tensor,
     group_size: int,
@@ -43,11 +69,13 @@ def group_normalized_advantages(
     Returns:
         ``[N]`` advantages.
     """
+    if group_size <= 1:
+        raise ValueError("group_size must be at least 2 for group-relative rewards")
     if rewards.numel() % group_size != 0:
         raise ValueError("rewards length must be divisible by group_size")
     groups = rewards.view(-1, group_size)
     mean = groups.mean(dim=1, keepdim=True)
-    std = groups.std(dim=1, keepdim=True)
+    std = groups.std(dim=1, keepdim=True, unbiased=False)
     adv = (groups - mean) / (std + eps)
     return adv.reshape(-1)
 
@@ -86,7 +114,15 @@ def grpo_loss(
         ``(loss, metrics)``.
     """
     cfg = cfg or GRPOConfig()
-    mask = completion_mask.to(policy_token_logp.dtype)
+    if cfg.group_size <= 1:
+        raise ValueError("cfg.group_size must be at least 2")
+    mask = completion_mask.to(
+        device=policy_token_logp.device, dtype=policy_token_logp.dtype
+    )
+    advantages = advantages.to(
+        device=policy_token_logp.device,
+        dtype=policy_token_logp.dtype,
+    )
 
     ratio = torch.exp(policy_token_logp - old_token_logp)
     adv = advantages.unsqueeze(1)
@@ -131,11 +167,14 @@ def sample_group(
         ``(sequences[G, P+n], completion_mask[G, P+n])`` where the mask is 1 on
         sampled tokens (everything after the prompt that is not padding).
     """
+    if cfg.group_size <= 1:
+        raise ValueError("cfg.group_size must be at least 2")
     if prompt_ids.dim() != 1:
         raise ValueError("prompt_ids must be 1-D")
     p = prompt_ids.shape[0]
     batch = prompt_ids.unsqueeze(0).expand(cfg.group_size, -1).contiguous()
-    seqs = model.generate(
+    seqs = _generate(
+        model,
         batch,
         max_new_tokens=cfg.max_new_tokens,
         temperature=cfg.temperature,
@@ -176,7 +215,9 @@ def grpo_compute_loss(
     Returns ``(loss, metrics)`` with ``loss`` averaged over prompts.
     """
     cfg = cfg or GRPOConfig()
-    policy.reverse_loss_enabled = False
+    if cfg.group_size <= 1:
+        raise ValueError("cfg.group_size must be at least 2")
+    _unwrap_model(policy).reverse_loss_enabled = False
 
     losses = []
     agg: dict[str, float] = {}
@@ -190,7 +231,12 @@ def grpo_compute_loss(
                 mask, seqs, cfg.tool_result_open_ids, cfg.tool_result_close_ids
             )
         responses = [decode(seqs[g, prompt.shape[0]:]) for g in range(seqs.shape[0])]
-        rewards = reward_fn(responses, idx).float()
+        rewards = reward_fn(responses, idx).to(device=seqs.device, dtype=torch.float32)
+        if rewards.numel() != cfg.group_size:
+            raise ValueError(
+                "reward_fn must return one scalar per sampled response "
+                f"(got {rewards.numel()} for group_size={cfg.group_size})"
+            )
         adv = group_normalized_advantages(rewards, cfg.group_size)
 
         with torch.no_grad():

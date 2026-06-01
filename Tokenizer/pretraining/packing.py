@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
+
 from .builder import IGNORE_INDEX, EncodedSample
 
 
@@ -13,21 +15,40 @@ def pack_samples(
     eos_id: int,
     pad_to_max_length: bool = False,
 ) -> list[EncodedSample]:
+    return list(
+        iter_pack_samples(
+            samples,
+            max_length=max_length,
+            pad_id=pad_id,
+            eos_id=eos_id,
+            pad_to_max_length=pad_to_max_length,
+        )
+    )
+
+
+def iter_pack_samples(
+    samples: Iterable[EncodedSample],
+    max_length: int,
+    pad_id: int,
+    eos_id: int,
+    pad_to_max_length: bool = False,
+) -> Iterator[EncodedSample]:
     if max_length <= 0:
         raise ValueError("max_length must be positive")
-    packed: list[EncodedSample] = []
     current = _empty_text_pack()
     count = 0
 
-    def flush() -> None:
+    def flush() -> EncodedSample | None:
         nonlocal current, count
+        emitted = None
         if current.input_ids:
             current.metadata = {"type": "packed_text", "num_samples": count}
             if pad_to_max_length:
                 current = _pad(current, max_length, pad_id)
-            packed.append(current)
+            emitted = current
         current = _empty_text_pack()
         count = 0
+        return emitted
 
     for sample in samples:
         is_multimodal = _has_modality(sample)
@@ -35,10 +56,12 @@ def pack_samples(
         if not sample.input_ids:
             continue
         if is_multimodal:
-            flush()
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
             if pad_to_max_length:
                 sample = _pad(sample, max_length, pad_id)
-            packed.append(sample)
+            yield sample
             continue
 
         extra_ids = list(sample.input_ids)
@@ -59,7 +82,9 @@ def pack_samples(
             extra_morph_depth = [0] + extra_morph_depth
 
         if len(current.input_ids) + len(extra_ids) > max_length:
-            flush()
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
             extra_ids = list(sample.input_ids)
             extra_mask = list(sample.attention_mask)
             extra_labels = list(sample.labels)
@@ -75,8 +100,9 @@ def pack_samples(
         current.morph_depth.extend(extra_morph_depth[:max_length])
         count += 1
 
-    flush()
-    return packed
+    flushed = flush()
+    if flushed is not None:
+        yield flushed
 
 
 def _empty_text_pack() -> EncodedSample:

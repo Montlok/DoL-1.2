@@ -182,6 +182,15 @@ def _grpo_config(
 
 
 def _validate_args(args: argparse.Namespace) -> int:
+    if args.group_size <= 1:
+        print("[error] --group-size must be at least 2", file=sys.stderr)
+        return 2
+    if args.prompts_per_step <= 0:
+        print("[error] --prompts-per-step must be positive", file=sys.stderr)
+        return 2
+    if args.max_new_tokens < 0:
+        print("[error] --max-new-tokens must be non-negative", file=sys.stderr)
+        return 2
     if not args.smoke:
         if not args.tokenizer:
             print("[error] --tokenizer is required (or pass --smoke)", file=sys.stderr)
@@ -205,13 +214,31 @@ def _maybe_init_from_checkpoint(model: RDTForCausalLM, path: str) -> None:
         print(f"[init] loaded {path} (missing={len(missing)} unexpected={len(unexpected)})")
 
 
-def _iter_prompt_batches(dataset, batch_size: int):
-    """Yield lists of dataset rows of length ``batch_size``, cycling forever."""
+def _iter_prompt_batches(
+    dataset,
+    batch_size: int,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+):
+    """Yield rank-sharded prompt rows, cycling forever.
+
+    When the prompt set is smaller than the process count, every rank reads the
+    full set to avoid distributed collectives hanging on ranks with no batches.
+    """
     n = len(dataset)
+    if n <= 0:
+        raise ValueError("prompt dataset is empty")
+    if world_size > 1 and n >= world_size:
+        indices = list(range(rank, n, world_size))
+    else:
+        indices = list(range(n))
+    if not indices:
+        raise ValueError(f"rank={rank} received no prompts from dataset of size {n}")
     i = 0
     while True:
-        batch = [dataset[(i + j) % n] for j in range(batch_size)]
-        i = (i + batch_size) % n
+        batch = [dataset[indices[(i + j) % len(indices)]] for j in range(batch_size)]
+        i = (i + batch_size) % len(indices)
         yield batch
 
 
@@ -286,7 +313,12 @@ def main(argv: list[str] | None = None) -> int:
 
     reward_cfg = _reward_cfg(args)
     grpo_cfg = _grpo_config(args, model_cfg, tool_open_ids, tool_close_ids)
-    batches = _iter_prompt_batches(dataset, args.prompts_per_step)
+    batches = _iter_prompt_batches(
+        dataset,
+        args.prompts_per_step,
+        rank=rank,
+        world_size=world_size,
+    )
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=False)
     t0 = time.time()
