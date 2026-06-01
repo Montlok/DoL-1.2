@@ -17,7 +17,7 @@ dependencies = ["tokenizers>=0.19"]
 
 [project.optional-dependencies]
 hf = ["transformers>=4.40", "tokenizers>=0.19"]
-tokenizer-build = ["tokenizers>=0.19", "datasets>=2.0"]
+tokenizer-build = ["tokenizers>=0.19", "datasets>=2.0", "pyarrow>=12"]
 eval = ["sentencepiece>=0.2"]
 model = ["torch>=2.1"]
 train = ["torch>=2.1", "mamba-ssm>=2.2"]
