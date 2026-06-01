@@ -87,19 +87,21 @@ log() { printf '\n==> %s\n' "$*"; }
 # ---------------------------------------------------------------------------
 log "[0/5] checking build dependencies"
 WIKI_LANGS="$WIKI_LANGS" WIKI_DUMP="$WIKI_DUMP" WIKI_DATE="$WIKI_DATE" python3 - <<'PY'
-import importlib.util, os, sys
+import importlib.util, glob, os, sys
 
 required = ["tokenizers"]
 # Wikipedia sampling needs ``pyarrow`` for a local parquet dump and ``datasets``
 # for the HF streaming fallback. Require each only when that path is actually
-# taken, so local-only / SMOKE runs stay dependency-light.
+# taken, so local-only / SMOKE runs stay dependency-light. A language counts as
+# "local" only when its shard dir actually holds ``*.parquet`` files; an empty
+# or metadata-only dir falls back to streaming (mirrors the sampling loop).
 langs = os.environ.get("WIKI_LANGS", "").split()
 dump = os.environ.get("WIKI_DUMP", "")
 date = os.environ.get("WIKI_DATE", "20231101")
-need_local = any(os.path.isdir(os.path.join(dump, f"{date}.{lang}")) for lang in langs)
-need_stream = any(
-    not os.path.isdir(os.path.join(dump, f"{date}.{lang}")) for lang in langs
-)
+def _has_local(lang):
+    return bool(glob.glob(os.path.join(dump, f"{date}.{lang}", "*.parquet")))
+need_local = any(_has_local(lang) for lang in langs)
+need_stream = any(not _has_local(lang) for lang in langs)
 if need_local:
     required.append("pyarrow")
 if need_stream:
@@ -150,7 +152,7 @@ else
         echo "WARNING: CN_CORPUS unset or missing; skipping CHINESE bundle"
     fi
     for lang in $WIKI_LANGS; do
-        if [ -d "$WIKI_DUMP/$WIKI_DATE.$lang" ]; then
+        if ls "$WIKI_DUMP/$WIKI_DATE.$lang"/*.parquet >/dev/null 2>&1; then
             echo "sampling wikipedia ($lang, up to $WIKI_LIMIT docs) from local dump"
             python3 -m Tokenizer.tools.prepare_corpus --source wiki \
                 --lang "$lang" --limit "$WIKI_LIMIT" --wiki-date "$WIKI_DATE" \
