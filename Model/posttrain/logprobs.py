@@ -98,3 +98,29 @@ def completion_logprobs(
     target_mask = completion_mask[:, 1:].to(token_logp.dtype)
     masked = token_logp * target_mask
     return masked.sum(dim=-1), masked
+
+
+def token_logprobs_with_mask(
+    model: RDTForCausalLM,
+    input_ids: torch.Tensor,
+    completion_mask: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    recurrent_steps: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unmasked per-token log-probs plus the aligned completion mask.
+
+    Unlike :func:`completion_logprobs`, the returned ``token_logp`` is **not**
+    zeroed outside the completion — GRPO needs the raw policy/old/ref log-probs
+    to form importance ratios, and applies the mask only at the final reduction.
+
+    Returns:
+        ``(token_logp[B, T-1], shifted_mask[B, T-1])``.
+    """
+    token_logp = sequence_logprobs(
+        model,
+        input_ids,
+        attention_mask=attention_mask,
+        recurrent_steps=recurrent_steps,
+    )
+    shifted_mask = completion_mask[:, 1:].to(token_logp.dtype)
+    return token_logp, shifted_mask
