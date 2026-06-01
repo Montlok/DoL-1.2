@@ -223,6 +223,9 @@ if [ -n "$MIX_MANIFEST" ]; then
             --manifest "$MIX_MANIFEST" --output "$ALL_JSONL" \
             --tokenizer-bundle "$BUNDLE_DIR" --report "$MIX_REPORT"
         echo "mix report: $MIX_REPORT"
+        # The corpus changed, so any previously packed shards are stale: drop
+        # them to force Stage 3 to repack from the new weighted mixture.
+        rm -f "$SHARD_JSONL"
     fi
 fi
 

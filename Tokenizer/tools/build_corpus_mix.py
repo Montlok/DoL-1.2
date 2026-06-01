@@ -325,15 +325,26 @@ def emit_mix(
 
     total_emitted_docs = 0
     with open(out_path, "w", encoding="utf-8") as fh:
+        # Round-robin across sources so the bounded shuffle buffer always holds a
+        # mixture: pulling one doc per source per cycle means a mid-stream flush
+        # still interleaves every active source, instead of dumping a solid run
+        # of whichever source happened to fill the buffer first.
+        active = []
         for s in stats:
             if s.repeat_factor <= 0:
                 continue
-            tokens_per_doc = (
-                s.est_tokens / s.docs if s.docs else 0.0
-            )
-            for text in _iter_source_texts(
-                s.spec.path, s.spec.fmt, s.spec.text_column
-            ):
+            tokens_per_doc = s.est_tokens / s.docs if s.docs else 0.0
+            it = _iter_source_texts(s.spec.path, s.spec.fmt, s.spec.text_column)
+            active.append((s, tokens_per_doc, it))
+
+        while active:
+            still_active = []
+            for s, tokens_per_doc, it in active:
+                try:
+                    text = next(it)
+                except StopIteration:
+                    continue
+                still_active.append((s, tokens_per_doc, it))
                 n = _emit_counts(s.repeat_factor, rng)
                 for _ in range(n):
                     buffer.append(json.dumps({"text": text}, ensure_ascii=False))
@@ -341,6 +352,7 @@ def emit_mix(
                     realized[s.spec.path]["tokens_est"] += tokens_per_doc
                     total_emitted_docs += 1
                 flush_some(False, fh)
+            active = still_active
         flush_some(True, fh)
 
     report = {

@@ -223,6 +223,30 @@ class EndToEndTest(unittest.TestCase):
             # Both runs target mn~=en, realized shares stay balanced.
             self.assertAlmostEqual(grown["mn"], base["mn"], delta=0.15)
 
+    def test_sources_interleaved_not_blocked(self) -> None:
+        # Two sources both larger than a small shuffle buffer must interleave in
+        # the output, not appear as two solid contiguous runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.jsonl")
+            b = os.path.join(tmp, "b.jsonl")
+            _write_jsonl(a, [f"AAA-{i}" for i in range(500)])
+            _write_jsonl(b, [f"BBB-{i}" for i in range(500)])
+            specs = [
+                SourceSpec.from_raw({"path": a, "lang": "a", "weight": 0.5}),
+                SourceSpec.from_raw({"path": b, "lang": "b", "weight": 0.5}),
+            ]
+            stats = [measure_source(s, _proxy_encode) for s in specs]
+            stats = compute_plan(stats, total_tokens=None, max_epochs=4)
+            out = os.path.join(tmp, "mix.jsonl")
+            # Tiny buffer forces several mid-stream flushes.
+            emit_mix(stats, out, seed=0, buffer_size=50)
+            with open(out, "r", encoding="utf-8") as fh:
+                tags = [json.loads(line)["text"][:3] for line in fh if line.strip()]
+            # The first 100 emitted docs should contain BOTH sources, which is
+            # only true if sources interleave rather than flush one at a time.
+            head = set(tags[:100])
+            self.assertEqual(head, {"AAA", "BBB"})
+
 
 if __name__ == "__main__":
     unittest.main()
