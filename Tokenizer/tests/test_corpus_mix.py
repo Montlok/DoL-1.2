@@ -248,5 +248,100 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(head, {"AAA", "BBB"})
 
 
+class SignatureTest(unittest.TestCase):
+    def _specs(self, a, b):
+        return MixConfig.from_raw(
+            {
+                "sources": [
+                    {"path": a, "lang": "mn", "weight": 0.5},
+                    {"path": b, "lang": "en", "weight": 0.5},
+                ]
+            }
+        )
+
+    def test_signature_changes_when_source_changes(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _compute_signature
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.jsonl")
+            b = os.path.join(tmp, "b.jsonl")
+            _write_jsonl(a, ["one"])
+            _write_jsonl(b, ["two"])
+            mbytes = b'{"x":1}'
+            cfg = self._specs(a, b)
+            sig1 = _compute_signature(mbytes, cfg, None)
+            sig2 = _compute_signature(mbytes, cfg, None)
+            self.assertEqual(sig1, sig2)  # stable when nothing changes
+            # Rewriting a source (new size/mtime) flips the signature.
+            _write_jsonl(a, ["one", "three", "four"])
+            sig3 = _compute_signature(mbytes, cfg, None)
+            self.assertNotEqual(sig1, sig3)
+
+    def test_signature_changes_with_manifest(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _compute_signature
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.jsonl")
+            b = os.path.join(tmp, "b.jsonl")
+            _write_jsonl(a, ["one"])
+            _write_jsonl(b, ["two"])
+            cfg = self._specs(a, b)
+            self.assertNotEqual(
+                _compute_signature(b'{"v":1}', cfg, None),
+                _compute_signature(b'{"v":2}', cfg, None),
+            )
+
+    def test_skip_if_fresh_roundtrip(self) -> None:
+        # Full CLI-style round trip: first build writes a signed report; a second
+        # build with --skip-if-fresh is a no-op (output mtime unchanged); editing
+        # a source invalidates the signature and forces a rebuild.
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            a = os.path.join(tmp, "a.jsonl")
+            b = os.path.join(tmp, "b.jsonl")
+            _write_jsonl(a, [f"alpha-{i}" for i in range(50)])
+            _write_jsonl(b, [f"beta-{i}" for i in range(50)])
+            manifest = os.path.join(tmp, "m.json")
+            with open(manifest, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "sources": [
+                            {"path": a, "lang": "mn", "weight": 0.5},
+                            {"path": b, "lang": "en", "weight": 0.5},
+                        ]
+                    },
+                    f,
+                )
+            out = os.path.join(tmp, "mix.jsonl")
+            report = os.path.join(tmp, "report.json")
+            root = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            )
+            env = {**os.environ, "PYTHONPATH": root}
+            cmd = [
+                sys.executable, "-m", "Tokenizer.tools.build_corpus_mix",
+                "--manifest", manifest, "--output", out, "--report", report,
+                "--skip-if-fresh",
+            ]
+            subprocess.run(cmd, check=True, cwd=root, env=env)
+            mtime1 = os.stat(out).st_mtime_ns
+
+            # Fresh rerun: must skip and leave the output untouched.
+            res = subprocess.run(
+                cmd, check=True, cwd=root, env=env, capture_output=True, text=True
+            )
+            self.assertIn("skipped", res.stdout)
+            self.assertEqual(os.stat(out).st_mtime_ns, mtime1)
+
+            # Edit a source -> signature mismatch -> rebuild (output rewritten).
+            _write_jsonl(a, [f"alpha-{i}" for i in range(80)])
+            res2 = subprocess.run(
+                cmd, check=True, cwd=root, env=env, capture_output=True, text=True
+            )
+            self.assertNotIn("skipped", res2.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

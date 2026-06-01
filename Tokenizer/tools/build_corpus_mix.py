@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import math
 import os
@@ -100,6 +101,48 @@ def _resolve_text_files(path: str) -> list[str]:
             for p in glob.glob(os.path.join(path, "**", ext), recursive=True)
         )
     return sorted(glob.glob(path))
+
+
+def _resolve_source_files(path: str, fmt: str) -> list[str]:
+    """Resolve a source to its concrete backing files (parquet or text)."""
+    if fmt == "parquet":
+        return _resolve_parquet_shards(path)
+    return _resolve_text_files(path)
+
+
+def _path_fingerprint(files: list[str]) -> list[tuple[str, int, int]]:
+    """Cheap (path, size, mtime_ns) fingerprint without reading file contents."""
+    fp = []
+    for p in files:
+        try:
+            st = os.stat(p)
+            fp.append((p, st.st_size, st.st_mtime_ns))
+        except OSError:
+            fp.append((p, -1, -1))
+    return fp
+
+
+def _compute_signature(
+    manifest_bytes: bytes,
+    cfg: "MixConfig",
+    bundle_path: Optional[str],
+) -> str:
+    """Hash the manifest, every resolved source file's (size, mtime) and the
+    tokenizer bundle so the cached mix is invalidated whenever any input that
+    affects the mixture changes (manifest edits, swapped/added/removed shards,
+    or a retrained tokenizer).
+    """
+    h = hashlib.sha256()
+    h.update(manifest_bytes)
+    for spec in cfg.sources:
+        files = _resolve_source_files(spec.path, spec.fmt)
+        h.update(repr((spec.lang, spec.domain, spec.weight, spec.text_column)).encode())
+        h.update(repr(_path_fingerprint(files)).encode())
+    h.update(repr((cfg.total_tokens, cfg.max_epochs, cfg.seed)).encode())
+    if bundle_path:
+        cfg_json = os.path.join(bundle_path, "config.json")
+        h.update(repr(_path_fingerprint([cfg_json])).encode())
+    return h.hexdigest()
 
 
 def _iter_source_texts(path: str, fmt: str, text_column: str) -> Iterator[str]:
@@ -427,10 +470,32 @@ def main() -> None:
         action="store_true",
         help="print per-source measurements and the plan, do not emit",
     )
+    parser.add_argument(
+        "--skip-if-fresh",
+        action="store_true",
+        help=(
+            "skip rebuilding when --output exists and --report carries a "
+            "signature matching the current manifest/sources/tokenizer state"
+        ),
+    )
     args = parser.parse_args()
 
-    with open(args.manifest, "r", encoding="utf-8") as f:
-        cfg = MixConfig.from_raw(json.load(f))
+    with open(args.manifest, "rb") as f:
+        manifest_bytes = f.read()
+    cfg = MixConfig.from_raw(json.loads(manifest_bytes))
+
+    # Cache check: bail out before the expensive measure/emit when nothing that
+    # affects the mixture has changed since the report was last written.
+    signature = _compute_signature(manifest_bytes, cfg, args.tokenizer_bundle)
+    if args.skip_if_fresh and args.report and os.path.exists(args.output):
+        try:
+            with open(args.report, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            prev = {}
+        if prev.get("signature") == signature:
+            print(json.dumps({"skipped": True, "reason": "fresh"}))
+            return
 
     encode = _build_encoder(args.tokenizer_bundle)
     stats = [measure_source(s, encode, args.sample_docs) for s in cfg.sources]
@@ -448,6 +513,7 @@ def main() -> None:
 
     report = emit_mix(stats, args.output, seed=cfg.seed)
     report["max_epochs"] = cfg.max_epochs
+    report["signature"] = signature
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)

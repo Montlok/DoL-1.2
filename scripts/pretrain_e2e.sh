@@ -209,22 +209,18 @@ fi
 # ---------------------------------------------------------------------------
 if [ -n "$MIX_MANIFEST" ]; then
     log "[2b] building token-weighted corpus mix"
-    # Idempotency keys on the mix report, not on all.jsonl: the report is only
-    # ever written by build_corpus_mix, so a stale plain-cat all.jsonl from a
-    # prior unweighted run is correctly rebuilt instead of silently reused.
-    if [ -s "$MIX_REPORT" ] && [ -s "$ALL_JSONL" ]; then
-        echo "weighted mix already built, skipping"
-    else
-        # Drop any stale concat output so the mixer always owns all.jsonl here.
-        rm -f "$ALL_JSONL"
-        # Measure exact tokens with the freshly built bundle, then up/down-sample
-        # each source to hit the manifest's target language/domain proportions.
-        python3 -m Tokenizer.tools.build_corpus_mix \
-            --manifest "$MIX_MANIFEST" --output "$ALL_JSONL" \
-            --tokenizer-bundle "$BUNDLE_DIR" --report "$MIX_REPORT"
-        echo "mix report: $MIX_REPORT"
-        # The corpus changed, so any previously packed shards are stale: drop
-        # them to force Stage 3 to repack from the new weighted mixture.
+    # Delegate staleness to the mixer: --skip-if-fresh rebuilds whenever the
+    # manifest, any source shard, or the tokenizer changes (signature in the
+    # report), and is a no-op otherwise. all.jsonl's mtime therefore only moves
+    # when the mixture actually changed.
+    python3 -m Tokenizer.tools.build_corpus_mix \
+        --manifest "$MIX_MANIFEST" --output "$ALL_JSONL" \
+        --tokenizer-bundle "$BUNDLE_DIR" --report "$MIX_REPORT" --skip-if-fresh
+    echo "mix report: $MIX_REPORT"
+    # If the mix was (re)built, all.jsonl is now newer than any packed shard, so
+    # drop the shard to force Stage 3 to repack from the new mixture. When the
+    # mix was fresh (untouched), the shard stays newer and is preserved.
+    if [ -f "$ALL_JSONL" ] && [ "$ALL_JSONL" -nt "$SHARD_JSONL" ]; then
         rm -f "$SHARD_JSONL"
     fi
 fi
