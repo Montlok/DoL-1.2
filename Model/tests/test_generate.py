@@ -95,6 +95,55 @@ class GenerateTest(unittest.TestCase):
         tail = out[:, prompt.shape[1] + 1:]
         self.assertTrue(torch.all(tail == cfg.pad_id))
 
+    def test_stop_ids_halts_like_eos(self):
+        torch.manual_seed(0)
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        prompt = self._prompt(cfg)
+        stop = 311  # an arbitrary non-eos "delimiter" token (e.g. </tool_call>)
+
+        def fake_forward(window, return_logits=True):
+            bsz = window.shape[0]
+            logits = torch.zeros(bsz, window.shape[1], cfg.vocab_size)
+            logits[:, -1, stop] = 100.0
+            return {"logits": logits}
+
+        model.forward = fake_forward  # type: ignore[method-assign]
+
+        out = model.generate(prompt, max_new_tokens=5, greedy=True, stop_ids=[stop])
+        first_new = out[:, prompt.shape[1]]
+        # The stop token itself is kept so a harness can see which delimiter hit.
+        self.assertTrue(torch.all(first_new == stop))
+        tail = out[:, prompt.shape[1] + 1:]
+        self.assertTrue(torch.all(tail == cfg.pad_id))
+
+    def test_stop_ids_does_not_affect_default_eos(self):
+        torch.manual_seed(0)
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        prompt = self._prompt(cfg)
+
+        # No stop_ids -> identical to a plain greedy run.
+        a = model.generate(prompt, max_new_tokens=6, greedy=True)
+        b = model.generate(prompt, max_new_tokens=6, greedy=True, stop_ids=None)
+        self.assertTrue(torch.equal(a, b))
+
+    def test_on_token_callback_streams_each_step(self):
+        torch.manual_seed(0)
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        prompt = self._prompt(cfg)
+
+        seen: list[int] = []
+
+        def cb(step, tok):
+            seen.append(step)
+            self.assertEqual(tok.shape, (prompt.shape[0],))
+
+        out = model.generate(prompt, max_new_tokens=4, greedy=True, on_token=cb)
+        self.assertEqual(seen, [0, 1, 2, 3])
+        self.assertEqual(out.shape, (prompt.shape[0], prompt.shape[1] + 4))
+
     def test_sampling_respects_top_k_one_equals_greedy(self):
         torch.manual_seed(0)
         cfg = _cfg()

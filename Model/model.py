@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable, Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -528,6 +530,8 @@ class RDTForCausalLM(nn.Module):
         pad_id: int | None = None,
         repetition_penalty: float = 1.0,
         use_cache: bool = False,
+        stop_ids: Sequence[int] | None = None,
+        on_token: Callable[[int, torch.Tensor], None] | None = None,
     ) -> torch.Tensor:
         """Autoregressively continue ``input_ids`` (``[B, L]``) with sampling.
 
@@ -556,6 +560,17 @@ class RDTForCausalLM(nn.Module):
         Returns the full sequence ``[B, L + n]`` where ``n <= max_new_tokens``.
         Generation stops early for a row once it emits ``eos_id`` (subsequent
         positions are filled with ``pad_id``).
+
+        ``stop_ids`` adds extra stop tokens: a row also finishes once it emits
+        any id in ``stop_ids`` (the stop token itself is kept in the output, so
+        a harness can see *which* delimiter — e.g. ``</think>`` or a tool-call
+        close token — ended the segment, then resume by calling ``generate``
+        again on the returned sequence). ``eos_id`` is always a stop token.
+
+        ``on_token`` is an optional callback invoked as ``on_token(step, tok)``
+        after each decoding step with the step index and the ``[B]`` tensor of
+        newly sampled ids; use it for streaming. Both are backward compatible:
+        when unset, behaviour is identical to before.
         """
 
         if input_ids.dim() != 2:
@@ -588,6 +603,17 @@ class RDTForCausalLM(nn.Module):
         device = seq.device
         finished = torch.zeros(seq.shape[0], dtype=torch.bool, device=device)
 
+        stop_token_ids: list[int] = []
+        if eos_id is not None:
+            stop_token_ids.append(int(eos_id))
+        if stop_ids is not None:
+            stop_token_ids.extend(int(s) for s in stop_ids)
+        stop_tensor = (
+            torch.tensor(sorted(set(stop_token_ids)), device=device, dtype=seq.dtype)
+            if stop_token_ids
+            else None
+        )
+
         decode_cache = None
         if use_cache:
             from Model.inference.cache import DecodeCache
@@ -615,7 +641,7 @@ class RDTForCausalLM(nn.Module):
             decode_cache = DecodeCache()
 
         try:
-            for _ in range(max_new_tokens):
+            for step in range(max_new_tokens):
                 if use_cache:
                     if decode_cache.seq_len == 0:
                         step_ids = seq
@@ -655,7 +681,12 @@ class RDTForCausalLM(nn.Module):
                     finished, torch.full_like(next_token, pad_id), next_token
                 )
                 seq = torch.cat([seq, next_token.unsqueeze(1)], dim=1)
-                finished = finished | (next_token == eos_id)
+                if on_token is not None:
+                    on_token(step, next_token)
+                if stop_tensor is not None:
+                    finished = finished | torch.isin(next_token, stop_tensor)
+                else:
+                    finished = finished | (next_token == eos_id)
                 if bool(finished.all()):
                     break
         finally:
