@@ -94,6 +94,8 @@ class MHCAttnSubLayer(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        cache=None,
+        pos_offset: int = 0,
     ) -> torch.Tensor:
         def attn_fn(inp: torch.Tensor) -> torch.Tensor:
             return self.attn(
@@ -102,6 +104,8 @@ class MHCAttnSubLayer(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
+                cache=cache,
+                pos_offset=pos_offset,
             )
 
         streams = self.attn_hc(streams, attn_fn)
@@ -172,12 +176,24 @@ class TwoStageCore(nn.Module):
         causal: bool = True,
         steps: int | None = None,
         bptt_window: int | None = None,
+        cache=None,
+        pos_offset: int = 0,
     ) -> tuple[torch.Tensor, dict]:
         self._check_inputs(e0, word_pos, morph_depth, attn_mask)
 
         total_steps = int(steps if steps is not None else self.cfg.recurrent_steps)
         if total_steps <= 0:
             raise ValueError("steps must be positive")
+
+        if cache is not None:
+            return self._forward_cached(
+                e0,
+                word_pos=word_pos,
+                morph_depth=morph_depth,
+                total_steps=total_steps,
+                cache=cache,
+                pos_offset=pos_offset,
+            )
 
         backbone = self._run_stage1(
             e0,
@@ -218,6 +234,72 @@ class TwoStageCore(nn.Module):
             "global_semantic": out.global_semantic,
         }
         return out.hidden, info
+
+    def _forward_cached(
+        self,
+        e0: torch.Tensor,
+        word_pos: torch.Tensor | None,
+        morph_depth: torch.Tensor | None,
+        total_steps: int,
+        cache,
+        pos_offset: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """Incremental decode path (bit-exact with :meth:`forward`).
+
+        Stage-1 Mamba layers carry a constant-size recurrent state; each
+        ``(step, layer)`` of the Stage-2 refinement loop owns its own causal
+        MLA cache, since every pass re-attends over the frozen earlier
+        positions. ``attn_mask`` is omitted (pad-free generation).
+        """
+
+        backbone = e0
+        for i, layer in enumerate(self.stage1):
+            backbone = layer(
+                backbone,
+                attn_mask=None,
+                cache=cache.mamba_cache(f"stage1.{i}"),
+            )
+
+        if self.drift_mode == "mhc":
+            streams = self._expand(backbone)
+            for step in range(total_steps):
+                for li, layer in enumerate(self.stage2):
+                    streams = layer(
+                        streams,
+                        word_pos=word_pos,
+                        morph_depth=morph_depth,
+                        attn_mask=None,
+                        causal=True,
+                        cache=cache.mla_cache(f"stage2.s{step}.l{li}"),
+                        pos_offset=pos_offset,
+                    )
+            hidden = self._collapse(streams)
+        else:
+            inject = self.drift_mode in {"decay", "both"}
+            hidden = backbone
+            for step in range(total_steps):
+                if inject:
+                    scale = self.inject_scale * (self.inject_decay ** step)
+                    hidden = hidden + scale * backbone
+                for li, layer in enumerate(self.stage2):
+                    hidden = layer(
+                        hidden,
+                        word_pos=word_pos,
+                        morph_depth=morph_depth,
+                        attn_mask=None,
+                        causal=True,
+                        cache=cache.mla_cache(f"stage2.s{step}.l{li}"),
+                        pos_offset=pos_offset,
+                    )
+                if self.boundary_norm is not None:
+                    hidden = self.boundary_norm(hidden)
+
+        info = {
+            "steps_used": total_steps,
+            "ponder_cost": e0.new_tensor(0.0),
+            "global_semantic": backbone.mean(dim=1),
+        }
+        return hidden, info
 
     def _run_stage1(
         self,

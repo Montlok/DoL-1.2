@@ -2,11 +2,11 @@
 
 ## Current Status
 
-The tokenizer is now organized as a routed multi-track scaffold. It keeps one
-global token id space, segments input by route, and records token-level offsets
-for downstream alignment. The implementation is intentionally lightweight but
-keeps extension points for production normalizers, trained MorphBPE models, and
-real HuggingFace tokenizers.
+The tokenizer is organized as a routed two-track design. It keeps one global
+token id space, segments input by route, and records token-level offsets for
+downstream alignment. The two content tracks are a morphology-aware MorphBPE
+track for traditional Mongolian and a general multilingual byte-level BPE track
+for everything else.
 
 ## Module Responsibilities
 
@@ -21,11 +21,13 @@ real HuggingFace tokenizers.
   merges across root/suffix boundaries, and seeds the full Mongolian letter
   alphabet so valid unseen letters still encode at character level instead of
   falling to `<unk>`.
-- `Tokenizer/generic_bpe/` contains reusable HuggingFace-track and byte-fallback
-  helpers.
-- `Tokenizer/unified/` is the routed tokenizer: Mongolian -> MorphBPE,
-  Chinese/English -> HF tracks, specials -> fixed ids, Mongolian/CJK/Latin
-  punctuation -> misc tokens or byte fallback.
+- `Tokenizer/generic_bpe/` wraps the general byte-level BPE (`GeneralBPEModel` /
+  `GeneralBPETrainer`, backed by HuggingFace `tokenizers`) plus byte-fallback
+  helpers. Byte-level coverage means no `<unk>` for any non-Mongolian script.
+- `Tokenizer/unified/` is the routed tokenizer: Mongolian block -> MorphBPE,
+  everything else (Chinese, English, Japanese, Cyrillic, digits, punctuation,
+  symbols, `\n`/`\t`) -> general byte-level BPE, specials -> fixed ids, plain
+  spaces -> the `▁` space token.
 - `Tokenizer/multimodal/` expands image/video-style placeholders and records
   multimodal token spans. The tokenizer does not process vision features.
 
@@ -35,9 +37,7 @@ real HuggingFace tokenizers.
 SEGMENT = {
     "special": (0, 256),
     "mongolian": (256, 24576),
-    "chinese": (24576, 49152),
-    "english": (49152, 63488),
-    "misc": (63488, 65536),
+    "general": (24576, 65536),
 }
 ```
 
@@ -56,9 +56,9 @@ Core special ids: `<pad>` 0, `<unk>` 1, `<bos>` 2, `<eos>` 3, `<img>` 4,
 - `attention_mask`: defaults to one per input id.
 
 Offsets are Python string offsets into the input passed to the tokenizer.
-`<bos>` and `<eos>` use `-1:-1`. Byte fallback repeats the original character
-span for every emitted byte token. HF fast tokenizers use `offset_mapping` when
-available; otherwise the wrapper falls back to coarse span coverage.
+`<bos>` and `<eos>` use `-1:-1`. The general byte-level BPE track uses the
+ByteLevel offset mapping, which is char-accurate; byte fallback (only reachable
+when a track has no model) repeats the original character span per byte token.
 
 ## Multimodal Contract
 

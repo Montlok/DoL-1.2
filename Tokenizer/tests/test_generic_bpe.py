@@ -1,119 +1,58 @@
 # -*- coding: utf-8 -*-
-"""Tests for generic BPE: HF offset wrapper and byte fallback."""
+"""Tests for generic BPE: general byte-level BPE wrapper and byte fallback."""
 
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 
 from Tokenizer.generic_bpe import (
-    HFTrackTokenizer,
+    GeneralBPEModel,
+    GeneralBPETrainer,
     decode_bytes,
     encode_byte_fallback,
     is_byte_token,
 )
 
 
-class _FakeFastTokenizer:
-    """Mimics a HF fast tokenizer that supports return_offsets_mapping."""
+class GeneralBPEModelTests(unittest.TestCase):
+    def test_minimal_is_lossless_byte_level(self):
+        model = GeneralBPEModel.minimal()
+        for text in ("hello", "中文", "日本語", "🙂", "Кириллица"):
+            pieces = model.encode_pieces(text)
+            self.assertTrue(pieces)
+            local_ids = [p[0] for p in pieces]
+            self.assertEqual(model.decode(local_ids), text)
 
-    def __init__(self, vocab: dict[str, int]):
-        self.vocab = vocab
-        self.id_to_token = {i: t for t, i in vocab.items()}
+    def test_minimal_offsets_are_in_bounds(self):
+        model = GeneralBPEModel.minimal()
+        text = "中a文"
+        pieces = model.encode_pieces(text)
+        for _local_id, _tok, start, end in pieces:
+            self.assertLessEqual(0, start)
+            self.assertLessEqual(start, end)
+            self.assertLessEqual(end, len(text))
 
-    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
-        # Naive whitespace tokenization with real char offsets.
-        ids = []
-        offsets = []
-        cursor = 0
-        for word in text.split(" "):
-            if not word:
-                cursor += 1
-                continue
-            ids.append(self.vocab.get(word, self.vocab.get("<unk>", 0)))
-            offsets.append((cursor, cursor + len(word)))
-            cursor += len(word) + 1
-        return {"input_ids": ids, "offset_mapping": offsets}
+    def test_train_compresses_and_round_trips(self):
+        trainer = GeneralBPETrainer(vocab_size=500, min_frequency=1)
+        corpus = ["hello world"] * 50 + ["中文测试"] * 50
+        model = trainer.train(corpus)
+        self.assertGreaterEqual(model.vocab_size, 256)
+        for text in ("hello world", "中文测试", "🙂"):
+            pieces = model.encode_pieces(text)
+            self.assertEqual(model.decode([p[0] for p in pieces]), text)
 
-    def get_vocab(self):
-        return self.vocab
-
-    def encode(self, text, add_special_tokens=False):
-        return self(text)["input_ids"]
-
-    def convert_ids_to_tokens(self, idx):
-        return self.id_to_token.get(idx, "<unk>")
-
-
-class _FakeSlowTokenizer:
-    """Mimics a HF slow tokenizer (no __call__ offsets support)."""
-
-    def __init__(self, vocab: dict[str, int]):
-        self.vocab = vocab
-        self.id_to_token = {i: t for t, i in vocab.items()}
-
-    def encode(self, text, add_special_tokens=False):
-        return [
-            self.vocab.get(w, self.vocab.get("<unk>", 0))
-            for w in text.split(" ")
-            if w
-        ]
-
-    def get_vocab(self):
-        return self.vocab
-
-    def convert_ids_to_tokens(self, idx):
-        return self.id_to_token.get(idx, "<unk>")
-
-
-class HFTrackOffsetTests(unittest.TestCase):
-    def test_fast_offsets_used(self):
-        vocab = {"hello": 1, "world": 2, "<unk>": 0}
-        local_to_global = {1: 101, 2: 102}
-        tok = HFTrackTokenizer(
-            _FakeFastTokenizer(vocab),
-            prefix="en▁",
-            local_to_global=local_to_global,
-            unk_id=999,
-            track="en",
-        )
-        tokens = tok.encode_with_offsets("hello world", base_start=10)
-        self.assertEqual([t.id for t in tokens], [101, 102])
-        self.assertEqual(tokens[0].start, 10)
-        self.assertEqual(tokens[0].end, 15)
-        self.assertEqual(tokens[1].start, 16)
-        self.assertEqual(tokens[1].end, 21)
-        self.assertTrue(all(t.track == "en" for t in tokens))
-
-    def test_slow_fallback(self):
-        vocab = {"hello": 1, "world": 2, "<unk>": 0}
-        local_to_global = {1: 101, 2: 102}
-        tok = HFTrackTokenizer(
-            _FakeSlowTokenizer(vocab),
-            prefix="en▁",
-            local_to_global=local_to_global,
-            unk_id=999,
-            track="en",
-        )
-        tokens = tok.encode_with_offsets("hello world")
-        self.assertEqual(len(tokens), 2)
-        # Coarse offsets must span the whole input monotonically.
-        self.assertEqual(tokens[0].start, 0)
-        self.assertGreater(tokens[-1].end, tokens[0].end)
-        self.assertEqual(tokens[-1].end, len("hello world"))
-
-    def test_unknown_local_id_falls_to_unk(self):
-        vocab = {"hello": 1, "<unk>": 0}
-        tok = HFTrackTokenizer(
-            _FakeFastTokenizer(vocab),
-            prefix="en▁",
-            local_to_global={1: 101},
-            unk_id=999,
-            track="en",
-        )
-        tokens = tok.encode_with_offsets("hello banana")
-        # 'banana' isn't in local_to_global so resolves to unk_id.
-        self.assertEqual(tokens[0].id, 101)
-        self.assertEqual(tokens[1].id, 999)
+    def test_save_and_load_round_trip(self):
+        trainer = GeneralBPETrainer(vocab_size=400, min_frequency=1)
+        model = trainer.train(["abcabc abc"] * 40)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "general.json")
+            model.save(path)
+            loaded = GeneralBPEModel.load(path)
+        self.assertEqual(loaded.get_vocab(), model.get_vocab())
+        pieces = loaded.encode_pieces("abcabc")
+        self.assertEqual(loaded.decode([p[0] for p in pieces]), "abcabc")
 
 
 class ByteFallbackTests(unittest.TestCase):
@@ -145,7 +84,6 @@ class ByteFallbackTests(unittest.TestCase):
         vocab = {f"<0x{i:02X}>": 1000 + i for i in range(256)}
         vocab["<unk>"] = 0
         tokens = encode_byte_fallback("🙂a，", vocab, unk_id=0, base_start=5)
-        # All offsets must be >= base_start and non-decreasing.
         last = 5
         for t in tokens:
             self.assertGreaterEqual(t.start, last - 1)
@@ -153,14 +91,10 @@ class ByteFallbackTests(unittest.TestCase):
             last = t.start
 
     def test_lone_surrogate_does_not_crash(self):
-        # Regression: scraped text can contain lone surrogates (U+D800–U+DFFF).
-        # Strict ``str.encode("utf-8")`` raises UnicodeEncodeError and would
-        # abort the whole shard; surrogatepass must keep encoding going.
         vocab = {f"<0x{i:02X}>": 1000 + i for i in range(256)}
         vocab["<unk>"] = 0
         tokens = encode_byte_fallback("a\ud800b", vocab, unk_id=0)
         self.assertTrue(any(is_byte_token(t.token) for t in tokens))
-        # 'a' + 3 surrogate bytes + 'b' worth of byte tokens, all finite ids.
         self.assertTrue(all(isinstance(t.id, int) for t in tokens))
 
 

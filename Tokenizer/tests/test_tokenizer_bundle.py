@@ -19,17 +19,13 @@ class TokenizerBundleTest(unittest.TestCase):
     def test_bundle_save_load_encode_and_validate(self):
         with tempfile.TemporaryDirectory() as tmp:
             morphbpe_path = self._train_tiny_morphbpe(tmp)
-            bundle = TokenizerBundle.from_files(
-                morphbpe_path,
-                zh_source="smoke-zh",
-                en_source="smoke-en",
-                use_smoke_hf=True,
-            )
+            bundle = TokenizerBundle.from_files(morphbpe_path)
             out_dir = os.path.join(tmp, "bundle")
             bundle.save_dir(out_dir)
 
             self.assertTrue(os.path.exists(os.path.join(out_dir, "config.json")))
             self.assertTrue(os.path.exists(os.path.join(out_dir, "morphbpe.json")))
+            self.assertTrue(os.path.exists(os.path.join(out_dir, "general.json")))
             self.assertTrue(os.path.exists(os.path.join(out_dir, "vocab.json")))
 
             loaded = TokenizerBundle.from_dir(out_dir)
@@ -54,6 +50,60 @@ class TokenizerBundleTest(unittest.TestCase):
                 "<image_end>",
             ])
             self.assertEqual(len(mm.attention_mask), len(mm.input_ids))
+
+    def test_from_dir_loads_legacy_v1_config(self):
+        # Pre-v2 bundles stored zh_source/en_source/use_smoke_hf in config.json.
+        # Those keys must be dropped (with a warning), not raise TypeError.
+        import json
+        import warnings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            morphbpe_path = self._train_tiny_morphbpe(tmp)
+            bundle = TokenizerBundle.from_files(morphbpe_path)
+            out_dir = os.path.join(tmp, "bundle")
+            bundle.save_dir(out_dir)
+
+            config_path = os.path.join(out_dir, "config.json")
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg.update(
+                {
+                    "zh_source": "qwen",
+                    "en_source": "gpt2",
+                    "use_smoke_hf": True,
+                }
+            )
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f)
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                loaded = TokenizerBundle.from_dir(out_dir)
+            self.assertEqual(loaded.validate(), [])
+            self.assertFalse(hasattr(loaded.config, "zh_source"))
+            self.assertTrue(
+                any("legacy" in str(w.message).lower() for w in caught),
+                "expected a warning about legacy config keys",
+            )
+
+    def test_from_dir_rejects_unknown_config_key(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            morphbpe_path = self._train_tiny_morphbpe(tmp)
+            bundle = TokenizerBundle.from_files(morphbpe_path)
+            out_dir = os.path.join(tmp, "bundle")
+            bundle.save_dir(out_dir)
+
+            config_path = os.path.join(out_dir, "config.json")
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            cfg["totally_unknown_key"] = 1
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f)
+
+            with self.assertRaises(TypeError):
+                TokenizerBundle.from_dir(out_dir)
 
 
 if __name__ == "__main__":

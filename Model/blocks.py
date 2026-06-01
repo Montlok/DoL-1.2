@@ -30,6 +30,8 @@ class StandardBlock(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        cache=None,
+        pos_offset: int = 0,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.attn_norm(x),
@@ -37,6 +39,8 @@ class StandardBlock(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
+            cache=cache,
+            pos_offset=pos_offset,
         )
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -61,6 +65,8 @@ class AttnSubLayer(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        cache=None,
+        pos_offset: int = 0,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.attn_norm(x),
@@ -68,6 +74,8 @@ class AttnSubLayer(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
+            cache=cache,
+            pos_offset=pos_offset,
         )
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -87,9 +95,10 @@ class MambaSubLayer(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache=None,
         **kwargs,
     ) -> torch.Tensor:
-        x = self.mamba(x, attn_mask=attn_mask)
+        x = self.mamba(x, attn_mask=attn_mask, cache=cache)
         x = x + self.ffn(self.ffn_norm(x))
 
         if attn_mask is not None:

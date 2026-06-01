@@ -12,9 +12,9 @@ import json
 import sys
 from typing import Iterable
 
+from Tokenizer.generic_bpe import GeneralBPEModel
 from Tokenizer.unified.dual_tokenizer import (
     DualTrackTokenizer,
-    build_misc_tokens,
     build_unified_vocab,
 )
 
@@ -36,26 +36,10 @@ class _Morph:
         return [self.vocab.get(text, 0)]
 
 
-class _HF:
-    def __init__(self, vocab):
-        self._vocab = vocab
-
-    def get_vocab(self):
-        return dict(self._vocab)
-
-    def encode(self, text, add_special_tokens=False):
-        if text in self._vocab:
-            return [self._vocab[text]]
-        return [self._vocab[ch] for ch in text if ch in self._vocab]
-
-
 def _smoke_tokenizer() -> DualTrackTokenizer:
-    zh = _HF({"中": 0, "文": 1})
-    en = _HF({"hello": 0, "test": 1})
-    vocab = build_unified_vocab(
-        _Morph.vocab, ["中", "文"], ["hello", "test"], build_misc_tokens()
-    )
-    return DualTrackTokenizer(vocab, _Morph(), zh, en)
+    general = GeneralBPEModel.minimal()
+    vocab = build_unified_vocab(_Morph.vocab, general.get_vocab())
+    return DualTrackTokenizer(vocab, _Morph(), general)
 
 
 def _texts(path: str | None) -> Iterable[str]:

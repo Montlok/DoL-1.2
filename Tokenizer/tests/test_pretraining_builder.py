@@ -17,12 +17,7 @@ def build_smoke_bundle(tmp: str) -> TokenizerBundle:
     morphbpe = trainer.train(["ᠮᠣᠩᠭᠣᠯ ᠪᠢᠴᠢᠭ", "ᠮᠣᠩᠭᠣᠯ text"])
     morph_path = os.path.join(tmp, "morphbpe.json")
     morphbpe.save(morph_path)
-    bundle = TokenizerBundle.from_files(
-        morph_path,
-        zh_source="smoke-zh",
-        en_source="smoke-en",
-        use_smoke_hf=True,
-    )
+    bundle = TokenizerBundle.from_files(morph_path)
     bundle_dir = os.path.join(tmp, "bundle")
     bundle.save_dir(bundle_dir)
     return TokenizerBundle.from_dir(bundle_dir)

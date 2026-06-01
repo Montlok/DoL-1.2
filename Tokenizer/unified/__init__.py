@@ -9,8 +9,6 @@ __all__ = [
     "Span",
     "TokenizerBundle",
     "TokenizerBundleConfig",
-    "build_dual_tokenizer",
-    "build_misc_tokens",
     "build_unified_vocab",
     "make_byte_tokens",
     "segment_by_language",
@@ -22,7 +20,7 @@ def __getattr__(name):
         from . import encoded
 
         return getattr(encoded, name)
-    if name in {"SEGMENT", "SPECIAL_TOKENS", "build_misc_tokens", "build_unified_vocab", "make_byte_tokens"}:
+    if name in {"SEGMENT", "SPECIAL_TOKENS", "build_unified_vocab", "make_byte_tokens"}:
         from . import vocab
 
         return getattr(vocab, name)

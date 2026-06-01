@@ -1,76 +1,23 @@
 # -*- coding: utf-8 -*-
-"""Tokenizer coverage and hit-rate metrics for mixed Mongolian/zh/en text."""
+"""Tokenizer coverage and hit-rate metrics for mixed Mongolian/general text."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from collections import Counter
 from typing import Any, Iterable
 
 from Tokenizer.evals.mongolian_boundary_recall import compute_metrics
+from Tokenizer.generic_bpe import is_byte_token
 from Tokenizer.morphbpe import MorphBPETrainer
 from Tokenizer.traditional_mongolian.alphabet import is_mongolian_codepoint
 from Tokenizer.unified.bundle import TokenizerBundle
 from Tokenizer.unified.dual_tokenizer import (
     DualTrackTokenizer,
-    build_misc_tokens,
     build_unified_vocab,
-    char_lang,
 )
-
-
-class _LongestMatchTokenizer:
-    def __init__(self, tokens: Iterable[str]):
-        ordered = list(dict.fromkeys(tok for tok in tokens if tok))
-        if "<unk>" not in ordered:
-            ordered.insert(0, "<unk>")
-        self._vocab = {tok: idx for idx, tok in enumerate(ordered)}
-        self._unk_id = self._vocab["<unk>"]
-        self._ordered = sorted(
-            (tok for tok in self._vocab if tok != "<unk>"),
-            key=len,
-            reverse=True,
-        )
-
-    def get_vocab(self) -> dict[str, int]:
-        return dict(self._vocab)
-
-    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
-        return [idx for idx, _start, _end in self._tokenize(text)]
-
-    def __call__(
-        self,
-        text: str,
-        add_special_tokens: bool = False,
-        return_offsets_mapping: bool = False,
-    ) -> dict[str, list[Any]]:
-        pieces = self._tokenize(text)
-        result: dict[str, list[Any]] = {
-            "input_ids": [idx for idx, _start, _end in pieces]
-        }
-        if return_offsets_mapping:
-            result["offset_mapping"] = [(start, end) for _idx, start, end in pieces]
-        return result
-
-    def _tokenize(self, text: str) -> list[tuple[int, int, int]]:
-        out: list[tuple[int, int, int]] = []
-        cursor = 0
-        while cursor < len(text):
-            match = None
-            for token in self._ordered:
-                if text.startswith(token, cursor):
-                    match = token
-                    break
-            if match is None:
-                out.append((self._unk_id, cursor, cursor + 1))
-                cursor += 1
-                continue
-            out.append((self._vocab[match], cursor, cursor + len(match)))
-            cursor += len(match)
-        return out
 
 
 def iter_text(path: str) -> list[str]:
@@ -98,6 +45,7 @@ def build_experimental_tokenizer(
     vocab_size: int,
     min_pair_freq: int,
     seed_alphabet: bool = True,
+    general_vocab_size: int = 8000,
 ) -> DualTrackTokenizer:
     morphbpe = MorphBPETrainer(
         vocab_size=vocab_size,
@@ -105,28 +53,22 @@ def build_experimental_tokenizer(
         seed_alphabet=seed_alphabet,
     ).train(train_texts)
 
-    zh_counts: Counter[str] = Counter()
-    en_counts: Counter[str] = Counter()
-    for text in train_texts:
-        for ch in text:
-            if char_lang(ch) == "zh":
-                zh_counts[ch] += 1
-        for word in re.findall(r"[A-Za-z]+", text):
-            en_counts[word] += 1
+    from Tokenizer.generic_bpe import GeneralBPETrainer
 
-    zh_tokens = [tok for tok, _count in zh_counts.most_common()]
-    en_tokens = [tok for tok, _count in en_counts.most_common()]
+    general = GeneralBPETrainer(
+        vocab_size=general_vocab_size,
+        min_frequency=min_pair_freq,
+        show_progress=False,
+    ).train(train_texts)
+
     vocab = build_unified_vocab(
         morphbpe_vocab=morphbpe.vocab,
-        chinese_tokens=zh_tokens,
-        english_tokens=en_tokens,
-        misc_tokens=build_misc_tokens(),
+        general_vocab=general.get_vocab(),
     )
     return DualTrackTokenizer(
         unified_vocab=vocab,
         morphbpe=morphbpe,
-        zh_hf_tokenizer=_LongestMatchTokenizer(zh_tokens),
-        en_hf_tokenizer=_LongestMatchTokenizer(en_tokens),
+        general=general,
     )
 
 
@@ -165,7 +107,7 @@ def compute_hit_rate(texts: list[str], tokenizer: DualTrackTokenizer) -> dict[st
             if token.id == tokenizer.unk_id:
                 unk_count += 1
                 unk_by_track[token.track] += 1
-            if token.track == "misc" and token.token.startswith("<0x"):
+            if token.track == "general" and is_byte_token(token.token):
                 byte_fallback += 1
 
         for span in result.spans:
