@@ -572,8 +572,10 @@ class RDTForCausalLM(nn.Module):
 
         ``on_token`` is an optional callback invoked as ``on_token(step, tok)``
         after each decoding step with the step index and the ``[B]`` tensor of
-        newly sampled ids; use it for streaming. Both are backward compatible:
-        when unset, behaviour is identical to before.
+        ids that were just appended to the sequence; use it for streaming. Note
+        rows that have already finished receive ``pad_id`` (not a freshly
+        sampled id), matching exactly what is written to the output. Both are
+        backward compatible: when unset, behaviour is identical to before.
 
         ``recurrent_steps`` overrides the recurrent-depth refinement count for
         this decode call (default ``None`` -> ``cfg.recurrent_steps``). Because
@@ -695,6 +697,7 @@ class RDTForCausalLM(nn.Module):
                 next_token = torch.where(
                     finished, torch.full_like(next_token, pad_id), next_token
                 )
+                next_token = next_token.to(seq.dtype)
                 seq = torch.cat([seq, next_token.unsqueeze(1)], dim=1)
                 if on_token is not None:
                     on_token(step, next_token)

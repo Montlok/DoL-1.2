@@ -56,6 +56,17 @@ class GenerateTest(unittest.TestCase):
         b = model.generate(prompt, max_new_tokens=6, greedy=True)
         self.assertTrue(torch.equal(a, b))
 
+    def test_generate_preserves_int32_prompt_dtype(self):
+        torch.manual_seed(0)
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        prompt = self._prompt(cfg).to(torch.int32)
+
+        out = model.generate(prompt, max_new_tokens=5, greedy=True)
+
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out.shape, (2, prompt.shape[1] + 5))
+
     def test_generate_keeps_model_in_eval_off_for_training(self):
         cfg = _cfg()
         model = RDTForCausalLM(cfg)
