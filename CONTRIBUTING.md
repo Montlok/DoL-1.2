@@ -718,7 +718,7 @@ Author / Translator / Compiler. Title. Publisher or Collection, Edition, Year, p
 本仓库 / This Repository:
 
 ```text
-KeikaJames/LLM4MGLIAN, file path, commit or release tag, Apache License 2.0.
+Montlok/MoRoN-1.2, file path, commit or release tag, Apache License 2.0.
 ```
 
 ### 10.7 示例文本规范 / Example Text Rules
