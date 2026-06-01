@@ -24,6 +24,7 @@ import copy
 import os
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import torch
@@ -106,6 +107,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--recurrent-steps", type=int, default=None,
                    help="latent depth for sampling + scoring; defaults to config")
     p.add_argument("--dist-backend", choices=["nccl", "gloo"], default="nccl")
+    p.add_argument("--no-tool-result-mask", action="store_true",
+                   help="disable masking of externally-injected <tool_result> "
+                        "spans from the RL objective (on by default)")
     p.add_argument("--smoke", action="store_true", help="run 4 in-memory steps")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args(argv)
@@ -158,7 +162,12 @@ def _smoke_decode(ids: torch.Tensor) -> str:
     return "".join(chr((int(i) % 90) + 33) for i in ids.tolist() if int(i) != PAD_ID)
 
 
-def _grpo_config(args: argparse.Namespace, model_cfg: RDTConfig) -> GRPOConfig:
+def _grpo_config(
+    args: argparse.Namespace,
+    model_cfg: RDTConfig,
+    tool_result_open_ids: Sequence[int] | None = None,
+    tool_result_close_ids: Sequence[int] | None = None,
+) -> GRPOConfig:
     return GRPOConfig(
         clip_eps=args.clip_eps,
         kl_coef=args.kl_coef,
@@ -167,6 +176,8 @@ def _grpo_config(args: argparse.Namespace, model_cfg: RDTConfig) -> GRPOConfig:
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
+        tool_result_open_ids=list(tool_result_open_ids or []),
+        tool_result_close_ids=list(tool_result_close_ids or []),
     )
 
 
@@ -246,11 +257,18 @@ def main(argv: list[str] | None = None) -> int:
             train_cfg.resume, policy, optimizer, scheduler, state=state
         )
 
+    tool_open_ids: list[int] = []
+    tool_close_ids: list[int] = []
     if args.smoke:
         dataset = _smoke_dataset()
         decode = _smoke_decode
     else:
         from Tokenizer.unified.bundle import TokenizerBundle
+
+        from Model.posttrain.chat_template import (
+            TOOL_RESULT_CLOSE,
+            TOOL_RESULT_OPEN,
+        )
 
         bundle = TokenizerBundle.from_dir(args.tokenizer)
         dataset = PromptDataset(
@@ -262,9 +280,12 @@ def main(argv: list[str] | None = None) -> int:
         decode = lambda ids: bundle.tokenizer.decode(  # noqa: E731
             [int(i) for i in ids.tolist() if int(i) != PAD_ID]
         )
+        if not args.no_tool_result_mask:
+            tool_open_ids = list(bundle.encode(TOOL_RESULT_OPEN, add_bos=False, add_eos=False))
+            tool_close_ids = list(bundle.encode(TOOL_RESULT_CLOSE, add_bos=False, add_eos=False))
 
     reward_cfg = _reward_cfg(args)
-    grpo_cfg = _grpo_config(args, model_cfg)
+    grpo_cfg = _grpo_config(args, model_cfg, tool_open_ids, tool_close_ids)
     batches = _iter_prompt_batches(dataset, args.prompts_per_step)
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=False)

@@ -145,8 +145,9 @@ def sample_group(
         recurrent_steps=cfg.recurrent_steps,
     )
     mask = torch.zeros_like(seqs, dtype=torch.float32)
-    mask[:, p:] = 1.0
-    if pad_id is not None:
+    if pad_id is None:
+        mask[:, p:] = 1.0
+    else:
         mask[:, p:] = (seqs[:, p:] != pad_id).float()
     return seqs, mask
 
