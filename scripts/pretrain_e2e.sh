@@ -19,6 +19,9 @@
 #   CN_CORPUS       CHINESE bundle dir (人民日报/问答/Journal/Tsinghua)
 #   WIKI_LANGS      space-separated wiki languages (default "en ja zh mn")
 #   WIKI_LIMIT      wiki docs per language for tokenizer coverage (default 20000)
+#   WIKI_DUMP       local wikimedia parquet dump dir ({DATE}.{lang}/*.parquet);
+#                   used per-language when present, else HF streaming fallback
+#   WIKI_DATE       wiki snapshot date for the local dump (default 20231101)
 #   MORPHBPE_VOCAB  MorphBPE vocab size (default 24000)
 #   GENERAL_VOCAB   general byte-level BPE vocab size (default 40000)
 #   MAX_LENGTH      packed sequence length for shards (default 2048)
@@ -36,6 +39,8 @@ SMOKE="${SMOKE:-0}"
 WORK_DEFAULT="$ROOT/outputs/pretrain_e2e"
 WIKI_LANGS="${WIKI_LANGS:-en ja zh mn}"
 WIKI_LIMIT="${WIKI_LIMIT:-20000}"
+WIKI_DUMP="${WIKI_DUMP:-$ROOT/WIKIPEDIA(DO NOT GIT IT)}"
+WIKI_DATE="${WIKI_DATE:-20231101}"
 MORPHBPE_VOCAB="${MORPHBPE_VOCAB:-24000}"
 GENERAL_VOCAB="${GENERAL_VOCAB:-40000}"
 MAX_LENGTH="${MAX_LENGTH:-2048}"
@@ -81,13 +86,23 @@ log() { printf '\n==> %s\n' "$*"; }
 # Stage 0: dependency check
 # ---------------------------------------------------------------------------
 log "[0/5] checking build dependencies"
-WIKI_LANGS="$WIKI_LANGS" python3 - <<'PY'
+WIKI_LANGS="$WIKI_LANGS" WIKI_DUMP="$WIKI_DUMP" WIKI_DATE="$WIKI_DATE" python3 - <<'PY'
 import importlib.util, os, sys
 
 required = ["tokenizers"]
-# ``datasets`` is only needed to sample Wikipedia. Local-only and SMOKE runs
-# (WIKI_LANGS empty) must stay dependency-light.
-if os.environ.get("WIKI_LANGS", "").strip():
+# Wikipedia sampling needs ``pyarrow`` for a local parquet dump and ``datasets``
+# for the HF streaming fallback. Require each only when that path is actually
+# taken, so local-only / SMOKE runs stay dependency-light.
+langs = os.environ.get("WIKI_LANGS", "").split()
+dump = os.environ.get("WIKI_DUMP", "")
+date = os.environ.get("WIKI_DATE", "20231101")
+need_local = any(os.path.isdir(os.path.join(dump, f"{date}.{lang}")) for lang in langs)
+need_stream = any(
+    not os.path.isdir(os.path.join(dump, f"{date}.{lang}")) for lang in langs
+)
+if need_local:
+    required.append("pyarrow")
+if need_stream:
     required.append("datasets")
 
 missing = [m for m in required if importlib.util.find_spec(m) is None]
@@ -135,9 +150,17 @@ else
         echo "WARNING: CN_CORPUS unset or missing; skipping CHINESE bundle"
     fi
     for lang in $WIKI_LANGS; do
-        echo "sampling wikipedia ($lang, up to $WIKI_LIMIT docs)"
-        python3 -m Tokenizer.tools.prepare_corpus --source wiki \
-            --lang "$lang" --limit "$WIKI_LIMIT" --output "$GENERAL_JSONL" --append
+        if [ -d "$WIKI_DUMP/$WIKI_DATE.$lang" ]; then
+            echo "sampling wikipedia ($lang, up to $WIKI_LIMIT docs) from local dump"
+            python3 -m Tokenizer.tools.prepare_corpus --source wiki \
+                --lang "$lang" --limit "$WIKI_LIMIT" --wiki-date "$WIKI_DATE" \
+                --input "$WIKI_DUMP" --output "$GENERAL_JSONL" --append
+        else
+            echo "sampling wikipedia ($lang, up to $WIKI_LIMIT docs) via HF streaming"
+            python3 -m Tokenizer.tools.prepare_corpus --source wiki \
+                --lang "$lang" --limit "$WIKI_LIMIT" --wiki-date "$WIKI_DATE" \
+                --output "$GENERAL_JSONL" --append
+        fi
     done
 fi
 cat "$MN_JSONL" "$GENERAL_JSONL" > "$ALL_JSONL"
