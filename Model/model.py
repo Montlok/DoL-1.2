@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Callable, Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,6 +70,7 @@ class RDTForCausalLM(nn.Module):
         morph_depth: torch.Tensor,
         cache,
         pixel_values: torch.Tensor | None = None,
+        steps: int | None = None,
     ) -> torch.Tensor:
         """Incremental forward over the new tokens ``input_ids`` (``[B, m]``).
 
@@ -111,6 +114,7 @@ class RDTForCausalLM(nn.Module):
             causal=True,
             cache=cache,
             pos_offset=pos_offset,
+            steps=steps,
         )
 
         for i, block in enumerate(self.coda):
@@ -528,6 +532,9 @@ class RDTForCausalLM(nn.Module):
         pad_id: int | None = None,
         repetition_penalty: float = 1.0,
         use_cache: bool = False,
+        stop_ids: Sequence[int] | None = None,
+        on_token: Callable[[int, torch.Tensor], None] | None = None,
+        recurrent_steps: int | None = None,
     ) -> torch.Tensor:
         """Autoregressively continue ``input_ids`` (``[B, L]``) with sampling.
 
@@ -556,6 +563,26 @@ class RDTForCausalLM(nn.Module):
         Returns the full sequence ``[B, L + n]`` where ``n <= max_new_tokens``.
         Generation stops early for a row once it emits ``eos_id`` (subsequent
         positions are filled with ``pad_id``).
+
+        ``stop_ids`` adds extra stop tokens: a row also finishes once it emits
+        any id in ``stop_ids`` (the stop token itself is kept in the output, so
+        a harness can see *which* delimiter — e.g. ``</think>`` or a tool-call
+        close token — ended the segment, then resume by calling ``generate``
+        again on the returned sequence). ``eos_id`` is always a stop token.
+
+        ``on_token`` is an optional callback invoked as ``on_token(step, tok)``
+        after each decoding step with the step index and the ``[B]`` tensor of
+        ids that were just appended to the sequence; use it for streaming. Note
+        rows that have already finished receive ``pad_id`` (not a freshly
+        sampled id), matching exactly what is written to the output. Both are
+        backward compatible: when unset, behaviour is identical to before.
+
+        ``recurrent_steps`` overrides the recurrent-depth refinement count for
+        this decode call (default ``None`` -> ``cfg.recurrent_steps``). Because
+        RDT reasons in latent depth, raising this spends more test-time compute
+        ("think harder") per token without emitting any extra tokens; lowering
+        it trades quality for speed. The override is constant for the whole call
+        so the incremental KV/state cache stays consistent across positions.
         """
 
         if input_ids.dim() != 2:
@@ -572,6 +599,8 @@ class RDTForCausalLM(nn.Module):
             raise ValueError("min_p must be in (0, 1] when set")
         if repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be positive")
+        if recurrent_steps is not None and recurrent_steps <= 0:
+            raise ValueError("recurrent_steps must be positive when set")
         if use_cache and self.cfg.core_type != "two_stage":
             raise NotImplementedError(
                 "use_cache=True is only supported for core_type='two_stage'"
@@ -587,6 +616,17 @@ class RDTForCausalLM(nn.Module):
         seq = input_ids
         device = seq.device
         finished = torch.zeros(seq.shape[0], dtype=torch.bool, device=device)
+
+        stop_token_ids: list[int] = []
+        if eos_id is not None:
+            stop_token_ids.append(int(eos_id))
+        if stop_ids is not None:
+            stop_token_ids.extend(int(s) for s in stop_ids)
+        stop_tensor = (
+            torch.tensor(sorted(set(stop_token_ids)), device=device, dtype=seq.dtype)
+            if stop_token_ids
+            else None
+        )
 
         decode_cache = None
         if use_cache:
@@ -615,7 +655,7 @@ class RDTForCausalLM(nn.Module):
             decode_cache = DecodeCache()
 
         try:
-            for _ in range(max_new_tokens):
+            for step in range(max_new_tokens):
                 if use_cache:
                     if decode_cache.seq_len == 0:
                         step_ids = seq
@@ -629,13 +669,16 @@ class RDTForCausalLM(nn.Module):
                         word_pos=word_pos[:, -m:],
                         morph_depth=morph_depth[:, -m:],
                         cache=decode_cache,
+                        steps=recurrent_steps,
                     )[:, -1, :].float()
                 else:
                     window = seq
                     if window.shape[1] > cfg.max_seq_len:
                         window = window[:, -cfg.max_seq_len:]
 
-                    out = self.forward(window, return_logits=True)
+                    out = self.forward(
+                        window, steps=recurrent_steps, return_logits=True
+                    )
                     logits = out["logits"][:, -1, :].float()
 
                 if repetition_penalty != 1.0:
@@ -654,8 +697,14 @@ class RDTForCausalLM(nn.Module):
                 next_token = torch.where(
                     finished, torch.full_like(next_token, pad_id), next_token
                 )
+                next_token = next_token.to(seq.dtype)
                 seq = torch.cat([seq, next_token.unsqueeze(1)], dim=1)
-                finished = finished | (next_token == eos_id)
+                if on_token is not None:
+                    on_token(step, next_token)
+                if stop_tensor is not None:
+                    finished = finished | torch.isin(next_token, stop_tensor)
+                else:
+                    finished = finished | (next_token == eos_id)
                 if bool(finished.all()):
                     break
         finally:
