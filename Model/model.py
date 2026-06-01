@@ -70,6 +70,7 @@ class RDTForCausalLM(nn.Module):
         morph_depth: torch.Tensor,
         cache,
         pixel_values: torch.Tensor | None = None,
+        steps: int | None = None,
     ) -> torch.Tensor:
         """Incremental forward over the new tokens ``input_ids`` (``[B, m]``).
 
@@ -113,6 +114,7 @@ class RDTForCausalLM(nn.Module):
             causal=True,
             cache=cache,
             pos_offset=pos_offset,
+            steps=steps,
         )
 
         for i, block in enumerate(self.coda):
@@ -532,6 +534,7 @@ class RDTForCausalLM(nn.Module):
         use_cache: bool = False,
         stop_ids: Sequence[int] | None = None,
         on_token: Callable[[int, torch.Tensor], None] | None = None,
+        recurrent_steps: int | None = None,
     ) -> torch.Tensor:
         """Autoregressively continue ``input_ids`` (``[B, L]``) with sampling.
 
@@ -571,6 +574,13 @@ class RDTForCausalLM(nn.Module):
         after each decoding step with the step index and the ``[B]`` tensor of
         newly sampled ids; use it for streaming. Both are backward compatible:
         when unset, behaviour is identical to before.
+
+        ``recurrent_steps`` overrides the recurrent-depth refinement count for
+        this decode call (default ``None`` -> ``cfg.recurrent_steps``). Because
+        RDT reasons in latent depth, raising this spends more test-time compute
+        ("think harder") per token without emitting any extra tokens; lowering
+        it trades quality for speed. The override is constant for the whole call
+        so the incremental KV/state cache stays consistent across positions.
         """
 
         if input_ids.dim() != 2:
@@ -587,6 +597,8 @@ class RDTForCausalLM(nn.Module):
             raise ValueError("min_p must be in (0, 1] when set")
         if repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be positive")
+        if recurrent_steps is not None and recurrent_steps <= 0:
+            raise ValueError("recurrent_steps must be positive when set")
         if use_cache and self.cfg.core_type != "two_stage":
             raise NotImplementedError(
                 "use_cache=True is only supported for core_type='two_stage'"
@@ -655,13 +667,16 @@ class RDTForCausalLM(nn.Module):
                         word_pos=word_pos[:, -m:],
                         morph_depth=morph_depth[:, -m:],
                         cache=decode_cache,
+                        steps=recurrent_steps,
                     )[:, -1, :].float()
                 else:
                     window = seq
                     if window.shape[1] > cfg.max_seq_len:
                         window = window[:, -cfg.max_seq_len:]
 
-                    out = self.forward(window, return_logits=True)
+                    out = self.forward(
+                        window, steps=recurrent_steps, return_logits=True
+                    )
                     logits = out["logits"][:, -1, :].float()
 
                 if repetition_penalty != 1.0:

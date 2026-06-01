@@ -80,7 +80,7 @@ class GenerateTest(unittest.TestCase):
         prompt = self._prompt(cfg)
 
         # Make forward deterministically favor EOS, independent of tied weights.
-        def fake_forward(window, return_logits=True):
+        def fake_forward(window, return_logits=True, steps=None):
             bsz = window.shape[0]
             logits = torch.zeros(bsz, window.shape[1], cfg.vocab_size)
             logits[:, -1, cfg.eos_id] = 100.0
@@ -102,7 +102,7 @@ class GenerateTest(unittest.TestCase):
         prompt = self._prompt(cfg)
         stop = 311  # an arbitrary non-eos "delimiter" token (e.g. </tool_call>)
 
-        def fake_forward(window, return_logits=True):
+        def fake_forward(window, return_logits=True, steps=None):
             bsz = window.shape[0]
             logits = torch.zeros(bsz, window.shape[1], cfg.vocab_size)
             logits[:, -1, stop] = 100.0
@@ -143,6 +143,56 @@ class GenerateTest(unittest.TestCase):
         out = model.generate(prompt, max_new_tokens=4, greedy=True, on_token=cb)
         self.assertEqual(seen, [0, 1, 2, 3])
         self.assertEqual(out.shape, (prompt.shape[0], prompt.shape[1] + 4))
+
+    def test_recurrent_steps_override_changes_logits(self):
+        torch.manual_seed(0)
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        model.eval()
+        prompt = self._prompt(cfg)
+
+        # More latent-depth refinement ("think harder") must actually change the
+        # computation: the next-token logits differ between shallow and deep.
+        with torch.no_grad():
+            shallow = model.forward(prompt, steps=1, return_logits=True)["logits"]
+            deep = model.forward(prompt, steps=8, return_logits=True)["logits"]
+        self.assertEqual(shallow.shape, deep.shape)
+        self.assertFalse(torch.allclose(shallow, deep))
+
+    def test_recurrent_steps_none_matches_default(self):
+        torch.manual_seed(0)
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        prompt = self._prompt(cfg)
+
+        a = model.generate(prompt, max_new_tokens=5, greedy=True)
+        b = model.generate(prompt, max_new_tokens=5, greedy=True, recurrent_steps=None)
+        self.assertTrue(torch.equal(a, b))
+
+    def test_recurrent_steps_rejects_non_positive(self):
+        cfg = _cfg()
+        model = RDTForCausalLM(cfg)
+        prompt = self._prompt(cfg)
+        with self.assertRaises(ValueError):
+            model.generate(prompt, max_new_tokens=2, recurrent_steps=0)
+
+    def test_recurrent_steps_override_cached_matches_cachefree(self):
+        # The depth override must reach the incremental-cache decode path and
+        # stay bit-exact with the cache-free path (two_stage core only).
+        from Model.tests.test_decode_cache import _two_stage_cfg
+
+        torch.manual_seed(0)
+        cfg = _two_stage_cfg()
+        model = RDTForCausalLM(cfg)
+        prompt = torch.tensor([[cfg.bos_id, 300, 301, 302]])
+
+        free = model.generate(
+            prompt, max_new_tokens=4, greedy=True, recurrent_steps=2, use_cache=False
+        )
+        cached = model.generate(
+            prompt, max_new_tokens=4, greedy=True, recurrent_steps=2, use_cache=True
+        )
+        self.assertTrue(torch.equal(free, cached))
 
     def test_sampling_respects_top_k_one_equals_greedy(self):
         torch.manual_seed(0)
