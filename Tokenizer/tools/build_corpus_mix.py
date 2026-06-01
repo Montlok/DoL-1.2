@@ -37,6 +37,13 @@ Manifest schema (JSON)::
 ``weight`` values are normalized, so they need not sum to 1. ``path`` may be a
 ``.jsonl``/``.txt`` file, a ``.parquet`` file, a directory of parquet shards, or
 a glob. ``format`` is inferred from the extension when omitted.
+
+Optional per-source cleaning (all default off, so behaviour is unchanged unless
+requested):
+  * ``min_chars`` (int): drop documents shorter than this many characters.
+  * ``strip_url_lines`` (bool): remove lines that are a bare URL.
+  * ``keep_lines`` ("zh"|"mongolian"): keep only lines containing that script,
+    e.g. to extract the Chinese side of a line-aligned bilingual corpus.
 """
 
 from __future__ import annotations
@@ -55,9 +62,38 @@ _DEFAULT_MAX_EPOCHS = 4
 _DEFAULT_SAMPLE_DOCS = 2000
 _MIN_CHARS = 1
 
+# Unicode script ranges used by the optional per-source line filter.
+_SCRIPT_RANGES = {
+    "zh": ((0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0xF900, 0xFAFF)),
+    "mongolian": ((0x1800, 0x18AF), (0x11660, 0x1167F)),
+}
+
 
 def _clean(text: str) -> str:
     return (text or "").strip()
+
+
+def _line_has_script(line: str, script: str) -> bool:
+    ranges = _SCRIPT_RANGES[script]
+    return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in line)
+
+
+def _postclean(text: str, spec: "SourceSpec") -> str:
+    """Apply opt-in per-source cleaning. No-op unless the source requests it."""
+    if not (spec.strip_url_lines or spec.keep_lines):
+        return text
+    lines = text.split("\n")
+    kept = []
+    for line in lines:
+        ls = line.strip()
+        if spec.strip_url_lines and ls and " " not in ls and ls.lower().startswith(
+            ("http://", "https://", "www.")
+        ):
+            continue
+        if spec.keep_lines and ls and not _line_has_script(ls, spec.keep_lines):
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
 
 
 def _infer_format(path: str, explicit: Optional[str]) -> str:
@@ -145,8 +181,15 @@ def _compute_signature(
     return h.hexdigest()
 
 
-def _iter_source_texts(path: str, fmt: str, text_column: str) -> Iterator[str]:
+def _iter_source_texts(spec: "SourceSpec") -> Iterator[str]:
     """Yield cleaned, non-empty texts from a source in any supported format."""
+    path, fmt, text_column = spec.path, spec.fmt, spec.text_column
+    min_chars = max(spec.min_chars, _MIN_CHARS)
+
+    def finalize(raw: str) -> Optional[str]:
+        text = _postclean(_clean(raw), spec)
+        return text if len(text) >= min_chars else None
+
     if fmt == "parquet":
         import pyarrow.parquet as pq
 
@@ -162,8 +205,8 @@ def _iter_source_texts(path: str, fmt: str, text_column: str) -> Iterator[str]:
                 )
             for batch in pf.iter_batches(batch_size=1000, columns=[text_column]):
                 for value in batch.column(text_column):
-                    text = _clean(str(value.as_py() or ""))
-                    if len(text) >= _MIN_CHARS:
+                    text = finalize(str(value.as_py() or ""))
+                    if text is not None:
                         yield text
     elif fmt == "txt":
         files = _resolve_text_files(path)
@@ -172,8 +215,8 @@ def _iter_source_texts(path: str, fmt: str, text_column: str) -> Iterator[str]:
         for fp in files:
             with open(fp, "r", encoding="utf-8", errors="replace") as fh:
                 for line in fh:
-                    text = _clean(line)
-                    if len(text) >= _MIN_CHARS:
+                    text = finalize(line)
+                    if text is not None:
                         yield text
     else:  # jsonl
         files = _resolve_text_files(path)
@@ -189,8 +232,8 @@ def _iter_source_texts(path: str, fmt: str, text_column: str) -> Iterator[str]:
                         obj = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    text = _clean(str(obj.get(text_column, "") or ""))
-                    if len(text) >= _MIN_CHARS:
+                    text = finalize(str(obj.get(text_column, "") or ""))
+                    if text is not None:
                         yield text
 
 
@@ -202,11 +245,19 @@ class SourceSpec:
     weight: float = 1.0
     text_column: str = "text"
     fmt: str = ""
+    min_chars: int = _MIN_CHARS
+    strip_url_lines: bool = False
+    keep_lines: str = ""
 
     @classmethod
     def from_raw(cls, raw: dict) -> "SourceSpec":
         if "path" not in raw:
             raise ValueError(f"source entry missing 'path': {raw!r}")
+        keep_lines = raw.get("keep_lines", "") or ""
+        if keep_lines and keep_lines not in _SCRIPT_RANGES:
+            raise ValueError(
+                f"keep_lines={keep_lines!r} not in {sorted(_SCRIPT_RANGES)}"
+            )
         return cls(
             path=raw["path"],
             lang=raw.get("lang", "unknown"),
@@ -214,6 +265,9 @@ class SourceSpec:
             weight=float(raw.get("weight", 1.0)),
             text_column=raw.get("text_column", "text"),
             fmt=_infer_format(raw["path"], raw.get("format")),
+            min_chars=int(raw.get("min_chars", _MIN_CHARS)),
+            strip_url_lines=bool(raw.get("strip_url_lines", False)),
+            keep_lines=keep_lines,
         )
 
 
@@ -262,7 +316,7 @@ def measure_source(
     """
     stats = SourceStats(spec=spec)
     sampled_chars = 0
-    for text in _iter_source_texts(spec.path, spec.fmt, spec.text_column):
+    for text in _iter_source_texts(spec):
         stats.docs += 1
         clen = len(text)
         stats.chars += clen
@@ -377,7 +431,7 @@ def emit_mix(
             if s.repeat_factor <= 0:
                 continue
             tokens_per_doc = s.est_tokens / s.docs if s.docs else 0.0
-            it = _iter_source_texts(s.spec.path, s.spec.fmt, s.spec.text_column)
+            it = _iter_source_texts(s.spec)
             active.append((s, tokens_per_doc, it))
 
         while active:

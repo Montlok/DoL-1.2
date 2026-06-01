@@ -59,26 +59,28 @@ class ManifestTest(unittest.TestCase):
 
 class GlobSourceTest(unittest.TestCase):
     def test_jsonl_glob_expands(self) -> None:
-        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+        from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
 
         with tempfile.TemporaryDirectory() as tmp:
             _write_jsonl(os.path.join(tmp, "a.jsonl"), ["alpha"])
             _write_jsonl(os.path.join(tmp, "b.jsonl"), ["beta"])
             texts = sorted(
-                _iter_source_texts(os.path.join(tmp, "*.jsonl"), "jsonl", "text")
+                _iter_source_texts(
+                    SourceSpec(path=os.path.join(tmp, "*.jsonl"), fmt="jsonl")
+                )
             )
             self.assertEqual(texts, ["alpha", "beta"])
 
     def test_jsonl_directory_expands(self) -> None:
-        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+        from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
 
         with tempfile.TemporaryDirectory() as tmp:
             _write_jsonl(os.path.join(tmp, "a.jsonl"), ["one", "two"])
-            texts = sorted(_iter_source_texts(tmp, "jsonl", "text"))
+            texts = sorted(_iter_source_texts(SourceSpec(path=tmp, fmt="jsonl")))
             self.assertEqual(texts, ["one", "two"])
 
     def test_txt_glob_expands(self) -> None:
-        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+        from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
 
         with tempfile.TemporaryDirectory() as tmp:
             with open(os.path.join(tmp, "a.txt"), "w", encoding="utf-8") as fh:
@@ -86,20 +88,78 @@ class GlobSourceTest(unittest.TestCase):
             with open(os.path.join(tmp, "b.txt"), "w", encoding="utf-8") as fh:
                 fh.write("line-b\n")
             texts = sorted(
-                _iter_source_texts(os.path.join(tmp, "*.txt"), "txt", "text")
+                _iter_source_texts(
+                    SourceSpec(path=os.path.join(tmp, "*.txt"), fmt="txt")
+                )
             )
             self.assertEqual(texts, ["line-a", "line-b"])
 
     def test_missing_glob_raises(self) -> None:
-        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+        from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
 
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
                 list(
                     _iter_source_texts(
-                        os.path.join(tmp, "nope-*.jsonl"), "jsonl", "text"
+                        SourceSpec(
+                            path=os.path.join(tmp, "nope-*.jsonl"), fmt="jsonl"
+                        )
                     )
                 )
+
+
+class CleaningTest(unittest.TestCase):
+    def test_strip_url_lines(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = "real content here\nhttps://example.com/page\nmore content"
+            _write_jsonl(os.path.join(tmp, "a.jsonl"), [doc])
+            spec = SourceSpec(
+                path=os.path.join(tmp, "a.jsonl"),
+                fmt="jsonl",
+                strip_url_lines=True,
+            )
+            out = list(_iter_source_texts(spec))
+            self.assertEqual(out, ["real content here\nmore content"])
+
+    def test_keep_zh_lines_drops_english(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = "跳到主要内容\nSkip to main content\n香港政府一站通"
+            _write_jsonl(os.path.join(tmp, "a.jsonl"), [doc])
+            spec = SourceSpec(
+                path=os.path.join(tmp, "a.jsonl"),
+                fmt="jsonl",
+                keep_lines="zh",
+            )
+            out = list(_iter_source_texts(spec))
+            self.assertEqual(out, ["跳到主要内容\n香港政府一站通"])
+
+    def test_min_chars_drops_short_docs(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_jsonl(os.path.join(tmp, "a.jsonl"), ["short", "a much longer doc"])
+            spec = SourceSpec(
+                path=os.path.join(tmp, "a.jsonl"), fmt="jsonl", min_chars=10
+            )
+            out = list(_iter_source_texts(spec))
+            self.assertEqual(out, ["a much longer doc"])
+
+    def test_no_cleaning_by_default(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = "keep\nhttps://x.com\nSkip to main content"
+            _write_jsonl(os.path.join(tmp, "a.jsonl"), [doc])
+            out = list(_iter_source_texts(SourceSpec(path=os.path.join(tmp, "a.jsonl"), fmt="jsonl")))
+            self.assertEqual(out, [doc])
+
+    def test_invalid_keep_lines_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            SourceSpec.from_raw({"path": "x.jsonl", "keep_lines": "klingon"})
 
 
 class EmitCountsTest(unittest.TestCase):
