@@ -151,27 +151,28 @@ def sample_group(
     return seqs, mask
 
 
-def grpo_step(
+def grpo_compute_loss(
     policy: RDTForCausalLM,
     reference: RDTForCausalLM | None,
     prompts: Sequence[torch.Tensor],
     reward_fn: Callable[[Sequence[str], int], torch.Tensor],
     decode: Callable[[torch.Tensor], str],
-    optimizer: torch.optim.Optimizer,
     cfg: GRPOConfig | None = None,
     eos_id: int | None = None,
     pad_id: int | None = None,
-) -> dict[str, float]:
-    """One GRPO update over a batch of prompts.
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Sample groups and build the differentiable GRPO loss for a prompt batch.
 
     For each prompt: sample a group, snapshot the sampling log-probs (``old``),
     score the group with ``reward_fn`` (decoded via ``decode``), normalize
-    advantages within the group, then take a clipped policy-gradient step with a
-    KL penalty toward ``reference`` (frozen). Reverse loss must be disabled on
-    the policy during alignment.
+    advantages within the group, and accumulate the clipped surrogate + KL
+    toward ``reference`` (frozen). The optimizer step is left to the caller so
+    trainers can own grad accumulation / clipping / scheduling.
 
     ``reward_fn(responses, prompt_index) -> [group_size]`` keeps reward logic
     (references, verifiers) outside the optimizer.
+
+    Returns ``(loss, metrics)`` with ``loss`` averaged over prompts.
     """
     cfg = cfg or GRPOConfig()
     policy.reverse_loss_enabled = False
@@ -214,18 +215,45 @@ def grpo_step(
             agg[k] = agg.get(k, 0.0) + v
 
     total = torch.stack(losses).mean()
-    optimizer.zero_grad()
-    total.backward()
-    optimizer.step()
-
     n = len(prompts)
     out = {k: v / n for k, v in agg.items()}
     out["loss"] = float(total.detach())
+    return total, out
+
+
+def grpo_step(
+    policy: RDTForCausalLM,
+    reference: RDTForCausalLM | None,
+    prompts: Sequence[torch.Tensor],
+    reward_fn: Callable[[Sequence[str], int], torch.Tensor],
+    decode: Callable[[torch.Tensor], str],
+    optimizer: torch.optim.Optimizer,
+    cfg: GRPOConfig | None = None,
+    eos_id: int | None = None,
+    pad_id: int | None = None,
+    grad_clip: float | None = None,
+) -> dict[str, float]:
+    """Convenience one-call GRPO update: compute loss + optimizer step.
+
+    Wraps :func:`grpo_compute_loss`; trainers that need grad accumulation or
+    custom scheduling should call :func:`grpo_compute_loss` directly and own the
+    optimizer step. ``grad_clip`` clips the global grad norm before stepping.
+    """
+    total, out = grpo_compute_loss(
+        policy, reference, prompts, reward_fn, decode,
+        cfg=cfg, eos_id=eos_id, pad_id=pad_id,
+    )
+    optimizer.zero_grad()
+    total.backward()
+    if grad_clip:
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
+    optimizer.step()
     return out
 
 
 __all__ = [
     "GRPOConfig",
+    "grpo_compute_loss",
     "grpo_loss",
     "grpo_step",
     "group_normalized_advantages",
