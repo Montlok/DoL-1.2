@@ -694,12 +694,30 @@ class TrainingConfig:
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
     grad_clip: float = 1.0
+    # Adam-atan2 (arXiv:2407.05872): replace the eps-guarded division by
+    # ``atan2`` so the update is scale-invariant and immune to bf16 underflow
+    # in the second-moment denominator. Drop-in; eps is then unused.
+    adam_use_atan2: bool = False
+    # Muon (Moonlight arXiv:2502.16982) for 2D weight matrices, AdamW for the
+    # rest. EXPERIMENTAL on this model: recurrent weight sharing amplifies the
+    # per-step gradients (~r x), so the orthogonalized update interacts with
+    # the shared-weight loop in ways the paper does not cover. Opt-in only.
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
 
-    # schedule (warmup + cosine to min_lr_ratio)
+    # schedule: "cosine" (warmup + cosine to min_lr_ratio) or "wsd"
+    # (warmup-stable-decay, MiniCPM arXiv:2404.06395 — a long constant-LR
+    # plateau then a short decay tail, which is where Mongolian-domain
+    # adaptation is concentrated). Both decay to ``min_lr_ratio * lr``.
     max_steps: int = 100_000
     warmup_steps: int = 2_000
     lr_decay_steps: int | None = None  # defaults to max_steps
     min_lr_ratio: float = 0.1
+    lr_schedule: str = "cosine"
+    # WSD: fraction of [warmup, lr_decay_steps] spent at the stable plateau
+    # before the decay tail begins. The remainder is the decay phase.
+    wsd_stable_ratio: float = 0.8
+    wsd_decay_shape: str = "1-sqrt"  # one of: 1-sqrt, linear, cosine
 
     # precision / memory
     precision: str = "bf16"  # one of: fp32, bf16, fp16
@@ -755,6 +773,23 @@ class TrainingConfig:
             self.lr_decay_steps = self.max_steps
         if self.recurrent_steps_ramp < 0:
             raise ValueError("recurrent_steps_ramp must be non-negative")
+        if self.optimizer.lower() not in {"adamw", "muon"}:
+            raise ValueError(f"unsupported optimizer: {self.optimizer}")
+        if self.lr_schedule not in {"cosine", "wsd"}:
+            raise ValueError(
+                f"lr_schedule must be 'cosine' or 'wsd', got {self.lr_schedule!r}"
+            )
+        if not (0.0 <= self.wsd_stable_ratio < 1.0):
+            raise ValueError("wsd_stable_ratio must be in [0, 1)")
+        if self.wsd_decay_shape not in {"1-sqrt", "linear", "cosine"}:
+            raise ValueError(
+                "wsd_decay_shape must be one of '1-sqrt'/'linear'/'cosine', "
+                f"got {self.wsd_decay_shape!r}"
+            )
+        if self.muon_ns_steps <= 0:
+            raise ValueError("muon_ns_steps must be positive")
+        if not (0.0 <= self.muon_momentum < 1.0):
+            raise ValueError("muon_momentum must be in [0, 1)")
 
 
 @dataclass
