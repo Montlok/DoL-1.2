@@ -525,6 +525,58 @@ class RDTForCausalLM(nn.Module):
                 with torch.no_grad():
                     module.weight[module.padding_idx].zero_()
 
+    def _kl_exit_active(self, recurrent_steps: int | None) -> bool:
+        """Whether zero-shot KL early-exit governs this decode step.
+
+        Gated on ``cfg.kl_exit_threshold > 0`` and only on the cache-free path
+        with no explicit ``recurrent_steps`` override; when disabled the decode
+        is bit-exact with a single fixed-depth forward.
+        """
+
+        return (
+            self.cfg.kl_exit_threshold > 0.0
+            and recurrent_steps is None
+            and self.cfg.core_type in {"two_stage", "segmented"}
+        )
+
+    @torch.no_grad()
+    def _adaptive_depth_logits(
+        self,
+        window: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Last-position logits with per-token adaptive recurrent depth.
+
+        Runs the refinement at increasing depth ``d = 1 .. recurrent_steps`` and
+        stops as soon as the symmetric-free KL between the depth-``d`` and
+        depth-``d-1`` last-token distributions drops below
+        ``cfg.kl_exit_threshold`` for every row (Huginn arXiv:2502.05171 §6.1,
+        zero-shot convergence of the latent recurrence). Saves test-time compute
+        on "easy" tokens while spending full depth on hard / rare ones. Always
+        returns the deepest distribution actually computed.
+        """
+
+        max_steps = self.cfg.recurrent_steps
+        threshold = self.cfg.kl_exit_threshold
+        prev_logp = None
+        logits = None
+        for d in range(1, max_steps + 1):
+            if pixel_values is not None:
+                out = self.forward(
+                    window, steps=d, return_logits=True, pixel_values=pixel_values
+                )
+            else:
+                out = self.forward(window, steps=d, return_logits=True)
+            logits = out["logits"][:, -1, :].float()
+            logp = F.log_softmax(logits, dim=-1)
+            if prev_logp is not None:
+                # KL(p_d || p_{d-1}) per row; exit when all rows have converged.
+                kl = (logp.exp() * (logp - prev_logp)).sum(dim=-1)
+                if bool((kl < threshold).all()):
+                    break
+            prev_logp = logp
+        return logits
+
     @torch.no_grad()
     def generate(
         self,
@@ -713,18 +765,23 @@ class RDTForCausalLM(nn.Module):
                                 "keep L + max_new_tokens <= max_seq_len."
                             )
 
-                    if pixel_values is not None:
+                    if self._kl_exit_active(recurrent_steps):
+                        logits = self._adaptive_depth_logits(
+                            window, pixel_values
+                        )
+                    elif pixel_values is not None:
                         out = self.forward(
                             window,
                             steps=recurrent_steps,
                             return_logits=True,
                             pixel_values=pixel_values,
                         )
+                        logits = out["logits"][:, -1, :].float()
                     else:
                         out = self.forward(
                             window, steps=recurrent_steps, return_logits=True
                         )
-                    logits = out["logits"][:, -1, :].float()
+                        logits = out["logits"][:, -1, :].float()
 
                 if repetition_penalty != 1.0:
                     logits = self._apply_repetition_penalty(
