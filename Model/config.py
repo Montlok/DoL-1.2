@@ -174,6 +174,46 @@ class RDTConfig:
     two_stage_downsample: bool = False
     two_stage_max_segments: int = 0
 
+    # ------------------------------------------------------------------
+    # Segmented core (``core_type="segmented"``, Block-Transformer-style,
+    # fully causal — arXiv:2406.02657 / 2306.09539).
+    #
+    # Text is sliced into fixed-length blocks of ``segment_len`` tokens. A
+    # causal (forward-only) Mamba encodes every token; the causal state at
+    # each block boundary is that block's summary (it only ever saw tokens
+    # <= the boundary, so there is zero future leakage). Block-causal MLA +
+    # shared-weight RDT recurrent depth refine the ``n_seg`` summaries, then a
+    # local causal decoder scatters the *previous* block's refined context
+    # back to token resolution to predict the next block. Because
+    # n_seg << n_tok the attention/RDT cost drops sharply.
+    #
+    # Stage-1 Mamba / Stage-2 attention layer counts reuse
+    # ``stage1_mamba_layers`` / ``stage2_attn_layers``; drift control reuses
+    # ``recurrent_drift_mode``.
+    # ------------------------------------------------------------------
+    segment_len: int = 8
+    segmented_local_layers: int = 2
+
+    # Random-r recurrent depth (Huginn arXiv:2502.05171): when enabled,
+    # training samples the refinement depth uniformly from
+    # ``[recurrent_r_min, recurrent_r_max]`` each forward instead of the fixed
+    # ``recurrent_steps``. Disabled by default so the other cores stay
+    # bit-exact. An explicit ``steps`` override always wins over sampling.
+    recurrent_random_r: bool = False
+    recurrent_r_min: int = 1
+    recurrent_r_max: int = 8
+
+    # Recurrent KV-sharing budget for cached decode (Huginn 6.2 / MoR
+    # arXiv:2507.10524): when > 0 the RDT refinement steps reuse a circular
+    # buffer of at most ``kv_share_budget`` MLA caches instead of one cache
+    # per (step, layer). 0 keeps the exact per-step caches.
+    kv_share_budget: int = 0
+
+    # Zero-shot per-token KL early-exit threshold for ``generate()`` (Huginn
+    # 6.1): stop the refinement loop once the KL between successive step
+    # output distributions drops below this value. 0 disables (fixed depth).
+    kl_exit_threshold: float = 0.0
+
     use_act: bool = False
     act_threshold: float = 0.99
     act_max_steps: int = 32
@@ -329,9 +369,10 @@ class RDTConfig:
             raise ValueError("loss_chunk_size must be positive")
 
     def _check_core(self) -> None:
-        if self.core_type not in {"interleaved", "two_stage"}:
+        if self.core_type not in {"interleaved", "two_stage", "segmented"}:
             raise ValueError(
-                f"core_type must be 'interleaved' or 'two_stage', got {self.core_type!r}"
+                "core_type must be 'interleaved', 'two_stage' or 'segmented', "
+                f"got {self.core_type!r}"
             )
 
         if self.recurrent_drift_mode not in {"none", "norm", "decay", "both", "mhc"}:
@@ -341,11 +382,26 @@ class RDTConfig:
                 f"{self.recurrent_drift_mode!r}"
             )
 
-        if self.core_type == "two_stage":
+        if self.recurrent_random_r:
+            if self.recurrent_r_min <= 0:
+                raise ValueError("recurrent_r_min must be positive")
+            if self.recurrent_r_max < self.recurrent_r_min:
+                raise ValueError(
+                    "recurrent_r_max must be >= recurrent_r_min when "
+                    "recurrent_random_r=True"
+                )
+
+        if self.kv_share_budget < 0:
+            raise ValueError("kv_share_budget must be non-negative")
+
+        if self.kl_exit_threshold < 0:
+            raise ValueError("kl_exit_threshold must be non-negative")
+
+        if self.core_type in {"two_stage", "segmented"}:
             if self.use_act:
                 raise ValueError(
-                    "core_type='two_stage' does not support use_act=True; ACT is "
-                    "only implemented for the interleaved RecurrentCore"
+                    f"core_type={self.core_type!r} does not support use_act=True; "
+                    "ACT is only implemented for the interleaved RecurrentCore"
                 )
             if self.stage1_mamba_layers <= 0:
                 raise ValueError("stage1_mamba_layers must be positive")
@@ -364,6 +420,7 @@ class RDTConfig:
                     "0 iterations cannot project onto the Birkhoff polytope"
                 )
 
+        if self.core_type == "two_stage":
             # Order-preserving downsampling is not implemented for the causal
             # two-stage core: mean-pooling a word's characters into one segment
             # leaks that word's future characters into earlier positions. Reject
@@ -374,6 +431,12 @@ class RDTConfig:
                     "two-stage core (it would leak intra-word future on a causal "
                     "path); keep two_stage_downsample=False"
                 )
+
+        if self.core_type == "segmented":
+            if self.segment_len <= 0:
+                raise ValueError("segment_len must be positive")
+            if self.segmented_local_layers <= 0:
+                raise ValueError("segmented_local_layers must be positive")
 
     @property
     def block_layers(self) -> int:
@@ -533,6 +596,73 @@ def two_stage_pretrain_config() -> RDTConfig:
         recurrent_drift_mode="mhc",
         mhc_n_streams=4,
         mhc_sinkhorn_iters=20,
+    )
+
+
+def segmented_tiny_config() -> RDTConfig:
+    """Tiny segmented (Block-Transformer-style) core for CPU smoke / tests.
+
+    Causal Mamba block encoder -> block-causal MLA + RDT refinement over
+    block summaries -> local causal decoder. NaiveSSM fallback (no CUDA).
+    """
+
+    return RDTConfig(
+        d_model=512,
+        n_heads=8,
+        head_dim=64,
+        kv_lora_rank=128,
+        rope_head_dim=32,
+        nope_head_dim=32,
+        ffn_hidden=1536,
+        ffn_multiple=256,
+        n_prelude=2,
+        n_coda=2,
+        mamba_per_block=5,
+        attn_per_block=1,
+        recurrent_steps=4,
+        max_seq_len=2048,
+        use_official_mamba=False,
+        core_type="segmented",
+        stage1_mamba_layers=5,
+        stage2_attn_layers=1,
+        segment_len=4,
+        segmented_local_layers=2,
+        recurrent_drift_mode="none",
+    )
+
+
+def segmented_pretrain_config() -> RDTConfig:
+    """~1.1B segmented RDT for formal pretraining (official Mamba on CUDA)."""
+
+    return RDTConfig(
+        d_model=2048,
+        n_heads=16,
+        head_dim=128,
+        kv_lora_rank=512,
+        rope_head_dim=64,
+        nope_head_dim=64,
+        ffn_hidden=8192,
+        ffn_multiple=256,
+        n_prelude=3,
+        n_coda=3,
+        mamba_per_block=5,
+        attn_per_block=1,
+        recurrent_steps=8,
+        max_seq_len=4096,
+        use_official_mamba=True,
+        bidirectional=False,
+        grad_ckpt_recurrent=True,
+        grad_ckpt_prelude_coda=True,
+        loss_chunk_size=8192,
+        core_type="segmented",
+        stage1_mamba_layers=5,
+        stage2_attn_layers=1,
+        segment_len=8,
+        segmented_local_layers=2,
+        recurrent_drift_mode="none",
+        recurrent_random_r=True,
+        recurrent_r_min=2,
+        recurrent_r_max=8,
     )
 
 
