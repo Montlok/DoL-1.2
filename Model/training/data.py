@@ -318,7 +318,7 @@ def _resolve_shards(spec: str | Sequence[str | Path]) -> list[Path]:
             # and is the right tool for user-supplied shard specs that may
             # be absolute mount paths like ``/mnt/corpus/*.jsonl``.
             return sorted(Path(p) for p in glob.glob(str(spec), recursive=True))
-        return [path]
+        return [path] if path.is_file() else []
     return [Path(p) for p in spec]
 
 
@@ -347,6 +347,12 @@ def build_dataloader(
     paths = _resolve_shards(spec)
     if not paths:
         raise FileNotFoundError(f"no shards resolved from spec: {spec!r}")
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "resolved shard paths do not exist: "
+            + ", ".join(str(path) for path in missing[:5])
+        )
 
     dataset = StreamingJsonlDataset(
         paths,

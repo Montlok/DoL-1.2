@@ -23,11 +23,11 @@ Run on the GPU server (not collected by unittest):
 
 from __future__ import annotations
 
+import math
 import time
 
 import torch
 
-from Model.config import RDTConfig
 from Model.model import RDTForCausalLM
 from Model.tests.gpu_bench import _base
 
@@ -109,12 +109,19 @@ def profile_rdt_scaling():
         mo = torch.zeros(1, seq, dtype=torch.long, device=dev)
         try:
             with torch.no_grad():
-                t_ts = _time(lambda: ts._refine_plain(x, word_pos=wp,
-                                                      morph_depth=mo,
-                                                      attn_mask=None, causal=True,
-                                                      total_steps=8,
-                                                      bptt_window=None),
-                             iters=5, warmup=2)
+                t_ts = _time(
+                    lambda ts_core=ts: ts_core._refine_plain(
+                        x,
+                        word_pos=wp,
+                        morph_depth=mo,
+                        attn_mask=None,
+                        causal=True,
+                        total_steps=8,
+                        bptt_window=None,
+                    ),
+                    iters=5,
+                    warmup=2,
+                )
         except RuntimeError:
             t_ts = float("nan")
         del ts
@@ -128,14 +135,22 @@ def profile_rdt_scaling():
         wps = torch.arange(n_seg, device=dev).unsqueeze(0)
         mos = torch.zeros(1, n_seg, dtype=torch.long, device=dev)
         with torch.no_grad():
-            t_sg = _time(lambda: sg._refine(xs, word_pos=wps, morph_depth=mos,
-                                            total_steps=8, bptt_window=None),
-                         iters=5, warmup=2)
+            t_sg = _time(
+                lambda sg_core=sg: sg_core._refine(
+                    xs,
+                    word_pos=wps,
+                    morph_depth=mos,
+                    total_steps=8,
+                    bptt_window=None,
+                ),
+                iters=5,
+                warmup=2,
+            )
         del sg
         torch.cuda.empty_cache()
 
         sp = t_ts / t_sg if t_sg > 0 else float("nan")
-        ts_str = "OOM" if t_ts != t_ts else f"{t_ts:7.2f} ms"
+        ts_str = "OOM" if math.isnan(t_ts) else f"{t_ts:7.2f} ms"
         print(f"{seq:>6}{ts_str:>20}{t_sg:>17.2f} ms{sp:>9.1f}x", flush=True)
 
 

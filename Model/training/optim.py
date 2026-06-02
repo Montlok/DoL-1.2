@@ -37,15 +37,8 @@ _NORM_TYPES: tuple[type, ...] = (
 )
 
 
-def param_groups_with_no_decay(
-    model: nn.Module,
-    weight_decay: float,
-) -> list[dict]:
-    """Split parameters into decayed / non-decayed groups.
-
-    Norms, biases, embeddings, and tensors marked with ``_no_weight_decay``
-    (e.g. mamba ``dt_bias``, ``A_log``, ``D``) skip weight decay.
-    """
+def _split_params_by_decay(model: nn.Module) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
+    """Return ``(decay, no_decay)`` parameter lists using the repo policy."""
 
     decay: list[nn.Parameter] = []
     no_decay: list[nn.Parameter] = []
@@ -73,6 +66,21 @@ def param_groups_with_no_decay(
                 no_decay.append(param)
             else:
                 decay.append(param)
+
+    return decay, no_decay
+
+
+def param_groups_with_no_decay(
+    model: nn.Module,
+    weight_decay: float,
+) -> list[dict]:
+    """Split parameters into decayed / non-decayed groups.
+
+    Norms, biases, embeddings, and tensors marked with ``_no_weight_decay``
+    (e.g. mamba ``dt_bias``, ``A_log``, ``D``) skip weight decay.
+    """
+
+    decay, no_decay = _split_params_by_decay(model)
 
     groups: list[dict] = []
     if decay:
@@ -119,33 +127,36 @@ def _build_adamw(groups: list[dict], cfg: TrainingConfig) -> torch.optim.Optimiz
 def _build_muon(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimizer:
     """Hybrid Muon: 2-D hidden weights on Muon, the rest on AdamW(/atan2).
 
-    Embeddings, the LM head, norms and biases are kept on the adaptive
-    optimizer per the Muon convention; only 2-D non-embedding weight matrices
-    are orthogonalized.
+    The routing preserves :func:`param_groups_with_no_decay`: tensors that would
+    skip weight decay stay on AdamW with ``weight_decay=0``, and non-2-D tensors
+    that should decay stay on AdamW with the configured decay. Muon only gets
+    2-D decay-eligible hidden matrices; embeddings and output heads stay on the
+    adaptive optimizer.
     """
 
     muon_params: list[nn.Parameter] = []
-    adam_params: list[nn.Parameter] = []
-    seen: set[int] = set()
+    adam_decay: list[nn.Parameter] = []
+    adam_no_decay: list[nn.Parameter] = []
 
+    head_ids: set[int] = set()
+    for attr in ("lm_head", "reverse_head"):
+        head = getattr(model, attr, None)
+        if head is not None:
+            head_ids |= {id(p) for p in head.parameters(recurse=False)}
     embed_ids = {
         id(p)
         for m in model.modules()
         if isinstance(m, nn.Embedding)
         for p in m.parameters(recurse=False)
     }
-    head = getattr(model, "lm_head", None)
-    if head is not None:
-        embed_ids |= {id(p) for p in head.parameters(recurse=False)}
 
-    for param in model.parameters():
-        if not param.requires_grad or id(param) in seen:
-            continue
-        seen.add(id(param))
-        if param.ndim == 2 and id(param) not in embed_ids:
+    decay, no_decay = _split_params_by_decay(model)
+    for param in decay:
+        if param.ndim == 2 and id(param) not in embed_ids and id(param) not in head_ids:
             muon_params.append(param)
         else:
-            adam_params.append(param)
+            adam_decay.append(param)
+    adam_no_decay.extend(no_decay)
 
     sub: list[torch.optim.Optimizer] = []
     if muon_params:
@@ -158,8 +169,12 @@ def _build_muon(model: nn.Module, cfg: TrainingConfig) -> torch.optim.Optimizer:
                 ns_steps=cfg.muon_ns_steps,
             )
         )
-    if adam_params:
-        adam_groups = [{"params": adam_params, "weight_decay": 0.0}]
+    adam_groups: list[dict] = []
+    if adam_decay:
+        adam_groups.append({"params": adam_decay, "weight_decay": cfg.weight_decay})
+    if adam_no_decay:
+        adam_groups.append({"params": adam_no_decay, "weight_decay": 0.0})
+    if adam_groups:
         sub.append(_build_adamw(adam_groups, cfg))
 
     if not sub:

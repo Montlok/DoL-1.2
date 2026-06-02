@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from Model.config import RDTConfig, TrainingConfig
 from Model.model import RDTForCausalLM
@@ -103,6 +104,120 @@ class TrainingLoopSmokeTest(unittest.TestCase):
         )
 
         self.assertEqual(model.seen_return_logits, [False])
+
+    def test_recurrent_steps_override_only_when_ramp_active(self):
+        class RecordingModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(()))
+                self.seen_steps: list[int | None] = []
+
+            def forward(self, *args, **kwargs):
+                self.seen_steps.append(kwargs.get("steps"))
+                loss = self.weight * 0.0 + torch.ones((), dtype=self.weight.dtype)
+                return {"loss": loss, "loss_parts": {}, "rec_info": {}}
+
+        batch = _make_batch(_tiny_cfg(), length=8)
+
+        def _iter():
+            while True:
+                yield batch
+
+        base_cfg = TrainingConfig(
+            train_data="",
+            seq_len=8,
+            micro_batch_size=2,
+            grad_accum_steps=1,
+            num_workers=0,
+            learning_rate=1e-3,
+            max_steps=1,
+            warmup_steps=1,
+            precision="fp32",
+        )
+        model = RecordingModel()
+        optim = build_optimizer(model, base_cfg)
+        sched = build_scheduler(optim, base_cfg)
+        train_one_step(
+            model,
+            _iter(),
+            optim,
+            sched,
+            base_cfg,
+            TrainState(),
+            device=torch.device("cpu"),
+            target_recurrent_steps=8,
+        )
+        self.assertEqual(model.seen_steps, [None])
+
+        ramp_cfg = TrainingConfig(
+            train_data="",
+            seq_len=8,
+            micro_batch_size=2,
+            grad_accum_steps=1,
+            num_workers=0,
+            learning_rate=1e-3,
+            max_steps=1,
+            warmup_steps=1,
+            precision="fp32",
+            recurrent_steps_start=2,
+            recurrent_steps_ramp=10,
+        )
+        model = RecordingModel()
+        optim = build_optimizer(model, ramp_cfg)
+        sched = build_scheduler(optim, ramp_cfg)
+        train_one_step(
+            model,
+            _iter(),
+            optim,
+            sched,
+            ramp_cfg,
+            TrainState(),
+            device=torch.device("cpu"),
+            target_recurrent_steps=8,
+        )
+        self.assertEqual(model.seen_steps, [2])
+
+    def test_non_finite_loss_raises_before_optimizer_step(self):
+        class BadLossModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(()))
+
+            def forward(self, *args, **kwargs):
+                loss = self.weight * float("nan")
+                return {"loss": loss, "loss_parts": {}, "rec_info": {}}
+
+        train_cfg = TrainingConfig(
+            train_data="",
+            seq_len=8,
+            micro_batch_size=2,
+            grad_accum_steps=1,
+            num_workers=0,
+            learning_rate=1e-3,
+            max_steps=1,
+            warmup_steps=1,
+            precision="fp32",
+        )
+        model = BadLossModel()
+        optim = build_optimizer(model, train_cfg)
+        sched = build_scheduler(optim, train_cfg)
+        batch = _make_batch(_tiny_cfg(), length=8)
+
+        def _iter():
+            while True:
+                yield batch
+
+        with self.assertRaises(FloatingPointError):
+            train_one_step(
+                model,
+                _iter(),
+                optim,
+                sched,
+                train_cfg,
+                TrainState(),
+                device=torch.device("cpu"),
+            )
+        self.assertEqual(sched.last_epoch, 0)
 
     def test_train_step_and_resume(self):
         torch.manual_seed(0)

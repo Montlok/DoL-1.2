@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 
 from Model.training.data import _resolve_shards
+from Model.training.data import build_dataloader
+from Model.config import TrainingConfig
 
 
 class ResolveShardsTest(unittest.TestCase):
@@ -57,9 +59,21 @@ class ResolveShardsTest(unittest.TestCase):
             shards = _resolve_shards(str(f))
             self.assertEqual(shards, [f])
 
+    def test_missing_single_file_returns_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            shards = _resolve_shards(str(Path(tmp) / "missing.jsonl"))
+            self.assertEqual(shards, [])
+
     def test_sequence_passthrough(self) -> None:
         shards = _resolve_shards(["/a.jsonl", Path("/b.jsonl")])
         self.assertEqual([str(p) for p in shards], ["/a.jsonl", "/b.jsonl"])
+
+    def test_build_dataloader_rejects_missing_sequence_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.jsonl"
+            cfg = TrainingConfig(train_data="", seq_len=8, num_workers=0)
+            with self.assertRaisesRegex(FileNotFoundError, "do not exist"):
+                build_dataloader([missing], cfg)
 
 
 if __name__ == "__main__":

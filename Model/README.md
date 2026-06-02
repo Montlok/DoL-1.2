@@ -39,21 +39,27 @@ Model/
 ## 2. Configs
 
 ```python
-from Model.config import tiny_config, small_config, base_config, pretrain_config
+from Model.config import (
+    tiny_config,
+    small_config,
+    base_config,
+    pretrain_config,
+    segmented_pretrain_config,
+)
 cfg = pretrain_config()  # ~1.1B params: d_model=2048, 16 heads, 8 recurrent steps
 ```
 
 | Config     | d_model | heads | layers (prelude / coda) | recurrent steps | seq_len |
 |------------|---------|-------|-------------------------|-----------------|---------|
-| tiny       | 192     | 3     | 1 / 1                   | 4               | 2048    |
-| small      | 768     | 12    | 2 / 2                   | 8               | 4096    |
-| base       | 1536    | 16    | 3 / 3                   | 16              | 8192    |
+| tiny       | 512     | 8     | 2 / 2                   | 4               | 2048    |
+| small      | 1024    | 16    | 3 / 3                   | 8               | 4096    |
+| base       | 2048    | 32    | 4 / 4                   | 16              | 8192    |
 | pretrain   | 2048    | 16    | 3 / 3                   | 8               | 4096    |
+| segmented_pretrain | 2048 | 16 | 3 / 3                  | random 2-8      | 4096    |
 
 Activation-memory controls (in `RDTConfig`):
 
-- `use_activation_checkpointing`, `grad_ckpt_recurrent`, `grad_ckpt_blocks`,
-  `grad_ckpt_prelude_coda`.
+- `grad_ckpt_recurrent`, `grad_ckpt_blocks`, `grad_ckpt_prelude_coda`.
 - `bptt_window > 0` truncates BPTT (older recurrent steps are detached).
 - `use_act` switches to PonderNet-style adaptive halting with
   `act_max_steps` upper bound; the loop runs the full bound without
@@ -124,18 +130,18 @@ New knobs:
 - `segment_len` — block length `L_B` (tiny default 4, pretrain 8; smaller blocks
   model more easily, BD3LM/Block-Transformer).
 - `segmented_local_layers` — depth of the S3 local causal decoder.
-- `kv_share_budget` — cached-decode recurrent KV sharing (Huginn §6.2 / MoR
-  arXiv:2507.10524): `>0` recycles a circular buffer of that many MLA caches
-  across RDT steps instead of one per `(step, layer)`. `0` (default) keeps
-  per-step caches and is **bit-exact** with the cache-free forward.
+- `kv_share_budget` — reserved for future cached-decode recurrent KV sharing.
+  Keep this at `0` today: cache-equivalent decode needs one MLA cache per
+  `(step, layer)`, and the cached path rejects `>0` rather than silently mixing
+  recurrent-step histories.
 - `kl_exit_threshold` — zero-shot KL early-exit for `generate()` (Huginn §6.1):
   `>0` adaptively stops the recurrent-depth loop once successive step
   distributions converge (cache-free path only); `0` (default) keeps fixed depth
   and is bit-exact. Naturally spends more depth on rare/hard Mongolian segments.
 
 Cached incremental decoding (`generate(..., use_cache=True)`) is supported for
-`segmented` (in addition to `two_stage`) and is bit-exact with the cache-free
-path; it requires the NaiveSSM backend (`--mamba=naive`). Tests:
+`segmented` (in addition to `two_stage`) and matches the cache-free path within
+fp tolerance; it requires the NaiveSSM backend (`--mamba=naive`). Tests:
 `Model/tests/test_segmented.py`, `test_early_exit.py`, `test_multilingual.py`.
 
 
@@ -179,7 +185,8 @@ so defaults stay **AdamW + warmup/cosine** (no regression to alignment phases):
   `update = -lr·a·atan2(m̂, b·√v̂)`, eps-free and bf16-underflow-proof. Drop-in.
 - `lr_schedule` — `cosine` (default) or `wsd` (**Warmup-Stable-Decay**,
   MiniCPM arXiv:2404.06395): constant plateau then a short decay tail
-  (`wsd_decay_frac`), ideal for a late Mongolian-domain decay phase.
+  controlled by `wsd_stable_ratio` and `wsd_decay_shape`, ideal for a late
+  Mongolian-domain decay phase.
 - `muon_*` — route 2-D non-embedding weights through **Muon** (Moonlight
   arXiv:2502.16982; quintic Newton-Schulz orthogonalization) while
   embeddings/lm_head/norms/biases stay on AdamW via `CombinedOptimizer`.

@@ -39,6 +39,8 @@ from Model.config import (  # noqa: E402
     TrainingConfig,
     base_config,
     pretrain_config,
+    segmented_pretrain_config,
+    segmented_tiny_config,
     small_config,
     tiny_config,
     two_stage_pretrain_config,
@@ -57,6 +59,7 @@ from Model.training import (  # noqa: E402
     apply_parallelism,
     build_optimizer,
     build_scheduler,
+    destroy_distributed,
     init_distributed,
     is_main_process,
     load_checkpoint,
@@ -71,6 +74,8 @@ CONFIG_CHOICES = {
     "pretrain": pretrain_config,
     "two_stage_tiny": two_stage_tiny_config,
     "two_stage_pretrain": two_stage_pretrain_config,
+    "segmented_tiny": segmented_tiny_config,
+    "segmented_pretrain": segmented_pretrain_config,
 }
 
 
@@ -347,13 +352,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.smoke and state.step >= 4:
                 break
     finally:
-        logger.close()
-        if not args.smoke:
-            save_checkpoint(
-                train_cfg.output_dir, state.step, policy, optimizer, scheduler,
-                metadata={"config": args.config, "phase": "dpo", "final": True},
-                keep_last_n=train_cfg.keep_last_n,
-            )
+        try:
+            logger.close()
+            if not args.smoke:
+                save_checkpoint(
+                    train_cfg.output_dir, state.step, policy, optimizer, scheduler,
+                    metadata={"config": args.config, "phase": "dpo", "final": True},
+                    keep_last_n=train_cfg.keep_last_n,
+                )
+        finally:
+            destroy_distributed()
     return 0
 
 

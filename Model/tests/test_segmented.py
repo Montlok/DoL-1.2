@@ -73,7 +73,7 @@ class SegmentedSmokeTest(unittest.TestCase):
         self.assertEqual(out["rec_info"]["n_segments"], 4)  # ceil(13/4)
         out["loss"].backward()
         grads = [p.grad for p in model.parameters() if p.grad is not None]
-        self.assertTrue(len(grads) > 0)
+        self.assertGreater(len(grads), 0)
 
     def test_start_ctx_receives_gradient(self) -> None:
         torch.manual_seed(0)
@@ -140,7 +140,7 @@ class SegmentedCausalityTest(unittest.TestCase):
 
 
 class SegmentedCachedDecodeTest(unittest.TestCase):
-    """Cached incremental decode must be bit-exact with a full forward."""
+    """Cached incremental decode must match a full forward within fp tolerance."""
 
     def _gold(self, cfg, prefill=3):
         torch.manual_seed(0)
@@ -166,29 +166,28 @@ class SegmentedCachedDecodeTest(unittest.TestCase):
                 diffs.append((ref[:, t, :] - lg1[:, 0, :]).abs().max().item())
         return max(diffs)
 
-    def test_incremental_logits_bit_exact_plain(self):
+    def test_incremental_logits_match_plain(self):
         self.assertLess(self._gold(_seg_cfg("none")), ATOL)
 
-    def test_incremental_logits_bit_exact_decay(self):
+    def test_incremental_logits_match_decay(self):
         self.assertLess(self._gold(_seg_cfg("decay")), ATOL)
 
-    def test_incremental_logits_bit_exact_mhc(self):
+    def test_incremental_logits_match_mhc(self):
         self.assertLess(self._gold(_seg_cfg("mhc")), ATOL)
 
-    def test_incremental_logits_bit_exact_non_morph_rope(self):
+    def test_incremental_logits_match_non_morph_rope(self):
         self.assertLess(self._gold(_seg_cfg("none", morph_rope=False)), ATOL)
 
-    def test_incremental_logits_bit_exact_segment_len8(self):
+    def test_incremental_logits_match_segment_len8(self):
         self.assertLess(self._gold(_seg_cfg("none", segment_len=8)), ATOL)
 
     def test_prefill_spanning_multiple_blocks(self):
         # prefill of 9 tokens already closes two len-4 blocks before streaming.
         self.assertLess(self._gold(_seg_cfg("none"), prefill=9), ATOL)
 
-    def test_kv_share_budget_runs_and_caps_caches(self):
-        # KV-share (budget>0) is a lossy optimization (recycles MLA caches);
-        # it must still decode without error and never hold more than
-        # ``budget`` rdt caches per layer.
+    def test_kv_share_budget_rejected_for_cached_decode(self):
+        # A shared append-only MLA cache corrupts recurrent-step history; reject
+        # the knob until a correct approximation is implemented.
         torch.manual_seed(0)
         cfg = _seg_cfg("none")
         cfg.kv_share_budget = 2  # < recurrent_steps (3)
@@ -198,10 +197,8 @@ class SegmentedCachedDecodeTest(unittest.TestCase):
         mask = torch.ones_like(ids)
         wp, md = model._default_morph_info(ids, mask)
         with torch.no_grad():
-            model._forward_decode(ids, wp, md, cache)
-        rdt_keys = [k for k in cache.mla if k.startswith("seg.rdt.s")]
-        slots = {k.split(".l")[0] for k in rdt_keys}
-        self.assertLessEqual(len(slots), cfg.kv_share_budget)
+            with self.assertRaises(NotImplementedError):
+                model._forward_decode(ids, wp, md, cache)
 
 
 class SegmentedGenerateCacheEquivalenceTest(unittest.TestCase):

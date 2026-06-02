@@ -6,7 +6,7 @@ Invoked directly on the GPU server (not part of the unittest run):
 
     PYTHONPATH=. python Model/tests/gpu_bench.py
 
-Sweeps segment_len, kv_share_budget and random-r, reporting peak VRAM and
+Sweeps segment_len and random-r, reporting peak VRAM and
 forward+backward tokens/s. Also compares the segmented core against an
 equal-config two_stage baseline to quantify the compute saving from running the
 attention/RDT refinement over n_seg block summaries instead of all n_tok tokens.
@@ -61,10 +61,10 @@ def _run(cfg: RDTConfig, bsz: int, seq: int, iters: int = 5):
     model = RDTForCausalLM(cfg).to(dev).train()
     ids = torch.randint(0, cfg.vocab_size, (bsz, seq), device=dev)
 
-    def _step():
-        loss = model(ids, labels=ids, bptt_window=BPTT_WINDOW)["loss"]
+    def _step(step_model=model, step_ids=ids):
+        loss = step_model(step_ids, labels=step_ids, bptt_window=BPTT_WINDOW)["loss"]
         loss.backward()
-        model.zero_grad(set_to_none=True)
+        step_model.zero_grad(set_to_none=True)
 
     for _ in range(2):  # warmup
         _step()
@@ -90,7 +90,6 @@ def main() -> None:
     configs = [
         ("segmented L_B=4", _base("segmented", segment_len=4)),
         ("segmented L_B=8", _base("segmented", segment_len=8)),
-        ("segmented L_B=8 kvshare=2", _base("segmented", segment_len=8, kv_share_budget=2)),
         ("segmented L_B=8 random-r", _base("segmented", segment_len=8,
                                            recurrent_random_r=True,
                                            recurrent_r_min=2, recurrent_r_max=8)),

@@ -203,10 +203,9 @@ class RDTConfig:
     recurrent_r_min: int = 1
     recurrent_r_max: int = 8
 
-    # Recurrent KV-sharing budget for cached decode (Huginn 6.2 / MoR
-    # arXiv:2507.10524): when > 0 the RDT refinement steps reuse a circular
-    # buffer of at most ``kv_share_budget`` MLA caches instead of one cache
-    # per (step, layer). 0 keeps the exact per-step caches.
+    # Reserved recurrent KV-sharing budget for cached decode. Keep this at 0:
+    # the current exact cached path needs one MLA cache per (step, layer), and
+    # ``SegmentedCore`` rejects >0 until a correct approximation is implemented.
     kv_share_budget: int = 0
 
     # Zero-shot per-token KL early-exit threshold for ``generate()`` (Huginn
@@ -771,6 +770,8 @@ class TrainingConfig:
             raise ValueError(f"unknown parallel mode: {self.parallel}")
         if self.lr_decay_steps is None:
             self.lr_decay_steps = self.max_steps
+        elif self.lr_decay_steps <= 0:
+            raise ValueError("lr_decay_steps must be positive when set")
         if self.recurrent_steps_ramp < 0:
             raise ValueError("recurrent_steps_ramp must be non-negative")
         if self.optimizer.lower() not in {"adamw", "muon"}:

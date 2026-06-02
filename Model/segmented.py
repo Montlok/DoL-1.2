@@ -177,7 +177,7 @@ class SegmentedCore(nn.Module):
         return h, info
 
     # ------------------------------------------------------------------
-    # Incremental decode (bit-exact with :meth:`forward` when kv_share_budget=0)
+    # Incremental decode (full-forward equivalent when kv_share_budget=0)
     # ------------------------------------------------------------------
     def _forward_cached(
         self,
@@ -191,12 +191,19 @@ class SegmentedCore(nn.Module):
         """Process the new chunk ``e0`` (``[B, m, d]``) one block-causally.
 
         Stage-1 Mamba and the local decoder carry constant-size recurrent state;
-        the block-level RDT keeps a causal MLA cache per ``(step, layer)`` (or a
-        circular buffer of ``kv_share_budget`` slots). A block summary is
+        the block-level RDT keeps a causal MLA cache per ``(step, layer)``.
+        A block summary is
         finalized only when its block completes, and a token only ever reads its
         *previous* block's refined summary, so the result is identical to a fresh
         full forward over the growing prefix (zero future leakage preserved).
         """
+
+        if int(self.cfg.kv_share_budget) > 0:
+            raise NotImplementedError(
+                "segmented cached decode does not support kv_share_budget > 0. "
+                "A shared append-only MLA cache corrupts recurrent-step history; "
+                "keep kv_share_budget=0 for cache-equivalent decode."
+            )
 
         bsz, m, dim = e0.shape
         device = e0.device
@@ -263,11 +270,8 @@ class SegmentedCore(nn.Module):
         ).unsqueeze(0).expand(bsz, k)
         seg_md = torch.zeros(bsz, k, dtype=torch.long, device=device)
 
-        budget = int(self.cfg.kv_share_budget)
-
         def key(step: int, li: int) -> str:
-            slot = step if budget <= 0 else (step % budget)
-            return f"seg.rdt.s{slot}.l{li}"
+            return f"seg.rdt.s{step}.l{li}"
 
         if self.drift_mode == "mhc":
             streams = summaries.unsqueeze(-2).expand(

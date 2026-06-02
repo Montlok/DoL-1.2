@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import math
 import unittest
 
 import torch
@@ -27,6 +26,17 @@ def _toy_model() -> nn.Module:
     model.w = nn.Linear(8, 8, bias=True)
     model.lm_head = nn.Linear(8, 16, bias=False)
     return model
+
+
+class _MuonRoutingModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed = nn.Embedding(16, 8)
+        self.hidden = nn.Linear(8, 8, bias=True)
+        self.conv = nn.Conv1d(8, 8, kernel_size=3, bias=False)
+        self.no_wd_matrix = nn.Parameter(torch.randn(8, 8))
+        self.no_wd_matrix._no_weight_decay = True
+        self.lm_head = nn.Linear(8, 16, bias=False)
 
 
 def _step_once(model, optim):
@@ -82,8 +92,8 @@ class MuonTest(unittest.TestCase):
             loss.backward()
             optim.step()
             if first is None:
-                first = float(loss)
-        self.assertLess(float(loss), first)
+                first = float(loss.detach())
+        self.assertLess(float(loss.detach()), first)
 
     def test_muon_rejects_non_2d(self) -> None:
         p = nn.Parameter(torch.randn(8))
@@ -111,6 +121,35 @@ class BuildOptimizerTest(unittest.TestCase):
         self.assertNotIn(id(model.embed.weight), muon_param_ids)
         self.assertNotIn(id(model.lm_head.weight), muon_param_ids)
         self.assertIn(id(model.w.weight), muon_param_ids)
+
+    def test_muon_preserves_weight_decay_policy(self) -> None:
+        model = _MuonRoutingModel()
+        cfg = TrainingConfig(
+            train_data="x",
+            optimizer="muon",
+            weight_decay=0.2,
+            max_steps=10,
+        )
+        optim = build_optimizer(model, cfg)
+        self.assertIsInstance(optim, CombinedOptimizer)
+
+        muon = optim.optimizers[0]
+        adam = optim.optimizers[1]
+        muon_ids = {id(p) for group in muon.param_groups for p in group["params"]}
+        self.assertIn(id(model.hidden.weight), muon_ids)
+        self.assertNotIn(id(model.no_wd_matrix), muon_ids)
+        self.assertNotIn(id(model.conv.weight), muon_ids)
+        self.assertNotIn(id(model.lm_head.weight), muon_ids)
+
+        wd_by_param: dict[int, float] = {}
+        for group in adam.param_groups:
+            for param in group["params"]:
+                wd_by_param[id(param)] = group["weight_decay"]
+        self.assertEqual(wd_by_param[id(model.no_wd_matrix)], 0.0)
+        self.assertEqual(wd_by_param[id(model.embed.weight)], 0.0)
+        self.assertEqual(wd_by_param[id(model.hidden.bias)], 0.0)
+        self.assertEqual(wd_by_param[id(model.conv.weight)], cfg.weight_decay)
+        self.assertEqual(wd_by_param[id(model.lm_head.weight)], cfg.weight_decay)
 
     def test_muon_train_step_runs(self) -> None:
         torch.manual_seed(0)
@@ -165,6 +204,8 @@ class TrainingConfigValidationTest(unittest.TestCase):
             dict(optimizer="adam"),
             dict(muon_ns_steps=0),
             dict(muon_momentum=1.0),
+            dict(lr_decay_steps=0),
+            dict(lr_decay_steps=-1),
         ):
             with self.assertRaises(ValueError):
                 TrainingConfig(train_data="x", max_steps=10, **kw)

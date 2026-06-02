@@ -83,7 +83,7 @@ def _overfit(model, opt, sch, ids, steps):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         sch.step()
-        losses.append(float(loss))
+        losses.append(float(loss.detach()))
     return losses
 
 
@@ -105,7 +105,6 @@ def main() -> None:
     print(f"  loss[0]={losses[0]:.4f}  loss[-1]={losses[-1]:.4f}  "
           f"drop={losses[0]-losses[-1]:.4f}", flush=True)
     assert losses[-1] < losses[0] * 0.25, "did not converge"
-    assert all(b <= a + 1e-3 for a, b in zip(losses[::20], losses[20::20])) or True
     print("  PASS convergence (>=4x loss reduction, all finite)", flush=True)
 
     print("\n# 2. checkpoint round-trip", flush=True)
@@ -144,7 +143,9 @@ def main() -> None:
     rsch = build_scheduler(ropt, tcfg)
     rl = _overfit(rmodel, ropt, rsch, ids, 100)
     print(f"  loss[0]={rl[0]:.4f}  loss[-1]={rl[-1]:.4f}", flush=True)
-    assert rl[-1] < rl[0] * 0.5 and all(l == l for l in rl), "random-r path failed"
+    assert rl[-1] < rl[0] * 0.5 and all(
+        torch.isfinite(torch.tensor(loss_value)) for loss_value in rl
+    ), "random-r path failed"
     print("  PASS random-r trainability", flush=True)
 
     print("\nTRAIN_DONE ALL PASSED", flush=True)
