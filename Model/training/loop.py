@@ -113,7 +113,11 @@ def train_one_step(
             state.extra["grad_scaler"] = scaler
 
     rec_steps = None
-    if target_recurrent_steps is not None:
+    if (
+        target_recurrent_steps is not None
+        and cfg.recurrent_steps_start is not None
+        and cfg.recurrent_steps_ramp > 0
+    ):
         rec_steps = recurrent_steps_for_step(state.step, cfg, target_recurrent_steps)
 
     for _ in range(cfg.grad_accum_steps):
@@ -138,6 +142,8 @@ def train_one_step(
                 return_logits=not cfg.use_loss_chunking,
             )
         loss = out["loss"] / cfg.grad_accum_steps
+        if not bool(torch.isfinite(loss.detach())):
+            raise FloatingPointError(f"non-finite training loss at step {state.step}")
         if scaler is not None:
             scaler.scale(loss).backward()
         else:

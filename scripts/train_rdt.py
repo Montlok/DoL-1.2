@@ -32,6 +32,8 @@ from Model.config import (  # noqa: E402
     TrainingConfig,
     base_config,
     pretrain_config,
+    segmented_pretrain_config,
+    segmented_tiny_config,
     small_config,
     tiny_config,
     two_stage_pretrain_config,
@@ -50,6 +52,7 @@ from Model.training import (  # noqa: E402
     build_omvt_cfg,
     build_optimizer,
     build_scheduler,
+    destroy_distributed,
     evaluate,
     init_distributed,
     is_main_process,
@@ -67,6 +70,8 @@ CONFIG_CHOICES = {
     "pretrain": pretrain_config,
     "two_stage_tiny": two_stage_tiny_config,
     "two_stage_pretrain": two_stage_pretrain_config,
+    "segmented_tiny": segmented_tiny_config,
+    "segmented_pretrain": segmented_pretrain_config,
 }
 
 
@@ -96,14 +101,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--grad-accum-steps", type=int, default=1)
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.1)
+    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
+    p.add_argument("--adam-use-atan2", action="store_true")
+    p.add_argument("--muon-momentum", type=float, default=0.95)
+    p.add_argument("--muon-ns-steps", type=int, default=5)
     p.add_argument("--max-steps", type=int, default=100_000)
     p.add_argument("--warmup-steps", type=int, default=2000)
+    p.add_argument("--lr-decay-steps", type=int, default=None)
+    p.add_argument("--min-lr-ratio", type=float, default=0.1)
+    p.add_argument("--lr-schedule", choices=["cosine", "wsd"], default="cosine")
+    p.add_argument("--wsd-stable-ratio", type=float, default=0.8)
+    p.add_argument(
+        "--wsd-decay-shape",
+        choices=["1-sqrt", "linear", "cosine"],
+        default="1-sqrt",
+    )
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-max-batches", type=int, default=32)
     p.add_argument("--bptt-window", type=int, default=None)
+    p.add_argument("--recurrent-steps-start", type=int, default=None)
+    p.add_argument("--recurrent-steps-ramp", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--dist-backend", choices=["nccl", "gloo"], default="nccl")
     p.add_argument(
@@ -191,10 +211,19 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         micro_batch_size=args.micro_batch_size,
         grad_accum_steps=args.grad_accum_steps,
         num_workers=args.num_workers if not args.smoke else 0,
+        optimizer=args.optimizer,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        adam_use_atan2=args.adam_use_atan2,
+        muon_momentum=args.muon_momentum,
+        muon_ns_steps=args.muon_ns_steps,
         max_steps=4 if args.smoke else args.max_steps,
         warmup_steps=1 if args.smoke else args.warmup_steps,
+        lr_decay_steps=args.lr_decay_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        lr_schedule=args.lr_schedule,
+        wsd_stable_ratio=args.wsd_stable_ratio,
+        wsd_decay_shape=args.wsd_decay_shape,
         precision=args.precision,
         grad_clip=args.grad_clip,
         parallel=args.dist,
@@ -207,9 +236,26 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         eval_every=args.eval_every,
         eval_max_batches=args.eval_max_batches,
         bptt_window=args.bptt_window,
+        recurrent_steps_start=args.recurrent_steps_start,
+        recurrent_steps_ramp=args.recurrent_steps_ramp,
         seed=args.seed,
         resume=args.resume,
     )
+
+
+def _target_recurrent_steps_for_train(
+    model_cfg: RDTConfig,
+    train_cfg: TrainingConfig,
+) -> int | None:
+    """Return an explicit depth only when the training curriculum needs one.
+
+    Passing ``steps`` unconditionally disables ``SegmentedCore`` random-r
+    sampling. Let the model resolve its own depth unless a depth ramp is active.
+    """
+
+    if train_cfg.recurrent_steps_start is None or train_cfg.recurrent_steps_ramp <= 0:
+        return None
+    return model_cfg.recurrent_steps
 
 
 def _smoke_batches(model_cfg: RDTConfig, train_cfg: TrainingConfig):
@@ -397,7 +443,10 @@ def main(argv: list[str] | None = None) -> int:
                 train_cfg,
                 state,
                 device=device,
-                target_recurrent_steps=model_cfg.recurrent_steps,
+                target_recurrent_steps=_target_recurrent_steps_for_train(
+                    model_cfg,
+                    train_cfg,
+                ),
             )
             tokens_window += int(metrics["tokens"])
 
@@ -438,23 +487,26 @@ def main(argv: list[str] | None = None) -> int:
                     scaler=state.extra.get("grad_scaler"),
                 )
     finally:
-        logger.close()
-        # NOTE: `save_checkpoint` is a collective under FSDP (the
-        # `state_dict(FullStateDictConfig)` call gathers from every rank),
-        # so we must enter it on every rank; the helper internally limits
-        # the actual file write to rank 0. Guarding the call with
-        # `is_main_process()` would deadlock rank 0 at shutdown.
-        if not args.smoke:
-            save_checkpoint(
-                train_cfg.output_dir,
-                state.step,
-                model,
-                optimizer,
-                scheduler,
-                metadata={"config": args.config, "final": True},
-                keep_last_n=train_cfg.keep_last_n,
-                scaler=state.extra.get("grad_scaler"),
-            )
+        try:
+            logger.close()
+            # NOTE: `save_checkpoint` is a collective under FSDP (the
+            # `state_dict(FullStateDictConfig)` call gathers from every rank),
+            # so we must enter it on every rank; the helper internally limits
+            # the actual file write to rank 0. Guarding the call with
+            # `is_main_process()` would deadlock rank 0 at shutdown.
+            if not args.smoke:
+                save_checkpoint(
+                    train_cfg.output_dir,
+                    state.step,
+                    model,
+                    optimizer,
+                    scheduler,
+                    metadata={"config": args.config, "final": True},
+                    keep_last_n=train_cfg.keep_last_n,
+                    scaler=state.extra.get("grad_scaler"),
+                )
+        finally:
+            destroy_distributed()
     return 0
 
 

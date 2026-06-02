@@ -202,10 +202,14 @@ def save_checkpoint(
 
 def load_checkpoint(path: str | Path) -> CheckpointPayload:
     p = Path(path)
-    if p.name == "latest" or not p.exists():
-        candidate = p.parent / "latest" if p.parent.exists() else None
-        if candidate and candidate.exists():
-            p = candidate.resolve()
+    if p.name == "latest":
+        if not p.exists():
+            raise FileNotFoundError(f"checkpoint not found: {p}")
+        p = p.resolve()
+    elif p.is_dir() and not (p / "model.pt").exists() and (p / "latest").exists():
+        p = (p / "latest").resolve()
+    elif not p.exists():
+        raise FileNotFoundError(f"checkpoint not found: {p}")
 
     model_state = torch.load(p / "model.pt", map_location="cpu", weights_only=False)
     opt_path = p / "optimizer.pt"

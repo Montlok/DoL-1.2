@@ -53,8 +53,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--use-cache",
         action="store_true",
         help=(
-            "Incremental KV/state decoding (core_type='two_stage' only); "
-            "bit-exact with the cache-free path but O(L) per step."
+            "Incremental KV/state decoding (core_type='two_stage' or "
+            "'segmented'); matches the cache-free path within numerical "
+            "tolerance but remains O(L) per step."
         ),
     )
     p.add_argument(

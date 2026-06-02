@@ -174,6 +174,45 @@ class RDTConfig:
     two_stage_downsample: bool = False
     two_stage_max_segments: int = 0
 
+    # ------------------------------------------------------------------
+    # Segmented core (``core_type="segmented"``, Block-Transformer-style,
+    # fully causal — arXiv:2406.02657 / 2306.09539).
+    #
+    # Text is sliced into fixed-length blocks of ``segment_len`` tokens. A
+    # causal (forward-only) Mamba encodes every token; the causal state at
+    # each block boundary is that block's summary (it only ever saw tokens
+    # <= the boundary, so there is zero future leakage). Block-causal MLA +
+    # shared-weight RDT recurrent depth refine the ``n_seg`` summaries, then a
+    # local causal decoder scatters the *previous* block's refined context
+    # back to token resolution to predict the next block. Because
+    # n_seg << n_tok the attention/RDT cost drops sharply.
+    #
+    # Stage-1 Mamba / Stage-2 attention layer counts reuse
+    # ``stage1_mamba_layers`` / ``stage2_attn_layers``; drift control reuses
+    # ``recurrent_drift_mode``.
+    # ------------------------------------------------------------------
+    segment_len: int = 8
+    segmented_local_layers: int = 2
+
+    # Random-r recurrent depth (Huginn arXiv:2502.05171): when enabled,
+    # training samples the refinement depth uniformly from
+    # ``[recurrent_r_min, recurrent_r_max]`` each forward instead of the fixed
+    # ``recurrent_steps``. Disabled by default so the other cores stay
+    # bit-exact. An explicit ``steps`` override always wins over sampling.
+    recurrent_random_r: bool = False
+    recurrent_r_min: int = 1
+    recurrent_r_max: int = 8
+
+    # Reserved recurrent KV-sharing budget for cached decode. Keep this at 0:
+    # the current exact cached path needs one MLA cache per (step, layer), and
+    # ``SegmentedCore`` rejects >0 until a correct approximation is implemented.
+    kv_share_budget: int = 0
+
+    # Zero-shot per-token KL early-exit threshold for ``generate()`` (Huginn
+    # 6.1): stop the refinement loop once the KL between successive step
+    # output distributions drops below this value. 0 disables (fixed depth).
+    kl_exit_threshold: float = 0.0
+
     use_act: bool = False
     act_threshold: float = 0.99
     act_max_steps: int = 32
@@ -329,9 +368,10 @@ class RDTConfig:
             raise ValueError("loss_chunk_size must be positive")
 
     def _check_core(self) -> None:
-        if self.core_type not in {"interleaved", "two_stage"}:
+        if self.core_type not in {"interleaved", "two_stage", "segmented"}:
             raise ValueError(
-                f"core_type must be 'interleaved' or 'two_stage', got {self.core_type!r}"
+                "core_type must be 'interleaved', 'two_stage' or 'segmented', "
+                f"got {self.core_type!r}"
             )
 
         if self.recurrent_drift_mode not in {"none", "norm", "decay", "both", "mhc"}:
@@ -341,11 +381,26 @@ class RDTConfig:
                 f"{self.recurrent_drift_mode!r}"
             )
 
-        if self.core_type == "two_stage":
+        if self.recurrent_random_r:
+            if self.recurrent_r_min <= 0:
+                raise ValueError("recurrent_r_min must be positive")
+            if self.recurrent_r_max < self.recurrent_r_min:
+                raise ValueError(
+                    "recurrent_r_max must be >= recurrent_r_min when "
+                    "recurrent_random_r=True"
+                )
+
+        if self.kv_share_budget < 0:
+            raise ValueError("kv_share_budget must be non-negative")
+
+        if self.kl_exit_threshold < 0:
+            raise ValueError("kl_exit_threshold must be non-negative")
+
+        if self.core_type in {"two_stage", "segmented"}:
             if self.use_act:
                 raise ValueError(
-                    "core_type='two_stage' does not support use_act=True; ACT is "
-                    "only implemented for the interleaved RecurrentCore"
+                    f"core_type={self.core_type!r} does not support use_act=True; "
+                    "ACT is only implemented for the interleaved RecurrentCore"
                 )
             if self.stage1_mamba_layers <= 0:
                 raise ValueError("stage1_mamba_layers must be positive")
@@ -364,6 +419,7 @@ class RDTConfig:
                     "0 iterations cannot project onto the Birkhoff polytope"
                 )
 
+        if self.core_type == "two_stage":
             # Order-preserving downsampling is not implemented for the causal
             # two-stage core: mean-pooling a word's characters into one segment
             # leaks that word's future characters into earlier positions. Reject
@@ -374,6 +430,12 @@ class RDTConfig:
                     "two-stage core (it would leak intra-word future on a causal "
                     "path); keep two_stage_downsample=False"
                 )
+
+        if self.core_type == "segmented":
+            if self.segment_len <= 0:
+                raise ValueError("segment_len must be positive")
+            if self.segmented_local_layers <= 0:
+                raise ValueError("segmented_local_layers must be positive")
 
     @property
     def block_layers(self) -> int:
@@ -536,6 +598,73 @@ def two_stage_pretrain_config() -> RDTConfig:
     )
 
 
+def segmented_tiny_config() -> RDTConfig:
+    """Tiny segmented (Block-Transformer-style) core for CPU smoke / tests.
+
+    Causal Mamba block encoder -> block-causal MLA + RDT refinement over
+    block summaries -> local causal decoder. NaiveSSM fallback (no CUDA).
+    """
+
+    return RDTConfig(
+        d_model=512,
+        n_heads=8,
+        head_dim=64,
+        kv_lora_rank=128,
+        rope_head_dim=32,
+        nope_head_dim=32,
+        ffn_hidden=1536,
+        ffn_multiple=256,
+        n_prelude=2,
+        n_coda=2,
+        mamba_per_block=5,
+        attn_per_block=1,
+        recurrent_steps=4,
+        max_seq_len=2048,
+        use_official_mamba=False,
+        core_type="segmented",
+        stage1_mamba_layers=5,
+        stage2_attn_layers=1,
+        segment_len=4,
+        segmented_local_layers=2,
+        recurrent_drift_mode="none",
+    )
+
+
+def segmented_pretrain_config() -> RDTConfig:
+    """~1.1B segmented RDT for formal pretraining (official Mamba on CUDA)."""
+
+    return RDTConfig(
+        d_model=2048,
+        n_heads=16,
+        head_dim=128,
+        kv_lora_rank=512,
+        rope_head_dim=64,
+        nope_head_dim=64,
+        ffn_hidden=8192,
+        ffn_multiple=256,
+        n_prelude=3,
+        n_coda=3,
+        mamba_per_block=5,
+        attn_per_block=1,
+        recurrent_steps=8,
+        max_seq_len=4096,
+        use_official_mamba=True,
+        bidirectional=False,
+        grad_ckpt_recurrent=True,
+        grad_ckpt_prelude_coda=True,
+        loss_chunk_size=8192,
+        core_type="segmented",
+        stage1_mamba_layers=5,
+        stage2_attn_layers=1,
+        segment_len=8,
+        segmented_local_layers=2,
+        recurrent_drift_mode="none",
+        recurrent_random_r=True,
+        recurrent_r_min=2,
+        recurrent_r_max=8,
+    )
+
+
 @dataclass
 class TrainingConfig:
     """Top-level training-loop configuration.
@@ -564,12 +693,30 @@ class TrainingConfig:
     adam_beta2: float = 0.95
     adam_eps: float = 1e-8
     grad_clip: float = 1.0
+    # Adam-atan2 (arXiv:2407.05872): replace the eps-guarded division by
+    # ``atan2`` so the update is scale-invariant and immune to bf16 underflow
+    # in the second-moment denominator. Drop-in; eps is then unused.
+    adam_use_atan2: bool = False
+    # Muon (Moonlight arXiv:2502.16982) for 2D weight matrices, AdamW for the
+    # rest. EXPERIMENTAL on this model: recurrent weight sharing amplifies the
+    # per-step gradients (~r x), so the orthogonalized update interacts with
+    # the shared-weight loop in ways the paper does not cover. Opt-in only.
+    muon_momentum: float = 0.95
+    muon_ns_steps: int = 5
 
-    # schedule (warmup + cosine to min_lr_ratio)
+    # schedule: "cosine" (warmup + cosine to min_lr_ratio) or "wsd"
+    # (warmup-stable-decay, MiniCPM arXiv:2404.06395 — a long constant-LR
+    # plateau then a short decay tail, which is where Mongolian-domain
+    # adaptation is concentrated). Both decay to ``min_lr_ratio * lr``.
     max_steps: int = 100_000
     warmup_steps: int = 2_000
     lr_decay_steps: int | None = None  # defaults to max_steps
     min_lr_ratio: float = 0.1
+    lr_schedule: str = "cosine"
+    # WSD: fraction of [warmup, lr_decay_steps] spent at the stable plateau
+    # before the decay tail begins. The remainder is the decay phase.
+    wsd_stable_ratio: float = 0.8
+    wsd_decay_shape: str = "1-sqrt"  # one of: 1-sqrt, linear, cosine
 
     # precision / memory
     precision: str = "bf16"  # one of: fp32, bf16, fp16
@@ -623,8 +770,27 @@ class TrainingConfig:
             raise ValueError(f"unknown parallel mode: {self.parallel}")
         if self.lr_decay_steps is None:
             self.lr_decay_steps = self.max_steps
+        elif self.lr_decay_steps <= 0:
+            raise ValueError("lr_decay_steps must be positive when set")
         if self.recurrent_steps_ramp < 0:
             raise ValueError("recurrent_steps_ramp must be non-negative")
+        if self.optimizer.lower() not in {"adamw", "muon"}:
+            raise ValueError(f"unsupported optimizer: {self.optimizer}")
+        if self.lr_schedule not in {"cosine", "wsd"}:
+            raise ValueError(
+                f"lr_schedule must be 'cosine' or 'wsd', got {self.lr_schedule!r}"
+            )
+        if not (0.0 <= self.wsd_stable_ratio < 1.0):
+            raise ValueError("wsd_stable_ratio must be in [0, 1)")
+        if self.wsd_decay_shape not in {"1-sqrt", "linear", "cosine"}:
+            raise ValueError(
+                "wsd_decay_shape must be one of '1-sqrt'/'linear'/'cosine', "
+                f"got {self.wsd_decay_shape!r}"
+            )
+        if self.muon_ns_steps <= 0:
+            raise ValueError("muon_ns_steps must be positive")
+        if not (0.0 <= self.muon_momentum < 1.0):
+            raise ValueError("muon_momentum must be in [0, 1)")
 
 
 @dataclass

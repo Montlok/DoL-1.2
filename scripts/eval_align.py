@@ -34,6 +34,8 @@ from Model.config import (  # noqa: E402
     RDTConfig,
     base_config,
     pretrain_config,
+    segmented_pretrain_config,
+    segmented_tiny_config,
     small_config,
     tiny_config,
     two_stage_pretrain_config,
@@ -55,6 +57,8 @@ CONFIG_CHOICES = {
     "pretrain": pretrain_config,
     "two_stage_tiny": two_stage_tiny_config,
     "two_stage_pretrain": two_stage_pretrain_config,
+    "segmented_tiny": segmented_tiny_config,
+    "segmented_pretrain": segmented_pretrain_config,
 }
 
 

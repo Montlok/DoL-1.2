@@ -25,6 +25,7 @@ from Model.training.data import (
 )
 from Model.training.dist import (
     apply_parallelism,
+    destroy_distributed,
     init_distributed,
     is_main_process,
     wrap_ddp,
@@ -56,6 +57,7 @@ __all__ = [
     "build_omvt_cfg",
     "build_optimizer",
     "build_scheduler",
+    "destroy_distributed",
     "evaluate",
     "init_distributed",
     "is_main_process",
