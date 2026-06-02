@@ -78,6 +78,56 @@ def _line_has_script(line: str, script: str) -> bool:
     return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in line)
 
 
+# BOM / byte-order marks to delete from every streamed line in a single pass.
+_BOM_DELETE = {ord("\ufeff"): None, ord("\ufffe"): None}
+
+
+def _detect_text_encoding(sample: bytes) -> str:
+    """Detect a text file's byte encoding from a leading byte sample.
+
+    Local corpus drops arrive in mixed encodings: notably the bundled
+    "1000 traditional" Mongolian corpus is UTF-16LE (with repeated FEFF BOM
+    noise), which a naive utf-8 read silently turns into U+FFFD replacement
+    garbage -- wasting a large, high-quality source. Detection only inspects a
+    small sample so the caller can stream the full file line-by-line with the
+    chosen encoding.
+
+    Heuristic (robust and content-agnostic):
+      * honour a leading BOM;
+      * a high density of NUL bytes signals ASCII-heavy UTF-16: newlines, ASCII
+        digits/latin/spaces (ubiquitous even in Mongolian text) encode one NUL
+        byte each, so their density reliably flags UTF-16 -- pick LE vs BE by
+        which byte position holds the NULs. (Mongolian U+18xx code units do have
+        a non-zero high byte, so this keys off the interspersed ASCII, not the
+        Mongolian letters themselves.)
+      * otherwise prefer strict UTF-8 (tolerating a multibyte char clipped at the
+        sample boundary), falling back to GB18030 when the bytes aren't valid
+        UTF-8.
+    """
+    if sample[:2] == b"\xff\xfe":
+        return "utf-16-le"
+    if sample[:2] == b"\xfe\xff":
+        return "utf-16-be"
+    if sample[:3] == b"\xef\xbb\xbf":
+        return "utf-8-sig"
+    if not sample:
+        return "utf-8"
+    nul = sample.count(0)
+    if nul / len(sample) > 0.10:
+        le = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)
+        be = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
+        return "utf-16-le" if le >= be else "utf-16-be"
+    for trim in (0, 1, 2, 3):  # tolerate a multibyte char cut at the boundary
+        if trim >= len(sample):  # never trim past the sample we actually have
+            break
+        try:
+            sample[: len(sample) - trim].decode("utf-8")
+            return "utf-8"
+        except UnicodeDecodeError:
+            continue
+    return "gb18030"
+
+
 def _postclean(text: str, spec: "SourceSpec") -> str:
     """Apply opt-in per-source cleaning. No-op unless the source requests it."""
     if not (spec.strip_url_lines or spec.keep_lines):
@@ -213,8 +263,14 @@ def _iter_source_texts(spec: "SourceSpec") -> Iterator[str]:
         if not files:
             raise SystemExit(f"No text files found under {path!r}")
         for fp in files:
-            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
+            with open(fp, "rb") as bh:
+                enc = _detect_text_encoding(bh.read(65536))
+            # Stream line-by-line with the detected encoding to keep memory
+            # bounded on large corpora; strip any BOM/byte-order noise per line
+            # in a single pass via translate().
+            with open(fp, "r", encoding=enc, errors="replace") as fh:
                 for line in fh:
+                    line = line.translate(_BOM_DELETE)
                     text = finalize(line)
                     if text is not None:
                         yield text
