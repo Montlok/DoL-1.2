@@ -90,8 +90,12 @@ def _detect_text_encoding(sample: bytes) -> str:
 
     Heuristic (robust and content-agnostic):
       * honour a leading BOM;
-      * a high density of NUL bytes means UTF-16 (ASCII/Mongolian high bytes are
-        0x00) -- pick LE vs BE by which byte position holds the NULs;
+      * a high density of NUL bytes signals ASCII-heavy UTF-16: newlines, ASCII
+        digits/latin/spaces (ubiquitous even in Mongolian text) encode one NUL
+        byte each, so their density reliably flags UTF-16 -- pick LE vs BE by
+        which byte position holds the NULs. (Mongolian U+18xx code units do have
+        a non-zero high byte, so this keys off the interspersed ASCII, not the
+        Mongolian letters themselves.)
       * otherwise prefer strict UTF-8 (tolerating a multibyte char clipped at the
         sample boundary), falling back to GB18030 when the bytes aren't valid
         UTF-8.
@@ -110,6 +114,8 @@ def _detect_text_encoding(sample: bytes) -> str:
         be = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
         return "utf-16-le" if le >= be else "utf-16-be"
     for trim in (0, 1, 2, 3):  # tolerate a multibyte char cut at the boundary
+        if trim >= len(sample):  # never trim past the sample we actually have
+            break
         try:
             sample[: len(sample) - trim].decode("utf-8")
             return "utf-8"

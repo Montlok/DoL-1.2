@@ -127,6 +127,14 @@ class GlobSourceTest(unittest.TestCase):
             )
             self.assertEqual(texts, ["中文测试内容一二三四"])
 
+    def test_detect_encoding_tiny_sample(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import _detect_text_encoding
+
+        # 1-3 byte samples must not be mis-detected as utf-8 via boundary trim.
+        self.assertEqual(_detect_text_encoding(b"\xff"), "gb18030")
+        self.assertEqual(_detect_text_encoding(b"\xc3"), "gb18030")
+        self.assertEqual(_detect_text_encoding(b"hi"), "utf-8")
+
     def test_missing_glob_raises(self) -> None:
         from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
 
