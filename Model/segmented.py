@@ -116,8 +116,13 @@ class SegmentedCore(nn.Module):
         self._check_inputs(e0, word_pos, morph_depth, attn_mask)
 
         if cache is not None:
-            raise NotImplementedError(
-                "SegmentedCore incremental decode cache is not yet implemented"
+            return self._forward_cached(
+                e0,
+                word_pos=word_pos,
+                morph_depth=morph_depth,
+                total_steps=self._resolve_steps(steps),
+                cache=cache,
+                pos_offset=pos_offset,
             )
 
         total_steps = self._resolve_steps(steps)
@@ -170,6 +175,136 @@ class SegmentedCore(nn.Module):
             "n_segments": n_seg,
         }
         return h, info
+
+    # ------------------------------------------------------------------
+    # Incremental decode (bit-exact with :meth:`forward` when kv_share_budget=0)
+    # ------------------------------------------------------------------
+    def _forward_cached(
+        self,
+        e0: torch.Tensor,
+        word_pos: torch.Tensor | None,
+        morph_depth: torch.Tensor | None,
+        total_steps: int,
+        cache,
+        pos_offset: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """Process the new chunk ``e0`` (``[B, m, d]``) one block-causally.
+
+        Stage-1 Mamba and the local decoder carry constant-size recurrent state;
+        the block-level RDT keeps a causal MLA cache per ``(step, layer)`` (or a
+        circular buffer of ``kv_share_budget`` slots). A block summary is
+        finalized only when its block completes, and a token only ever reads its
+        *previous* block's refined summary, so the result is identical to a fresh
+        full forward over the growing prefix (zero future leakage preserved).
+        """
+
+        bsz, m, dim = e0.shape
+        device = e0.device
+        Lb = self.segment_len
+
+        backbone = e0
+        for i, layer in enumerate(self.stage1):
+            backbone = layer(
+                backbone,
+                attn_mask=None,
+                cache=cache.mamba_cache(f"seg.stage1.{i}"),
+            )
+
+        abs_pos = pos_offset + torch.arange(m, device=device)
+        is_boundary = ((abs_pos + 1) % Lb) == 0
+        boundary_local = torch.nonzero(is_boundary, as_tuple=False).flatten()
+
+        prior = getattr(cache, "seg_refined", None)
+        prior_segs = 0 if prior is None else prior.shape[1]
+
+        if boundary_local.numel() > 0:
+            new_summaries = backbone.index_select(1, boundary_local)  # [B, k, d]
+            refined_new = self._refine_cached(
+                new_summaries, total_steps, cache, seg_offset=prior_segs
+            )
+            if prior is None:
+                cache.seg_refined = refined_new
+            else:
+                cache.seg_refined = torch.cat([prior, refined_new], dim=1)
+
+        # Per-token previous-block context (refined[block-1] / start_ctx).
+        block_of = torch.div(abs_pos, Lb, rounding_mode="floor")
+        prev_block = block_of - 1
+        start = self.start_ctx.to(dtype=e0.dtype).view(1, 1, dim).expand(bsz, m, dim)
+        seg_refined = getattr(cache, "seg_refined", None)
+        if seg_refined is not None:
+            idx = prev_block.clamp(min=0).view(1, m, 1).expand(bsz, m, dim)
+            gathered = torch.gather(seg_refined, 1, idx)
+        else:
+            gathered = start
+        use_prev = (prev_block >= 0).view(1, m, 1)
+        ctx = torch.where(use_prev, gathered, start)
+
+        h = e0 + self.ctx_proj(ctx)
+        for i, layer in enumerate(self.local):
+            h = layer(
+                h,
+                attn_mask=None,
+                cache=cache.mamba_cache(f"seg.local.{i}"),
+            )
+
+        info = {
+            "steps_used": total_steps,
+            "ponder_cost": e0.new_tensor(0.0),
+            "global_semantic": backbone.mean(dim=1),
+        }
+        return h, info
+
+    def _refine_cached(self, summaries, total_steps, cache, seg_offset):
+        bsz, k, _ = summaries.shape
+        device = summaries.device
+        seg_wp = torch.arange(
+            seg_offset, seg_offset + k, device=device
+        ).unsqueeze(0).expand(bsz, k)
+        seg_md = torch.zeros(bsz, k, dtype=torch.long, device=device)
+
+        budget = int(self.cfg.kv_share_budget)
+
+        def key(step: int, li: int) -> str:
+            slot = step if budget <= 0 else (step % budget)
+            return f"seg.rdt.s{slot}.l{li}"
+
+        if self.drift_mode == "mhc":
+            streams = summaries.unsqueeze(-2).expand(
+                -1, -1, self.n_streams, -1
+            ).contiguous()
+            for step in range(total_steps):
+                for li, layer in enumerate(self.stage2):
+                    streams = layer(
+                        streams,
+                        word_pos=seg_wp,
+                        morph_depth=seg_md,
+                        attn_mask=None,
+                        causal=True,
+                        cache=cache.mla_cache(key(step, li)),
+                        pos_offset=seg_offset,
+                    )
+            return streams.mean(dim=-2)
+
+        inject = self.drift_mode in {"decay", "both"}
+        h = summaries
+        for step in range(total_steps):
+            if inject:
+                scale = self.inject_scale * (self.inject_decay ** step)
+                h = h + scale * summaries
+            for li, layer in enumerate(self.stage2):
+                h = layer(
+                    h,
+                    word_pos=seg_wp,
+                    morph_depth=seg_md,
+                    attn_mask=None,
+                    causal=True,
+                    cache=cache.mla_cache(key(step, li)),
+                    pos_offset=seg_offset,
+                )
+            if self.boundary_norm is not None:
+                h = self.boundary_norm(h)
+        return h
 
     # ------------------------------------------------------------------
     # Stage helpers
@@ -273,6 +408,8 @@ class SegmentedCore(nn.Module):
         return torch.where(use_prev, gathered, start)
 
     def _boundary_indices(self, seq_len: int, device) -> torch.Tensor:
+        if seq_len <= self.segment_len:
+            return torch.tensor([seq_len - 1], device=device)
         last = torch.arange(
             self.segment_len - 1, seq_len, self.segment_len, device=device
         )

@@ -89,10 +89,10 @@ class RDTForCausalLM(nn.Module):
         ``attn_mask`` is omitted throughout.
         """
 
-        if self.cfg.core_type != "two_stage":
+        if self.cfg.core_type not in {"two_stage", "segmented"}:
             raise NotImplementedError(
                 "incremental KV/state cache is implemented for core_type="
-                "'two_stage' only"
+                "'two_stage' / 'segmented' only"
             )
 
         bsz, seq_len = input_ids.shape
@@ -614,9 +614,10 @@ class RDTForCausalLM(nn.Module):
             raise ValueError("repetition_penalty must be positive")
         if recurrent_steps is not None and recurrent_steps <= 0:
             raise ValueError("recurrent_steps must be positive when set")
-        if use_cache and self.cfg.core_type != "two_stage":
+        if use_cache and self.cfg.core_type not in {"two_stage", "segmented"}:
             raise NotImplementedError(
-                "use_cache=True is only supported for core_type='two_stage'"
+                "use_cache=True is only supported for core_type="
+                "'two_stage' / 'segmented'"
             )
         if use_cache and self.cfg.use_official_mamba:
             raise NotImplementedError(
