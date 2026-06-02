@@ -78,6 +78,48 @@ def _line_has_script(line: str, script: str) -> bool:
     return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in line)
 
 
+def _count_script(text: str, script: str) -> int:
+    ranges = _SCRIPT_RANGES[script]
+    return sum(1 for ch in text if any(lo <= ord(ch) <= hi for lo, hi in ranges))
+
+
+def _decode_text_file(fp: str) -> str:
+    """Read a text file as a string, auto-detecting its byte encoding.
+
+    Local corpus drops arrive in mixed encodings: notably the bundled
+    "1000 traditional" Mongolian corpus is UTF-16LE (with repeated BOM noise),
+    which a naive utf-8 read silently turns into U+FFFD replacement garbage --
+    wasting a large, high-quality source. Honour any BOM; otherwise try the
+    common encodings and keep whichever yields the most real Mongolian (then the
+    fewest replacement chars). Finally strip BOM / byte-order codepoints.
+    """
+    with open(fp, "rb") as fh:
+        raw = fh.read()
+    if not raw:
+        return ""
+    if raw[:2] == b"\xff\xfe":
+        text = raw.decode("utf-16-le", "replace")
+    elif raw[:2] == b"\xfe\xff":
+        text = raw.decode("utf-16-be", "replace")
+    elif raw[:3] == b"\xef\xbb\xbf":
+        text = raw.decode("utf-8-sig", "replace")
+    else:
+        best_text, best_score = None, None
+        for enc in ("utf-8", "utf-16-le", "gb18030"):
+            try:
+                cand = raw.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                continue
+            score = (
+                _count_script(cand, "mongolian") + _count_script(cand, "zh"),
+                -cand.count("\ufffd"),
+            )
+            if best_score is None or score > best_score:
+                best_text, best_score = cand, score
+        text = best_text if best_text is not None else raw.decode("utf-8", "replace")
+    return text.replace("\ufeff", "").replace("\ufffe", "")
+
+
 def _postclean(text: str, spec: "SourceSpec") -> str:
     """Apply opt-in per-source cleaning. No-op unless the source requests it."""
     if not (spec.strip_url_lines or spec.keep_lines):
@@ -213,11 +255,10 @@ def _iter_source_texts(spec: "SourceSpec") -> Iterator[str]:
         if not files:
             raise SystemExit(f"No text files found under {path!r}")
         for fp in files:
-            with open(fp, "r", encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    text = finalize(line)
-                    if text is not None:
-                        yield text
+            for line in _decode_text_file(fp).splitlines():
+                text = finalize(line)
+                if text is not None:
+                    yield text
     else:  # jsonl
         files = _resolve_text_files(path)
         if not files:

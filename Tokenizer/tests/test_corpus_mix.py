@@ -94,6 +94,39 @@ class GlobSourceTest(unittest.TestCase):
             )
             self.assertEqual(texts, ["line-a", "line-b"])
 
+    def test_txt_utf16le_decoded(self) -> None:
+        """UTF-16LE txt drops (e.g. the 1000-traditional Mongolian corpus)
+        must decode to real text, not utf-8 replacement garbage."""
+        from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
+
+        mong = "\u182d\u1824\u1837\u182d\u1824"  # real Mongolian codepoints
+        with tempfile.TemporaryDirectory() as tmp:
+            # Repeated BOM + content, exactly the shape of the real corpus files.
+            payload = ("\ufeff" * 3) + mong + "\r\n" + mong
+            with open(os.path.join(tmp, "m.txt"), "wb") as fh:
+                fh.write(payload.encode("utf-16-le"))
+            texts = list(
+                _iter_source_texts(
+                    SourceSpec(path=os.path.join(tmp, "m.txt"), fmt="txt")
+                )
+            )
+            self.assertEqual(texts, [mong, mong])
+            self.assertNotIn("\ufffd", "".join(texts))
+            self.assertNotIn("\ufeff", "".join(texts))
+
+    def test_txt_gb18030_decoded(self) -> None:
+        from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "g.txt"), "wb") as fh:
+                fh.write("中文测试内容一二三四".encode("gb18030"))
+            texts = list(
+                _iter_source_texts(
+                    SourceSpec(path=os.path.join(tmp, "g.txt"), fmt="txt")
+                )
+            )
+            self.assertEqual(texts, ["中文测试内容一二三四"])
+
     def test_missing_glob_raises(self) -> None:
         from Tokenizer.tools.build_corpus_mix import SourceSpec, _iter_source_texts
 
