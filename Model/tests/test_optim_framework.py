@@ -69,6 +69,15 @@ class AdamAtan2Test(unittest.TestCase):
         optim.step()
         self.assertFalse(torch.isnan(p).any())
 
+    def test_moments_stay_fp32_for_low_precision_params(self) -> None:
+        p = nn.Parameter(torch.randn(4, 4, dtype=torch.bfloat16))
+        optim = AdamAtan2([p], lr=1e-2)
+        p.grad = torch.randn_like(p)
+        optim.step()
+        state = optim.state[p]
+        self.assertEqual(state["exp_avg"].dtype, torch.float32)
+        self.assertEqual(state["exp_avg_sq"].dtype, torch.float32)
+
 
 class MuonTest(unittest.TestCase):
     def test_newton_schulz_orthogonalizes(self) -> None:
@@ -101,6 +110,13 @@ class MuonTest(unittest.TestCase):
         p.grad = torch.randn(8)
         with self.assertRaises(ValueError):
             optim.step()
+
+    def test_momentum_stays_fp32_for_low_precision_params(self) -> None:
+        p = nn.Parameter(torch.randn(8, 8, dtype=torch.bfloat16))
+        optim = Muon([p], lr=1e-2)
+        p.grad = torch.randn_like(p)
+        optim.step()
+        self.assertEqual(optim.state[p]["momentum_buffer"].dtype, torch.float32)
 
 
 class BuildOptimizerTest(unittest.TestCase):
@@ -160,6 +176,23 @@ class BuildOptimizerTest(unittest.TestCase):
         for _ in range(30):
             last = _step_once(model, optim)
         self.assertLessEqual(last, first + 1e-3)
+
+    def test_combined_optimizer_exposes_mutable_base_state(self) -> None:
+        p1 = nn.Parameter(torch.randn(4, 4))
+        p2 = nn.Parameter(torch.randn(4))
+        opt1 = Muon([p1], lr=1e-2)
+        opt2 = AdamAtan2([p2], lr=1e-2)
+        optim = CombinedOptimizer([opt1, opt2])
+        self.assertIsInstance(optim.state, dict)
+
+        p1.grad = torch.randn_like(p1)
+        p2.grad = torch.randn_like(p2)
+        optim.step()
+
+        self.assertIn(p1, optim.state)
+        self.assertIn(p2, optim.state)
+        self.assertIs(optim.param_groups[0], opt1.param_groups[0])
+        self.assertIs(optim.param_groups[1], opt2.param_groups[0])
 
 
 class WSDScheduleTest(unittest.TestCase):

@@ -222,13 +222,13 @@ class AdamAtan2(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                grad = p.grad
+                grad = p.grad.to(dtype=torch.float32)
                 state = self.state[p]
 
                 if not state:
                     state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p)
-                    state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+                    state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
 
                 m, v = state["exp_avg"], state["exp_avg_sq"]
                 state["step"] += 1
@@ -244,7 +244,8 @@ class AdamAtan2(torch.optim.Optimizer):
 
                 if wd != 0:
                     p.mul_(1 - lr * wd)
-                p.add_(torch.atan2(m_hat, b * denom), alpha=-lr * a)
+                update = torch.atan2(m_hat, b * denom).to(dtype=p.dtype)
+                p.add_(update, alpha=-lr * a)
 
         return loss
 
@@ -307,10 +308,12 @@ class Muon(torch.optim.Optimizer):
                     continue
                 if p.ndim != 2:
                     raise ValueError("Muon only supports 2-D weight matrices")
-                grad = p.grad
+                grad = p.grad.to(dtype=torch.float32)
                 state = self.state[p]
                 if not state:
-                    state["momentum_buffer"] = torch.zeros_like(p)
+                    state["momentum_buffer"] = torch.zeros_like(
+                        p, dtype=torch.float32
+                    )
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(grad)
 
@@ -338,14 +341,20 @@ class CombinedOptimizer(torch.optim.Optimizer):
         if not optimizers:
             raise ValueError("CombinedOptimizer needs at least one optimizer")
         self.optimizers = optimizers
-        self.param_groups = [g for opt in optimizers for g in opt.param_groups]
+        groups = [g for opt in optimizers for g in opt.param_groups]
+        super().__init__(groups, {})
+        self._sync_param_groups()
+        self._sync_state()
 
-    @property
-    def state(self):  # pragma: no cover - convenience
-        merged: dict = {}
+    def _sync_param_groups(self) -> None:
+        self.param_groups = [
+            group for opt in self.optimizers for group in opt.param_groups
+        ]
+
+    def _sync_state(self) -> None:
+        self.state.clear()
         for opt in self.optimizers:
-            merged.update(opt.state)
-        return merged
+            self.state.update(opt.state)
 
     def zero_grad(self, set_to_none: bool = True):
         for opt in self.optimizers:
@@ -359,14 +368,18 @@ class CombinedOptimizer(torch.optim.Optimizer):
                 loss = closure()
         for opt in self.optimizers:
             opt.step()
+        self._sync_state()
         return loss
 
     def state_dict(self):
+        self._sync_state()
         return {"optimizers": [opt.state_dict() for opt in self.optimizers]}
 
     def load_state_dict(self, state_dict):
         for opt, sub in zip(self.optimizers, state_dict["optimizers"]):
             opt.load_state_dict(sub)
+        self._sync_param_groups()
+        self._sync_state()
 
 
 def build_scheduler(

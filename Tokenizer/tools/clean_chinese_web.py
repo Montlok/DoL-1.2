@@ -39,7 +39,7 @@ import time
 import unicodedata
 import zipfile
 from collections import Counter
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from multiprocessing import Pool
 from typing import Iterable, Iterator, Optional
 
@@ -47,7 +47,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from corpus_filters import (  # noqa: E402
     Deduper,
     exact_key,
-    script_ratio,
     simhash,
 )
 
@@ -177,7 +176,6 @@ _CJK_LO, _CJK_HI = 0x4E00, 0x9FFF
 _CJK_EXT = ((0x3400, 0x4DBF), (0xF900, 0xFAFF))
 # Chinese + ASCII sentence-ending punctuation.
 _SENT_END = set("。！？!?…")
-_PUNCT = set("，。！？；：、,.!?;:…—-（）()《》「」“”‘’\"' 、·")
 _DIGIT_RE = re.compile(r"\d")
 _GARBLE_RE = re.compile(r"[\ufffd\ue000-\uf8ff]")
 _HAN_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]")
