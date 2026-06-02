@@ -81,8 +81,13 @@ def build_ocr_row(
     labels = [ignore_index] * len(prompt) + supervised
     attention_mask = [1] * len(input_ids)
 
-    assert len(input_ids) == len(labels) == len(attention_mask)
-    assert input_ids.count(image_patch_id) >= n_image_tokens
+    if len(input_ids) != len(labels) or len(input_ids) != len(attention_mask):
+        raise RuntimeError("OCR row fields must have aligned lengths")
+    if input_ids.count(image_patch_id) != n_image_tokens:
+        raise ValueError(
+            "OCR row must contain exactly n_image_tokens image_patch slots; "
+            "instruction_ids and target_ids must not contain image_patch_id"
+        )
 
     return {
         "input_ids": input_ids,

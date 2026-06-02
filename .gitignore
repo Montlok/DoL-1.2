@@ -15,9 +15,20 @@ logs/
 *.pt
 *.bin
 
-# corpora (DO NOT COMMIT — user data)
+# private corpora and local-only data
+*DONOTGITIT*/
 *DO NOT GIT IT*/
-1000 traditional_mongolian_corpus（DO NOT GIT IT）/
-CHINESE(DO NOT GIT IT)/
-WIKIPEDIA(DO NOT GIT IT)/
+private_data/
+local_data/
+
+# local secrets
+.env
+.env.*
+!.env.example
 cookies.txt
+*.pem
+*.key
+*.token
+*.secret
+secrets/
+credentials/

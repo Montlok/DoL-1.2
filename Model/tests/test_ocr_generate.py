@@ -55,21 +55,43 @@ class TestGeneratePixelValues(unittest.TestCase):
         self.assertTrue(torch.all(out[:, : prompt.shape[1]] == prompt))
 
     def test_image_changes_output(self):
-        torch.manual_seed(0)
         cfg = _two_stage_cfg()
         model = RDTForCausalLM(cfg, patch_pixels=4).eval()
         prompt = _image_prompt(cfg)
 
+        def fake_forward(
+            input_ids,
+            *,
+            steps=None,
+            return_logits=True,
+            pixel_values=None,
+            **kwargs,
+        ):
+            self.assertTrue(return_logits)
+            self.assertIsNotNone(pixel_values)
+            self.assertIsNone(steps)
+            logits = torch.zeros(
+                input_ids.shape[0],
+                input_ids.shape[1],
+                cfg.vocab_size,
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            token = 300 if float(pixel_values.sum()) > 0 else 301
+            logits[:, -1, token] = 100.0
+            return {"logits": logits}
+
+        model.forward = fake_forward  # type: ignore[method-assign]
         a = model.generate(
-            prompt, max_new_tokens=4, greedy=True, use_cache=False,
+            prompt, max_new_tokens=1, greedy=True, use_cache=False,
             pixel_values=torch.full((1, 4), 5.0),
         )
         b = model.generate(
-            prompt, max_new_tokens=4, greedy=True, use_cache=False,
+            prompt, max_new_tokens=1, greedy=True, use_cache=False,
             pixel_values=torch.full((1, 4), -5.0),
         )
-        # Two very different images should drive different greedy decodes.
-        self.assertFalse(torch.equal(a, b))
+        self.assertEqual(int(a[0, -1]), 300)
+        self.assertEqual(int(b[0, -1]), 301)
 
     def test_cached_matches_cachefree_with_image(self):
         torch.manual_seed(0)

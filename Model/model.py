@@ -589,6 +589,11 @@ class RDTForCausalLM(nn.Module):
         ("think harder") per token without emitting any extra tokens; lowering
         it trades quality for speed. The override is constant for the whole call
         so the incremental KV/state cache stays consistent across positions.
+
+        ``pixel_values`` optionally supplies image features for prompts containing
+        ``<image_patch>`` slots. Cached decoding consumes them only during the
+        prefill step; cache-free decoding refuses sliding-window truncation with
+        images because dropping patch slots would desync the visual payload.
         """
 
         if input_ids.dim() != 2:

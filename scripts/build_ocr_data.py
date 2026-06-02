@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -96,22 +97,34 @@ def render_vertical_line(
     return img
 
 
-def _read_lines(path: str) -> list[str]:
-    raw = Path(path).read_text(encoding="utf-8").splitlines()
-    lines: list[str] = []
-    for line in raw:
-        line = line.strip()
-        if not line:
-            continue
-        if line[0] in "{[":
-            obj = json.loads(line)
-            text = obj.get("text")
-            if not text:
-                raise ValueError(f"JSONL row missing 'text': {line[:80]}")
-            lines.append(text)
-        else:
-            lines.append(line)
-    return lines
+def _iter_input_text(path: str) -> Iterator[tuple[int, str]]:
+    """Yield ``(line_number, text)`` from plain text or JSONL without full reads."""
+
+    input_path = Path(path)
+    with input_path.open("r", encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            if line[0] in "{[":
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        f"{input_path}:{lineno}: invalid JSONL: {exc.msg}"
+                    ) from exc
+                if not isinstance(obj, dict):
+                    raise ValueError(
+                        f"{input_path}:{lineno}: JSONL row must be an object"
+                    )
+                text = obj.get("text")
+                if not isinstance(text, str) or not text:
+                    raise ValueError(
+                        f"{input_path}:{lineno}: JSONL row missing non-empty 'text'"
+                    )
+                yield lineno, text
+            else:
+                yield lineno, line
 
 
 def main() -> int:
@@ -154,39 +167,47 @@ def main() -> int:
     img_dir = out_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    lines = _read_lines(args.input)
-    if not lines:
-        print("[build-ocr] no input lines")
-        return 1
-
+    n_seen = 0
     n_written = 0
     with (out_dir / "data.jsonl").open("w", encoding="utf-8") as fh:
-        for i, text in enumerate(lines):
+        for lineno, text in _iter_input_text(args.input):
+            n_seen += 1
+            target_ids = bundle.encode(text, add_bos=False, add_eos=False)
+            if not target_ids:
+                continue
+
             img = render_vertical_line(
                 text,
                 args.font,
                 image_size=args.image_size,
                 font_size=args.font_size,
             )
-            rel = f"images/{i:08d}.png"
+            rel = f"images/{n_written:08d}.png"
             img.save(out_dir / rel)
 
-            target_ids = bundle.encode(text, add_bos=False, add_eos=False)
-            if not target_ids:
-                continue
-            row = build_ocr_row(
-                target_ids,
-                n_image_tokens,
-                rel,
-                bos_id=BOS_ID,
-                image_start_id=IMAGE_START_ID,
-                image_patch_id=IMAGE_PATCH_ID,
-                image_end_id=IMAGE_END_ID,
-                eos_id=EOS_ID,
-                instruction_ids=instruction_ids,
-            )
+            try:
+                row = build_ocr_row(
+                    target_ids,
+                    n_image_tokens,
+                    rel,
+                    bos_id=BOS_ID,
+                    image_start_id=IMAGE_START_ID,
+                    image_patch_id=IMAGE_PATCH_ID,
+                    image_end_id=IMAGE_END_ID,
+                    eos_id=EOS_ID,
+                    instruction_ids=instruction_ids,
+                )
+            except ValueError as exc:
+                raise ValueError(f"{args.input}:{lineno}: {exc}") from exc
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             n_written += 1
+
+    if n_seen == 0:
+        print("[build-ocr] no input lines")
+        return 1
+    if n_written == 0:
+        print("[build-ocr] no rows written after tokenization")
+        return 1
 
     print(
         f"[build-ocr] wrote {n_written} rows -> {out_dir/'data.jsonl'} "
