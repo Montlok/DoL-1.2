@@ -120,6 +120,24 @@ def _fold_with_backend(
     return folded, "rust"
 
 
+def _fold_pair(
+    preds: Sequence[str], refs: Sequence[str], *, backend: str = "auto"
+) -> tuple[list[str], list[str], str]:
+    """Fold ``preds`` and ``refs`` through a *single* backend decision.
+
+    Folding the two sides in separate calls could, under ``backend="auto"``,
+    pick different backends (e.g. if only one side contains a newline that makes
+    the batched Rust round-trip bail to the Python fallback), making the two
+    sides normalized by different rules. Concatenating and folding once
+    guarantees both sides share the same backend and folding.
+    """
+    preds = list(preds)
+    refs = list(refs)
+    combined, used = _fold_with_backend(preds + refs, backend=backend)
+    n = len(preds)
+    return combined[:n], combined[n:], used
+
+
 def edit_distance(a: Sequence, b: Sequence) -> int:
     """Levenshtein edit distance between two sequences (O(len(a)*len(b)) time,
     O(min) space)."""
@@ -142,12 +160,18 @@ def edit_distance(a: Sequence, b: Sequence) -> int:
 def _corpus_rate(
     preds: Sequence[Sequence], refs: Sequence[Sequence]
 ) -> tuple[float, int, int]:
-    """Micro-averaged error rate: sum(edit distance) / sum(len(ref))."""
+    """Micro-averaged error rate: sum(edit distance) / sum(max(len(ref), 1)).
+
+    Using ``max(len(ref), 1)`` per sample ensures pure-insertion errors against
+    an empty reference are still reflected (a plain ``sum(len(ref))`` denominator
+    would add the insertions to the numerator but nothing to the denominator,
+    silently under-penalizing them — and would be 0/0 if every ref were empty).
+    """
     total_dist = 0
     total_len = 0
     for p, r in zip(preds, refs):
         total_dist += edit_distance(p, r)
-        total_len += len(r)
+        total_len += max(len(r), 1)
     rate = total_dist / total_len if total_len else 0.0
     return rate, total_dist, total_len
 
@@ -162,8 +186,7 @@ def cer(
     """Corpus character error rate. When ``normalize`` is true, both sides are
     folded to nominal Unicode first (the primary, render-robust metric)."""
     if normalize:
-        preds = nominal_normalize(preds, backend=backend)
-        refs = nominal_normalize(refs, backend=backend)
+        preds, refs, _ = _fold_pair(preds, refs, backend=backend)
     rate, _, _ = _corpus_rate(preds, refs)
     return rate
 
@@ -177,8 +200,7 @@ def wer(
 ) -> float:
     """Corpus word error rate over whitespace-split tokens."""
     if normalize:
-        preds = nominal_normalize(preds, backend=backend)
-        refs = nominal_normalize(refs, backend=backend)
+        preds, refs, _ = _fold_pair(preds, refs, backend=backend)
     rate, _, _ = _corpus_rate([p.split() for p in preds], [r.split() for r in refs])
     return rate
 
@@ -226,8 +248,7 @@ def ocr_report(
     kp = [preds[i] for i in keep]
     kr = [refs[i] for i in keep]
 
-    norm_p, used_backend = _fold_with_backend(kp, backend=backend)
-    norm_r, _ = _fold_with_backend(kr, backend=backend)
+    norm_p, norm_r, used_backend = _fold_pair(kp, kr, backend=backend)
 
     norm_cer, _, _ = _corpus_rate(norm_p, norm_r)
     raw_cer, _, _ = _corpus_rate(kp, kr)

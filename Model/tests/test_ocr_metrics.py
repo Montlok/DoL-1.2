@@ -69,6 +69,24 @@ class TestCER(unittest.TestCase):
     def test_perfect(self):
         self.assertEqual(cer(["abc"], ["abc"], normalize=False), 0.0)
 
+    def test_empty_ref_counts_insertions(self):
+        # Pure insertion against an empty reference must be penalized, not 0/0.
+        self.assertGreater(cer(["abc"], [""], normalize=False), 0.0)
+
+    def test_single_backend_decision_on_auto(self):
+        # The bug: under auto, folding preds/refs separately could pick different
+        # backends (one side has a newline -> Python fallback, the other -> Rust).
+        # _fold_pair folds the concatenated batch once, so a newline on *either*
+        # side forces the same backend for both.
+        from Model.ocr.metrics import _fold_pair
+
+        _, _, used = _fold_pair(["a\nb"], ["ab"], backend="auto")
+        self.assertEqual(used, "python")
+        # And an FVS-only difference stays free regardless.
+        pred = ["a\nb" + FVS1]
+        ref = ["a\nb"]
+        self.assertAlmostEqual(cer(pred, ref, backend="auto"), 0.0)
+
 
 class TestWER(unittest.TestCase):
     def test_word_error(self):

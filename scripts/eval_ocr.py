@@ -32,7 +32,6 @@ import argparse
 import json
 import os
 import sys
-from pathlib import Path
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
@@ -45,21 +44,30 @@ def _load(path: str) -> tuple[list[str], list[str], list[float | None]]:
     preds: list[str] = []
     refs: list[str] = []
     confs: list[float | None] = []
-    for lineno, line in enumerate(
-        Path(path).read_text(encoding="utf-8").splitlines(), 1
-    ):
-        line = line.strip()
-        if not line:
-            continue
-        obj = json.loads(line)
-        if "pred" not in obj or "ref" not in obj:
-            raise ValueError(
-                f"{path}:{lineno}: each line needs 'pred' and 'ref' keys"
-            )
-        preds.append(obj["pred"])
-        refs.append(obj["ref"])
-        c = obj.get("confidence")
-        confs.append(float(c) if c is not None else None)
+    # Stream line-by-line: OCR eval corpora can be large, so avoid loading the
+    # whole file into memory. Wrap parse errors with path:lineno for debugging.
+    with open(path, encoding="utf-8") as fh:
+        for lineno, raw in enumerate(fh, 1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
+            if "pred" not in obj or "ref" not in obj:
+                raise ValueError(
+                    f"{path}:{lineno}: each line needs 'pred' and 'ref' keys"
+                )
+            preds.append(obj["pred"])
+            refs.append(obj["ref"])
+            c = obj.get("confidence")
+            try:
+                confs.append(float(c) if c is not None else None)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path}:{lineno}: 'confidence' is not a number: {c!r}"
+                ) from exc
     return preds, refs, confs
 
 
