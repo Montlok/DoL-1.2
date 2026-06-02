@@ -78,46 +78,44 @@ def _line_has_script(line: str, script: str) -> bool:
     return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in line)
 
 
-def _count_script(text: str, script: str) -> int:
-    ranges = _SCRIPT_RANGES[script]
-    return sum(1 for ch in text if any(lo <= ord(ch) <= hi for lo, hi in ranges))
-
-
-def _decode_text_file(fp: str) -> str:
-    """Read a text file as a string, auto-detecting its byte encoding.
+def _detect_text_encoding(sample: bytes) -> str:
+    """Detect a text file's byte encoding from a leading byte sample.
 
     Local corpus drops arrive in mixed encodings: notably the bundled
-    "1000 traditional" Mongolian corpus is UTF-16LE (with repeated BOM noise),
-    which a naive utf-8 read silently turns into U+FFFD replacement garbage --
-    wasting a large, high-quality source. Honour any BOM; otherwise try the
-    common encodings and keep whichever yields the most real Mongolian (then the
-    fewest replacement chars). Finally strip BOM / byte-order codepoints.
+    "1000 traditional" Mongolian corpus is UTF-16LE (with repeated FEFF BOM
+    noise), which a naive utf-8 read silently turns into U+FFFD replacement
+    garbage -- wasting a large, high-quality source. Detection only inspects a
+    small sample so the caller can stream the full file line-by-line with the
+    chosen encoding.
+
+    Heuristic (robust and content-agnostic):
+      * honour a leading BOM;
+      * a high density of NUL bytes means UTF-16 (ASCII/Mongolian high bytes are
+        0x00) -- pick LE vs BE by which byte position holds the NULs;
+      * otherwise prefer strict UTF-8 (tolerating a multibyte char clipped at the
+        sample boundary), falling back to GB18030 when the bytes aren't valid
+        UTF-8.
     """
-    with open(fp, "rb") as fh:
-        raw = fh.read()
-    if not raw:
-        return ""
-    if raw[:2] == b"\xff\xfe":
-        text = raw.decode("utf-16-le", "replace")
-    elif raw[:2] == b"\xfe\xff":
-        text = raw.decode("utf-16-be", "replace")
-    elif raw[:3] == b"\xef\xbb\xbf":
-        text = raw.decode("utf-8-sig", "replace")
-    else:
-        best_text, best_score = None, None
-        for enc in ("utf-8", "utf-16-le", "gb18030"):
-            try:
-                cand = raw.decode(enc)
-            except (UnicodeDecodeError, LookupError):
-                continue
-            score = (
-                _count_script(cand, "mongolian") + _count_script(cand, "zh"),
-                -cand.count("\ufffd"),
-            )
-            if best_score is None or score > best_score:
-                best_text, best_score = cand, score
-        text = best_text if best_text is not None else raw.decode("utf-8", "replace")
-    return text.replace("\ufeff", "").replace("\ufffe", "")
+    if sample[:2] == b"\xff\xfe":
+        return "utf-16-le"
+    if sample[:2] == b"\xfe\xff":
+        return "utf-16-be"
+    if sample[:3] == b"\xef\xbb\xbf":
+        return "utf-8-sig"
+    if not sample:
+        return "utf-8"
+    nul = sample.count(0)
+    if nul / len(sample) > 0.10:
+        le = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)
+        be = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
+        return "utf-16-le" if le >= be else "utf-16-be"
+    for trim in (0, 1, 2, 3):  # tolerate a multibyte char cut at the boundary
+        try:
+            sample[: len(sample) - trim].decode("utf-8")
+            return "utf-8"
+        except UnicodeDecodeError:
+            continue
+    return "gb18030"
 
 
 def _postclean(text: str, spec: "SourceSpec") -> str:
@@ -255,10 +253,16 @@ def _iter_source_texts(spec: "SourceSpec") -> Iterator[str]:
         if not files:
             raise SystemExit(f"No text files found under {path!r}")
         for fp in files:
-            for line in _decode_text_file(fp).splitlines():
-                text = finalize(line)
-                if text is not None:
-                    yield text
+            with open(fp, "rb") as bh:
+                enc = _detect_text_encoding(bh.read(65536))
+            # Stream line-by-line with the detected encoding to keep memory
+            # bounded on large corpora; strip any BOM/byte-order noise per line.
+            with open(fp, "r", encoding=enc, errors="replace") as fh:
+                for line in fh:
+                    line = line.replace("\ufeff", "").replace("\ufffe", "")
+                    text = finalize(line)
+                    if text is not None:
+                        yield text
     else:  # jsonl
         files = _resolve_text_files(path)
         if not files:
