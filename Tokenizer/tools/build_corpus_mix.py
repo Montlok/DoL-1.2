@@ -78,6 +78,10 @@ def _line_has_script(line: str, script: str) -> bool:
     return any(any(lo <= ord(ch) <= hi for lo, hi in ranges) for ch in line)
 
 
+# BOM / byte-order marks to delete from every streamed line in a single pass.
+_BOM_DELETE = {ord("\ufeff"): None, ord("\ufffe"): None}
+
+
 def _detect_text_encoding(sample: bytes) -> str:
     """Detect a text file's byte encoding from a leading byte sample.
 
@@ -262,10 +266,11 @@ def _iter_source_texts(spec: "SourceSpec") -> Iterator[str]:
             with open(fp, "rb") as bh:
                 enc = _detect_text_encoding(bh.read(65536))
             # Stream line-by-line with the detected encoding to keep memory
-            # bounded on large corpora; strip any BOM/byte-order noise per line.
+            # bounded on large corpora; strip any BOM/byte-order noise per line
+            # in a single pass via translate().
             with open(fp, "r", encoding=enc, errors="replace") as fh:
                 for line in fh:
-                    line = line.replace("\ufeff", "").replace("\ufffe", "")
+                    line = line.translate(_BOM_DELETE)
                     text = finalize(line)
                     if text is not None:
                         yield text
