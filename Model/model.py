@@ -540,6 +540,7 @@ class RDTForCausalLM(nn.Module):
         stop_ids: Sequence[int] | None = None,
         on_token: Callable[[int, torch.Tensor], None] | None = None,
         recurrent_steps: int | None = None,
+        pixel_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Autoregressively continue ``input_ids`` (``[B, L]``) with sampling.
 
@@ -588,6 +589,11 @@ class RDTForCausalLM(nn.Module):
         ("think harder") per token without emitting any extra tokens; lowering
         it trades quality for speed. The override is constant for the whole call
         so the incremental KV/state cache stays consistent across positions.
+
+        ``pixel_values`` optionally supplies image features for prompts containing
+        ``<image_patch>`` slots. Cached decoding consumes them only during the
+        prefill step; cache-free decoding refuses sliding-window truncation with
+        images because dropping patch slots would desync the visual payload.
         """
 
         if input_ids.dim() != 2:
@@ -670,8 +676,13 @@ class RDTForCausalLM(nn.Module):
                 if use_cache:
                     if decode_cache.seq_len == 0:
                         step_ids = seq
+                        step_pixels = pixel_values
                     else:
                         step_ids = seq[:, -1:]
+                        # The image was folded into the cache at prefill; later
+                        # steps process only the new token and carry no
+                        # <image_patch> slots, so pixel_values must be dropped.
+                        step_pixels = None
                     mask = (seq != pad_id).long()
                     word_pos, morph_depth = self._default_morph_info(seq, mask)
                     m = step_ids.shape[1]
@@ -680,16 +691,36 @@ class RDTForCausalLM(nn.Module):
                         word_pos=word_pos[:, -m:],
                         morph_depth=morph_depth[:, -m:],
                         cache=decode_cache,
+                        pixel_values=step_pixels,
                         steps=recurrent_steps,
                     )[:, -1, :].float()
                 else:
                     window = seq
                     if window.shape[1] > cfg.max_seq_len:
                         window = window[:, -cfg.max_seq_len:]
+                        if pixel_values is not None:
+                            # Left-truncation could drop <image_patch> slots while
+                            # pixel_values still holds the full visual payload,
+                            # desyncing the injector. Refuse loudly.
+                            raise ValueError(
+                                "cache-free image generation cannot truncate the "
+                                "context (L + generated tokens exceeded "
+                                "max_seq_len); the <image_patch> slots would "
+                                "desync from pixel_values. Use use_cache=True or "
+                                "keep L + max_new_tokens <= max_seq_len."
+                            )
 
-                    out = self.forward(
-                        window, steps=recurrent_steps, return_logits=True
-                    )
+                    if pixel_values is not None:
+                        out = self.forward(
+                            window,
+                            steps=recurrent_steps,
+                            return_logits=True,
+                            pixel_values=pixel_values,
+                        )
+                    else:
+                        out = self.forward(
+                            window, steps=recurrent_steps, return_logits=True
+                        )
                     logits = out["logits"][:, -1, :].float()
 
                 if repetition_penalty != 1.0:
