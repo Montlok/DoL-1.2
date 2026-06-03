@@ -160,8 +160,11 @@ def _official_mamba_usable(device: str | torch.device | None = None) -> tuple[bo
             return False, f"invalid target device {device!r}: {exc}"
         if device_type != "cuda":
             return False, f"target device is {device_type}, not cuda"
-    if platform.system() == "Darwin":
+    host_os = platform.system()
+    if host_os == "Darwin":
         return False, "macOS uses the NaiveSSM fallback"
+    if host_os != "Linux":
+        return False, f"{host_os} is not Linux"
     if not torch.cuda.is_available():
         return False, "CUDA is not available"
     if not official_available():
@@ -214,8 +217,10 @@ def _resolve_mamba_backend(
     if cfg.use_official_mamba:
         sys.stderr.write(
             "WARNING: --mamba=auto falling back to NaiveSSM because "
-            f"{reason}. This is expected on macOS, but CUDA training should use "
-            "--mamba=official to fail fast if the official backend is missing.\n"
+            f"{reason}. This is expected for local fallback runs (macOS, "
+            "CPU-only/CPU-target, or unsupported OSes); CUDA/Linux training "
+            "should use --mamba=official to fail fast if the official backend "
+            "is missing.\n"
         )
     return replace(cfg, use_official_mamba=False)
 

@@ -108,10 +108,10 @@ class TrainRdtCliGuardsTest(unittest.TestCase):
             )
         self.assertFalse(resolved.use_official_mamba)
 
-    def test_auto_mamba_uses_naive_for_cpu_target(self) -> None:
+    def test_auto_mamba_uses_naive_on_non_linux_cuda_host(self) -> None:
         cfg = train_rdt.CONFIG_CHOICES["segmented_pretrain"]()
         with (
-            mock.patch.object(train_rdt.platform, "system", return_value="Linux"),
+            mock.patch.object(train_rdt.platform, "system", return_value="Windows"),
             mock.patch.object(train_rdt.torch.cuda, "is_available", return_value=True),
             mock.patch.object(train_rdt, "official_available", return_value=True),
             contextlib.redirect_stderr(io.StringIO()),
@@ -119,9 +119,27 @@ class TrainRdtCliGuardsTest(unittest.TestCase):
             resolved = train_rdt._resolve_mamba_backend(
                 cfg,
                 "auto",
+                device="cuda",
+            )
+        self.assertFalse(resolved.use_official_mamba)
+
+    def test_auto_mamba_uses_naive_for_cpu_target(self) -> None:
+        cfg = train_rdt.CONFIG_CHOICES["segmented_pretrain"]()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(train_rdt.platform, "system", return_value="Linux"),
+            mock.patch.object(train_rdt.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(train_rdt, "official_available", return_value=True),
+            contextlib.redirect_stderr(stderr),
+        ):
+            resolved = train_rdt._resolve_mamba_backend(
+                cfg,
+                "auto",
                 device="cpu",
             )
         self.assertFalse(resolved.use_official_mamba)
+        self.assertIn("target device is cpu", stderr.getvalue())
+        self.assertIn("CPU-only/CPU-target", stderr.getvalue())
 
     def test_official_mamba_fails_fast_without_cuda(self) -> None:
         cfg = train_rdt.CONFIG_CHOICES["segmented_pretrain"]()
