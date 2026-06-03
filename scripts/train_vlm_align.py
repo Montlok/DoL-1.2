@@ -52,7 +52,10 @@ def parse_args(argv=None):
         "--mamba",
         choices=["auto", "official", "naive"],
         default="auto",
-        help="Mamba backend for the RDT side (see scripts.train_rdt --mamba).",
+        help=(
+            "Mamba backend for the RDT side. auto uses official CUDA Mamba on "
+            "CUDA/Linux and NaiveSSM on macOS/CPU."
+        ),
     )
     p.add_argument("--steps", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=2)
@@ -198,7 +201,16 @@ def main(argv=None):
     # cap seq_len to the synthetic layout (tiny config is 2048 by default but
     # the smoke layout is much shorter)
     rdt_cfg = replace(rdt_cfg, max_seq_len=args.seq_len)
-    rdt_cfg = _resolve_mamba_backend(rdt_cfg, args.mamba)
+    try:
+        rdt_cfg = _resolve_mamba_backend(
+            rdt_cfg,
+            args.mamba,
+            device=device,
+            context="scripts.train_vlm_align",
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     omvt_cfg = _build_omvt_cfg(args)
 
