@@ -18,6 +18,7 @@ import contextlib
 import io
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import train_rdt
 
@@ -75,6 +76,79 @@ class TrainRdtCliGuardsTest(unittest.TestCase):
             train_rdt._target_recurrent_steps_for_train(model_cfg, ramp_cfg),
             model_cfg.recurrent_steps,
         )
+
+    def test_auto_mamba_prefers_official_on_cuda_linux(self) -> None:
+        cfg = train_rdt.CONFIG_CHOICES["segmented_tiny"]()
+        self.assertFalse(cfg.use_official_mamba)
+        with (
+            mock.patch.object(train_rdt.platform, "system", return_value="Linux"),
+            mock.patch.object(train_rdt.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(train_rdt, "official_available", return_value=True),
+        ):
+            resolved = train_rdt._resolve_mamba_backend(
+                cfg,
+                "auto",
+                device="cuda",
+            )
+        self.assertTrue(resolved.use_official_mamba)
+
+    def test_auto_mamba_uses_naive_on_macos(self) -> None:
+        cfg = train_rdt.CONFIG_CHOICES["segmented_pretrain"]()
+        self.assertTrue(cfg.use_official_mamba)
+        with (
+            mock.patch.object(train_rdt.platform, "system", return_value="Darwin"),
+            mock.patch.object(train_rdt.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(train_rdt, "official_available", return_value=True),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            resolved = train_rdt._resolve_mamba_backend(
+                cfg,
+                "auto",
+                device="cuda",
+            )
+        self.assertFalse(resolved.use_official_mamba)
+
+    def test_auto_mamba_uses_naive_for_cpu_target(self) -> None:
+        cfg = train_rdt.CONFIG_CHOICES["segmented_pretrain"]()
+        with (
+            mock.patch.object(train_rdt.platform, "system", return_value="Linux"),
+            mock.patch.object(train_rdt.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(train_rdt, "official_available", return_value=True),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            resolved = train_rdt._resolve_mamba_backend(
+                cfg,
+                "auto",
+                device="cpu",
+            )
+        self.assertFalse(resolved.use_official_mamba)
+
+    def test_official_mamba_fails_fast_without_cuda(self) -> None:
+        cfg = train_rdt.CONFIG_CHOICES["segmented_pretrain"]()
+        with (
+            mock.patch.object(train_rdt.platform, "system", return_value="Linux"),
+            mock.patch.object(train_rdt.torch.cuda, "is_available", return_value=False),
+            mock.patch.object(train_rdt, "official_available", return_value=True),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "CUDA is not available"):
+                train_rdt._resolve_mamba_backend(cfg, "official", device="cuda")
+
+    def test_cached_decode_requires_naive_mamba(self) -> None:
+        cfg = train_rdt.CONFIG_CHOICES["two_stage_pretrain"]()
+        with self.assertRaisesRegex(ValueError, "--use-cache requires --mamba naive"):
+            train_rdt._resolve_mamba_backend(
+                cfg,
+                "auto",
+                use_cache=True,
+                context="scripts.generate",
+            )
+        resolved = train_rdt._resolve_mamba_backend(
+            cfg,
+            "naive",
+            use_cache=True,
+            context="scripts.generate",
+        )
+        self.assertFalse(resolved.use_official_mamba)
 
     def test_requires_data_or_smoke(self) -> None:
         # No --data, no --smoke ⇒ must return non-zero exit code with a

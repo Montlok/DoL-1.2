@@ -50,21 +50,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--repetition-penalty", type=float, default=1.0)
     p.add_argument("--greedy", action="store_true")
     p.add_argument(
+        "--recurrent-steps",
+        type=int,
+        default=None,
+        help="Latent refinement depth override for this generation run.",
+    )
+    p.add_argument(
         "--use-cache",
         action="store_true",
         help=(
             "Incremental KV/state decoding (core_type='two_stage' or "
-            "'segmented'); matches the cache-free path within numerical "
-            "tolerance but remains O(L) per step."
+            "'segmented'); requires --mamba naive and a NaiveSSM checkpoint."
         ),
     )
     p.add_argument(
         "--mamba",
         choices=["auto", "official", "naive"],
         default="auto",
-        help="Mamba backend (see scripts/train_rdt --mamba).",
+        help=(
+            "Mamba backend. auto uses official CUDA Mamba on CUDA/Linux and "
+            "NaiveSSM on macOS/CPU; cached decode requires naive."
+        ),
     )
-    p.add_argument("--device", default="cpu")
+    p.add_argument("--device", default="auto")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args(argv)
 
@@ -82,10 +90,24 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     torch.manual_seed(args.seed)
 
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if args.recurrent_steps is not None and args.recurrent_steps <= 0:
+        raise SystemExit("scripts/generate: --recurrent-steps must be positive")
+
     bundle = TokenizerBundle.from_dir(args.tokenizer_bundle)
 
     cfg = CONFIG_CHOICES[args.config]()
-    cfg = _resolve_mamba_backend(cfg, args.mamba)
+    try:
+        cfg = _resolve_mamba_backend(
+            cfg,
+            args.mamba,
+            use_cache=args.use_cache,
+            device=args.device,
+            context="scripts.generate",
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     model = RDTForCausalLM(cfg)
     state = torch.load(_resolve_model_pt(args.checkpoint), map_location="cpu")
@@ -108,6 +130,7 @@ def main(argv: list[str] | None = None) -> None:
         greedy=args.greedy,
         repetition_penalty=args.repetition_penalty,
         use_cache=args.use_cache,
+        recurrent_steps=args.recurrent_steps,
     )
 
     full = out[0].tolist()

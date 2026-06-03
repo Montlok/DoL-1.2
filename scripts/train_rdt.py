@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import sys
 import time
 from dataclasses import replace
@@ -89,11 +90,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["auto", "official", "naive"],
         default="auto",
         help=(
-            "Mamba backend selection. 'auto' (default) uses the official CUDA "
-            "mamba_ssm kernel when importable and otherwise falls back to the "
-            "pure-PyTorch NaiveSSM with a warning; 'official' forces the CUDA "
-            "kernel (errors if mamba_ssm is missing); 'naive' forces the "
-            "fallback. Keeps one-click runs working on hosts without mamba_ssm."
+            "Mamba backend selection. 'auto' (default) uses official CUDA "
+            "Mamba on CUDA/Linux and NaiveSSM on macOS/CPU; 'official' fails "
+            "fast unless a CUDA-matched mamba_ssm is usable; 'naive' forces "
+            "the fallback for macOS or cached decoding."
         ),
     )
     p.add_argument("--seq-len", type=int, default=None)
@@ -150,32 +150,74 @@ def _tri_to_bool(value: str) -> bool | None:
     return value == "on"
 
 
-def _resolve_mamba_backend(cfg: RDTConfig, mode: str) -> RDTConfig:
-    """Apply the ``--mamba`` override so one-click runs survive hosts that lack
-    the CUDA ``mamba_ssm`` kernel.
+def _official_mamba_usable(device: str | torch.device | None = None) -> tuple[bool, str]:
+    """Return whether this host should run the official CUDA Mamba backend."""
+
+    if device is not None:
+        try:
+            device_type = torch.device(device).type
+        except (RuntimeError, TypeError) as exc:
+            return False, f"invalid target device {device!r}: {exc}"
+        if device_type != "cuda":
+            return False, f"target device is {device_type}, not cuda"
+    if platform.system() == "Darwin":
+        return False, "macOS uses the NaiveSSM fallback"
+    if not torch.cuda.is_available():
+        return False, "CUDA is not available"
+    if not official_available():
+        return False, "mamba_ssm is not importable"
+    return True, "official CUDA Mamba is available"
+
+
+def _resolve_mamba_backend(
+    cfg: RDTConfig,
+    mode: str,
+    *,
+    use_cache: bool = False,
+    device: str | torch.device | None = None,
+    context: str = "scripts.train_rdt",
+) -> RDTConfig:
+    """Apply the ``--mamba`` override using deployment-oriented defaults.
 
     * ``official`` forces ``use_official_mamba=True`` (model construction will
-      raise a clear error if the kernel is unimportable).
-    * ``naive`` forces the pure-PyTorch fallback.
-    * ``auto`` keeps the config's request when the kernel is importable, and
-      otherwise downgrades to the fallback with a loud warning instead of
-      crashing at model construction.
+      raise a clear error if the kernel is unusable).
+    * ``naive`` forces the pure-PyTorch fallback, which is the expected macOS
+      path and the only backend that supports incremental decode cache.
+    * ``auto`` means production by default: use official Mamba on CUDA/Linux,
+      otherwise use NaiveSSM. This deliberately overrides tiny configs on CUDA
+      so smoke tests exercise the same backend as pretraining.
     """
 
+    if use_cache and mode != "naive":
+        raise ValueError(
+            f"{context}: --use-cache requires --mamba naive and a NaiveSSM "
+            "checkpoint; official Mamba kernels are not steppable by the decode "
+            "cache, and official/naive checkpoints are not interchangeable."
+        )
+
     if mode == "official":
+        usable, reason = _official_mamba_usable(device=device)
+        if not usable:
+            raise RuntimeError(
+                f"{context}: --mamba official requested but official Mamba is "
+                f"not usable on this host ({reason}). Use --mamba naive on "
+                "macOS/CPU, or install a CUDA-matched mamba-ssm wheel."
+            )
         return replace(cfg, use_official_mamba=True)
     if mode == "naive":
         return replace(cfg, use_official_mamba=False)
 
-    if cfg.use_official_mamba and not official_available():
+    usable, reason = _official_mamba_usable(device=device)
+    if usable:
+        return replace(cfg, use_official_mamba=True)
+
+    if cfg.use_official_mamba:
         sys.stderr.write(
-            "WARNING: --mamba=auto requested the official mamba_ssm kernel but "
-            "it is not importable (no CUDA build?); falling back to NaiveSSM. "
-            "This is correct but much slower; install mamba-ssm or pass "
-            "--mamba=official to fail fast on a CUDA host.\n"
+            "WARNING: --mamba=auto falling back to NaiveSSM because "
+            f"{reason}. This is expected on macOS, but CUDA training should use "
+            "--mamba=official to fail fast if the official backend is missing.\n"
         )
-        return replace(cfg, use_official_mamba=False)
-    return cfg
+    return replace(cfg, use_official_mamba=False)
 
 
 def _build_model_cfg(args: argparse.Namespace) -> RDTConfig:
@@ -353,7 +395,11 @@ def main(argv: list[str] | None = None) -> int:
     rc = _validate_args(args)
     if rc != 0:
         return rc
-    model_cfg_preview = _build_model_cfg(args)
+    try:
+        model_cfg_preview = _build_model_cfg(args)
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     train_cfg_preview = _build_train_cfg(args, model_cfg_preview)
     omvt_cfg = build_omvt_cfg(args)
     rank, world_size, local_rank = init_distributed(backend=train_cfg_preview.dist_backend)
