@@ -54,6 +54,7 @@ except ImportError:
 
 VOCAB_SIZE = 65536
 IGNORE_INDEX = -100
+MIN_OFFICIAL_MAMBA3_D_STATE = 16
 
 PAD_ID = SPECIAL_TOKENS["<pad>"]
 UNK_ID = SPECIAL_TOKENS["<unk>"]
@@ -310,6 +311,12 @@ class RDTConfig:
 
         if self.d_model % self.mamba_headdim != 0:
             raise ValueError("d_model must be divisible by mamba_headdim")
+
+        if self.use_official_mamba and self.mamba_d_state < MIN_OFFICIAL_MAMBA3_D_STATE:
+            raise ValueError(
+                "official Mamba3 requires mamba_d_state >= "
+                f"{MIN_OFFICIAL_MAMBA3_D_STATE}"
+            )
 
         if self.ffn_hidden % self.ffn_multiple != 0:
             raise ValueError("ffn_hidden must be divisible by ffn_multiple")

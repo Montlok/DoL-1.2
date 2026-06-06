@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from Model.config import RDTConfig
+from Model.config import MIN_OFFICIAL_MAMBA3_D_STATE
 import Model.layers.mamba3_layer as mamba3_layer
 from Model.layers.mla import MLA
 from Model.layers.mamba3_layer import Mamba3Layer
@@ -188,6 +189,22 @@ class ModelSmokeTest(unittest.TestCase):
         self.assertEqual(layer.backend, "fallback")
         self.assertEqual(layer.mamba.d_state, 24)
 
+    def test_official_mamba_rejects_too_small_state_size(self):
+        with self.assertRaisesRegex(ValueError, "official Mamba3 requires"):
+            RDTConfig(
+                d_model=32,
+                n_heads=4,
+                head_dim=8,
+                kv_lora_rank=8,
+                rope_head_dim=4,
+                nope_head_dim=4,
+                ffn_hidden=64,
+                ffn_multiple=32,
+                mamba_d_state=MIN_OFFICIAL_MAMBA3_D_STATE - 1,
+                mamba_headdim=16,
+                use_official_mamba=True,
+            )
+
     def test_official_mamba_rejects_masked_state_updates(self):
         class FakeOfficialMamba3(nn.Module):
             def __init__(self, **kwargs):
@@ -200,6 +217,7 @@ class ModelSmokeTest(unittest.TestCase):
         mamba3_layer.OfficialMamba3 = FakeOfficialMamba3
         try:
             cfg = test_config()
+            cfg.mamba_d_state = MIN_OFFICIAL_MAMBA3_D_STATE
             cfg.use_official_mamba = True
             layer = Mamba3Layer(cfg)
 
