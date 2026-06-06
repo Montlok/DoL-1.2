@@ -51,6 +51,19 @@ class TrainRdtCliGuardsTest(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("--resume", stderr.getvalue())
 
+    def test_tokenizer_bundle_path_must_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = train_rdt.main([
+                    "--config", "tiny",
+                    "--output", tmp,
+                    "--smoke",
+                    "--tokenizer-bundle", "/definitely/not/a/bundle",
+                ])
+            self.assertEqual(rc, 2)
+            self.assertIn("--tokenizer-bundle", stderr.getvalue())
+
     def test_empty_shard_glob_fails_fast(self) -> None:
         # An empty glob (typo'd shard pattern) must abort with exit 2
         # *before* the model is allocated.

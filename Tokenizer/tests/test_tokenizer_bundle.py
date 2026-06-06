@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import json
 import os
 import tempfile
 import unittest
@@ -31,6 +32,10 @@ class TokenizerBundleTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(out_dir, "config.json")))
             self.assertTrue(os.path.exists(os.path.join(out_dir, "morphbpe.json")))
             self.assertTrue(os.path.exists(os.path.join(out_dir, "vocab.json")))
+            self.assertTrue(os.path.exists(os.path.join(out_dir, "manifest.json")))
+            with open(os.path.join(out_dir, "manifest.json"), "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            self.assertIn("vocab.json", manifest["files"])
 
             loaded = TokenizerBundle.from_dir(out_dir)
             self.assertEqual(loaded.validate(), [])
@@ -54,6 +59,13 @@ class TokenizerBundleTest(unittest.TestCase):
                 "<image_end>",
             ])
             self.assertEqual(len(mm.attention_mask), len(mm.input_ids))
+
+            with open(os.path.join(out_dir, "vocab.json"), "a", encoding="utf-8") as f:
+                f.write("\n")
+            issues = loaded.validate()
+            self.assertTrue(
+                any("manifest hash mismatch for vocab.json" in issue for issue in issues)
+            )
 
 
 if __name__ == "__main__":

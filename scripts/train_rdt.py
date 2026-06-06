@@ -12,10 +12,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
+import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import torch
@@ -47,6 +50,7 @@ from Model.training import (
     add_multimodal_args,
     build_optimizer,
     build_scheduler,
+    evaluate,
     init_distributed,
     is_main_process,
     resume_state,
@@ -69,6 +73,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--config", choices=list(CONFIG_CHOICES), default="tiny")
     p.add_argument("--data", default="")
     p.add_argument("--eval-data", default="")
+    p.add_argument(
+        "--tokenizer-bundle",
+        default="",
+        help="optional tokenizer bundle dir; recorded in checkpoint metadata",
+    )
     p.add_argument("--output", default="outputs/rdt")
     p.add_argument("--resume", default="")
     p.add_argument("--dist", choices=["single", "ddp", "fsdp"], default="single")
@@ -199,6 +208,13 @@ def _validate_args(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.tokenizer_bundle and not Path(args.tokenizer_bundle).is_dir():
+        print(
+            "scripts/train_rdt: --tokenizer-bundle must be an existing directory: "
+            f"{args.tokenizer_bundle}",
+            file=sys.stderr,
+        )
+        return 2
     # Resolve the data spec **here** rather than waiting for build_dataloader
     # so an empty glob (typo'd shard pattern) fails *before* we allocate a
     # multi-billion-parameter model and initialize the process group.
@@ -212,7 +228,81 @@ def _validate_args(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+    if not args.smoke and args.eval_data:
+        from Model.training.data import _resolve_shards
+
+        shards = _resolve_shards(args.eval_data)
+        if not shards:
+            print(
+                f"scripts/train_rdt: --eval-data resolved zero shards: {args.eval_data!r}",
+                file=sys.stderr,
+            )
+            return 2
     return 0
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _tokenizer_bundle_metadata(path: str) -> dict:
+    if not path:
+        return {}
+    root = Path(path)
+    files: dict[str, str] = {}
+    for name in ("config.json", "morphbpe.json", "vocab.json", "manifest.json"):
+        candidate = root / name
+        if candidate.exists():
+            files[name] = _file_sha256(candidate)
+    manifest = {}
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    return {
+        "path": str(root),
+        "files": files,
+        "manifest": manifest,
+    }
+
+
+def _git_metadata() -> dict:
+    def _run(*args: str) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", *args],
+                cwd=_REPO_ROOT,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return ""
+
+    return {
+        "commit": _run("rev-parse", "HEAD"),
+        "branch": _run("branch", "--show-current"),
+        "dirty": bool(_run("status", "--short")),
+    }
+
+
+def _run_metadata(
+    args: argparse.Namespace,
+    model_cfg: RDTConfig,
+    train_cfg: TrainingConfig,
+    omvt_cfg,
+) -> dict:
+    return {
+        "config_name": args.config,
+        "rdt_config": asdict(model_cfg),
+        "training_config": asdict(train_cfg),
+        "omvt_config": asdict(omvt_cfg) if omvt_cfg is not None else None,
+        "tokenizer_bundle": _tokenizer_bundle_metadata(args.tokenizer_bundle),
+        "git": _git_metadata(),
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -239,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     model_cfg = model_cfg_preview
     train_cfg = train_cfg_preview
     model_cfg = _apply_train_overrides(model_cfg, train_cfg)
+    run_metadata = _run_metadata(args, model_cfg, train_cfg, omvt_cfg)
 
     if is_main_process():
         Path(train_cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -269,6 +360,8 @@ def main(argv: list[str] | None = None) -> int:
             train_cfg.resume, model, optimizer, scheduler, state=state
         )
 
+    image_processor = build_image_processor(args)
+
     if args.smoke:
         batch_iter = _smoke_batches(model_cfg, train_cfg)
     else:
@@ -278,10 +371,23 @@ def main(argv: list[str] | None = None) -> int:
             world_size=world_size,
             rank=rank,
             pad_id=PAD_ID,
-            image_processor=build_image_processor(args),
+            image_processor=image_processor,
             omvt_cfg=omvt_cfg,
         )
         batch_iter = iter(dataloader)
+
+    eval_dataloader = None
+    if not args.smoke and train_cfg.eval_data:
+        eval_dataloader = build_dataloader(
+            train_cfg.eval_data,
+            train_cfg,
+            world_size=world_size,
+            rank=rank,
+            pad_id=PAD_ID,
+            infinite=False,
+            image_processor=image_processor,
+            omvt_cfg=omvt_cfg,
+        )
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=train_cfg.tensorboard)
     t0 = time.time()
@@ -307,6 +413,20 @@ def main(argv: list[str] | None = None) -> int:
                 tokens_window = 0
 
             if (
+                eval_dataloader is not None
+                and train_cfg.eval_every
+                and state.step % train_cfg.eval_every == 0
+            ):
+                eval_metrics = evaluate(
+                    model,
+                    iter(eval_dataloader),
+                    train_cfg,
+                    device=device,
+                    max_batches=train_cfg.eval_max_batches,
+                )
+                logger.log(state.step, eval_metrics)
+
+            if (
                 train_cfg.save_every
                 and state.step % train_cfg.save_every == 0
                 and not args.smoke
@@ -317,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
                     model,
                     optimizer,
                     scheduler,
-                    metadata={"config": args.config},
+                    metadata={**run_metadata, "checkpoint": "periodic"},
                     keep_last_n=train_cfg.keep_last_n,
                     scaler=state.extra.get("grad_scaler"),
                 )
@@ -335,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
                 model,
                 optimizer,
                 scheduler,
-                metadata={"config": args.config, "final": True},
+                metadata={**run_metadata, "checkpoint": "final"},
                 keep_last_n=train_cfg.keep_last_n,
                 scaler=state.extra.get("grad_scaler"),
             )

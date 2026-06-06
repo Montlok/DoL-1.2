@@ -15,7 +15,7 @@ Model/
   blocks.py            # StandardBlock, RecurrentBlock, AttnSubLayer, MambaSubLayer
   layers/
     mamba3_layer.py    # Official mamba_ssm.Mamba3 with NaiveSSM fallback
-    attention_mla.py   # MLA + MorphologicalRoPE
+    mla.py             # MLA + MorphologicalRoPE
     ...
   vision.py            # MLPVisionEncoder + dispatcher VisionInjector
   omvt/
@@ -27,7 +27,7 @@ Model/
     injector.py        # OMVTInjector: tower + projector + <image_patch> replacement
     heads.py / losses.py  # OCR / masked-patch / orientation / layout-order SSL
   training/
-  data.py            # JSONL + StreamingJsonlDataset + pixel-aware collator + dataloader
+    data.py            # JSONL + StreamingJsonlDataset + pixel-aware collator + dataloader
     optim.py           # AdamW (no-decay groups) + warmup/cosine
     dist.py            # init_distributed + wrap_ddp + wrap_fsdp
     checkpoint.py      # FSDP-aware save / resume
@@ -43,17 +43,16 @@ from Model.config import tiny_config, small_config, base_config, pretrain_config
 cfg = pretrain_config()  # ~1.1B params: d_model=2048, 16 heads, 8 recurrent steps
 ```
 
-| Config     | d_model | heads | layers (prelude / coda) | recurrent steps | seq_len |
-|------------|---------|-------|-------------------------|-----------------|---------|
-| tiny       | 192     | 3     | 1 / 1                   | 4               | 2048    |
-| small      | 768     | 12    | 2 / 2                   | 8               | 4096    |
-| base       | 1536    | 16    | 3 / 3                   | 16              | 8192    |
-| pretrain   | 2048    | 16    | 3 / 3                   | 8               | 4096    |
+| Config     | d_model | heads | head_dim | layers (prelude / coda) | recurrent steps | seq_len |
+|------------|---------|-------|----------|-------------------------|-----------------|---------|
+| tiny       | 512     | 8     | 64       | 2 / 2                   | 4               | 2048    |
+| small      | 1024    | 16    | 64       | 3 / 3                   | 8               | 4096    |
+| base       | 2048    | 32    | 64       | 4 / 4                   | 16              | 8192    |
+| pretrain   | 2048    | 16    | 128      | 3 / 3                   | 8               | 4096    |
 
 Activation-memory controls (in `RDTConfig`):
 
-- `use_activation_checkpointing`, `grad_ckpt_recurrent`, `grad_ckpt_blocks`,
-  `grad_ckpt_prelude_coda`.
+- `grad_ckpt_recurrent`, `grad_ckpt_blocks`, `grad_ckpt_prelude_coda`.
 - `bptt_window > 0` truncates BPTT (older recurrent steps are detached).
 - `use_act` switches to PonderNet-style adaptive halting with
   `act_max_steps` upper bound; the loop runs the full bound without
