@@ -12,11 +12,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import platform
+import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import torch
@@ -81,6 +84,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--config", choices=list(CONFIG_CHOICES), default="tiny")
     p.add_argument("--data", default="")
     p.add_argument("--eval-data", default="")
+    p.add_argument(
+        "--tokenizer-bundle",
+        default="",
+        help="optional tokenizer bundle dir; recorded in checkpoint metadata",
+    )
     p.add_argument("--output", default="outputs/rdt")
     p.add_argument("--resume", default="")
     p.add_argument("--dist", choices=["single", "ddp", "fsdp"], default="single")
@@ -343,6 +351,13 @@ def _validate_args(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.tokenizer_bundle and not Path(args.tokenizer_bundle).is_dir():
+        print(
+            "scripts/train_rdt: --tokenizer-bundle must be an existing directory: "
+            f"{args.tokenizer_bundle}",
+            file=sys.stderr,
+        )
+        return 2
     # Resolve the data spec **here** rather than waiting for build_dataloader
     # so an empty glob (typo'd shard pattern) fails *before* we allocate a
     # multi-billion-parameter model and initialize the process group.
@@ -395,6 +410,76 @@ def _evaluate_distributed(
     }
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _tokenizer_bundle_metadata(path: str) -> dict:
+    if not path:
+        return {}
+    root = Path(path)
+    files: dict[str, str] = {}
+    for name in (
+        "config.json",
+        "morphbpe.json",
+        "general.json",
+        "vocab.json",
+        "manifest.json",
+    ):
+        candidate = root / name
+        if candidate.exists():
+            files[name] = _file_sha256(candidate)
+    manifest = {}
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    return {
+        "path": str(root),
+        "files": files,
+        "manifest": manifest,
+    }
+
+
+def _git_metadata() -> dict:
+    def _run(*args: str) -> str:
+        try:
+            return subprocess.check_output(
+                ["git", *args],
+                cwd=_REPO_ROOT,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            return ""
+
+    return {
+        "commit": _run("rev-parse", "HEAD"),
+        "branch": _run("branch", "--show-current"),
+        "dirty": bool(_run("status", "--short")),
+    }
+
+
+def _run_metadata(
+    args: argparse.Namespace,
+    model_cfg: RDTConfig,
+    train_cfg: TrainingConfig,
+    omvt_cfg,
+) -> dict:
+    return {
+        "config_name": args.config,
+        "rdt_config": asdict(model_cfg),
+        "training_config": asdict(train_cfg),
+        "omvt_config": asdict(omvt_cfg) if omvt_cfg is not None else None,
+        "tokenizer_bundle": _tokenizer_bundle_metadata(args.tokenizer_bundle),
+        "git": _git_metadata(),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     rc = _validate_args(args)
@@ -423,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
     model_cfg = model_cfg_preview
     train_cfg = train_cfg_preview
     model_cfg = _apply_train_overrides(model_cfg, train_cfg)
+    run_metadata = _run_metadata(args, model_cfg, train_cfg, omvt_cfg)
 
     if is_main_process():
         Path(train_cfg.output_dir).mkdir(parents=True, exist_ok=True)
@@ -533,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
                     model,
                     optimizer,
                     scheduler,
-                    metadata={"config": args.config},
+                    metadata={**run_metadata, "checkpoint": "periodic"},
                     keep_last_n=train_cfg.keep_last_n,
                     scaler=state.extra.get("grad_scaler"),
                 )
@@ -552,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
                     model,
                     optimizer,
                     scheduler,
-                    metadata={"config": args.config, "final": True},
+                    metadata={**run_metadata, "checkpoint": "final"},
                     keep_last_n=train_cfg.keep_last_n,
                     scaler=state.extra.get("grad_scaler"),
                 )

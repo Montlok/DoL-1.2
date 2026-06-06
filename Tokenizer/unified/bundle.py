@@ -7,7 +7,9 @@ import json
 import os
 import shutil
 import warnings
+import hashlib
 from dataclasses import asdict, dataclass, fields
+from typing import Any
 
 from Tokenizer.generic_bpe import GeneralBPEModel
 from Tokenizer.morphbpe import MorphBPETokenizer
@@ -23,6 +25,7 @@ CONFIG_NAME = "config.json"
 MORPHBPE_NAME = "morphbpe.json"
 GENERAL_NAME = "general.json"
 VOCAB_NAME = "vocab.json"
+MANIFEST_NAME = "manifest.json"
 
 
 @dataclass
@@ -75,10 +78,12 @@ class TokenizerBundle:
         tokenizer: DualTrackTokenizer,
         processor: MultimodalProcessor,
         config: TokenizerBundleConfig,
+        bundle_dir: str | None = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        self.bundle_dir = bundle_dir
 
     @classmethod
     def from_files(
@@ -111,12 +116,15 @@ class TokenizerBundle:
         general_path = (
             os.path.join(path, config.general_file) if config.general_file else None
         )
-        return cls._build(
+        bundle = cls._build(
             config,
             morphbpe_path=morphbpe_path,
             vocab=vocab,
             general_path=general_path,
         )
+        if os.path.exists(os.path.join(path, MANIFEST_NAME)):
+            bundle.bundle_dir = path
+        return bundle
 
     @classmethod
     def _build(
@@ -181,6 +189,8 @@ class TokenizerBundle:
             json.dump(asdict(config), f, ensure_ascii=False, indent=2)
         with open(os.path.join(path, VOCAB_NAME), "w", encoding="utf-8") as f:
             json.dump(self.tokenizer.vocab, f, ensure_ascii=False, indent=2)
+        _write_manifest(path, config)
+        self.bundle_dir = path
 
     def encode(
         self, text: str, add_bos: bool = False, add_eos: bool = False
@@ -248,4 +258,63 @@ class TokenizerBundle:
                 issues.append("multimodal smoke produced no image span")
         except Exception as exc:  # pragma: no cover - reported as validation issue.
             issues.append(f"multimodal smoke failed: {exc}")
+        if self.bundle_dir:
+            issues.extend(validate_manifest(self.bundle_dir))
         return issues
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_manifest(path: str, config: TokenizerBundleConfig) -> None:
+    files = {}
+    for name in (CONFIG_NAME, MORPHBPE_NAME, GENERAL_NAME, VOCAB_NAME):
+        file_path = os.path.join(path, name)
+        if os.path.exists(file_path):
+            files[name] = _sha256_file(file_path)
+    manifest = {
+        "version": BUNDLE_VERSION,
+        "files": files,
+        "sources": {
+            "morphbpe_file": config.morphbpe_file,
+            "general_file": config.general_file,
+        },
+        "multimodal": {
+            "patch_size": config.patch_size,
+            "merge_size": config.merge_size,
+            "temporal_patch_size": config.temporal_patch_size,
+        },
+    }
+    with open(os.path.join(path, MANIFEST_NAME), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def read_manifest(path: str) -> dict[str, Any]:
+    manifest_path = os.path.join(path, MANIFEST_NAME)
+    if not os.path.exists(manifest_path):
+        return {}
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def validate_manifest(path: str) -> list[str]:
+    issues: list[str] = []
+    manifest = read_manifest(path)
+    if not manifest:
+        issues.append(f"{MANIFEST_NAME} is missing")
+        return issues
+    files = manifest.get("files") or {}
+    for name, expected in files.items():
+        file_path = os.path.join(path, name)
+        if not os.path.exists(file_path):
+            issues.append(f"manifest file is missing: {name}")
+            continue
+        actual = _sha256_file(file_path)
+        if actual != expected:
+            issues.append(f"manifest hash mismatch for {name}")
+    return issues
