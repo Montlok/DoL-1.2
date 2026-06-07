@@ -271,6 +271,7 @@ def main(argv: list[str] | None = None) -> int:
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=False)
     t0 = time.time()
     tokens_window = 0
+    completed = False
     try:
         while state.step < train_cfg.max_steps:
             metrics = train_one_step(
@@ -309,10 +310,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if args.smoke and state.step >= 4:
                 break
+        completed = True
     finally:
         try:
             logger.close()
-            if not args.smoke:
+            if completed and not args.smoke:
                 save_checkpoint(
                     train_cfg.output_dir,
                     state.step,

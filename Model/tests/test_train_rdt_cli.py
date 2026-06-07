@@ -256,6 +256,44 @@ class TrainRdtCliGuardsTest(unittest.TestCase):
             self.assertEqual(rc, 2)
             self.assertIn("--eval-data", stderr.getvalue())
 
+    def test_low_supervised_rate_fails_fast(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+
+            data = os.path.join(tmp, "train.jsonl")
+            with open(data, "w", encoding="utf-8") as fh:
+                fh.write(
+                    '{"input_ids":[2,3],"attention_mask":[1,1],'
+                    '"labels":[-100,-100]}\n'
+                )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = train_rdt.main([
+                    "--config", "tiny",
+                    "--output", tmp,
+                    "--data", data,
+                ])
+            self.assertEqual(rc, 2)
+            self.assertIn("supervised_rate", stderr.getvalue())
+
+    def test_min_supervised_rate_zero_disables_data_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+
+            data = os.path.join(tmp, "train.jsonl")
+            with open(data, "w", encoding="utf-8") as fh:
+                fh.write(
+                    '{"input_ids":[2,3],"attention_mask":[1,1],'
+                    '"labels":[-100,-100]}\n'
+                )
+            args = train_rdt.parse_args([
+                "--config", "tiny",
+                "--output", tmp,
+                "--data", data,
+                "--min-supervised-rate", "0",
+            ])
+            self.assertEqual(train_rdt._validate_args(args), 0)
+
     def test_smoke_runs_without_data(self) -> None:
         # --smoke explicitly opts into the synthetic batch generator.
         with tempfile.TemporaryDirectory() as tmp:

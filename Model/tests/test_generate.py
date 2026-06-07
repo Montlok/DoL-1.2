@@ -222,6 +222,7 @@ class GenerateTest(unittest.TestCase):
             cfg.core_type = "two_stage"
             cfg.stage1_mamba_layers = 1
             cfg.stage2_attn_layers = 1
+            cfg.mamba_d_state = 16
             cfg.use_official_mamba = True
             model = RDTForCausalLM(cfg)
             prompt = torch.tensor([[cfg.bos_id, 300, 301]])

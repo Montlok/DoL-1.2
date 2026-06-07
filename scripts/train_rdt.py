@@ -31,6 +31,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from Model.config import (  # noqa: E402
+    IGNORE_INDEX,
     PAD_ID,
     RDTConfig,
     TrainingConfig,
@@ -129,6 +130,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--eval-max-batches", type=int, default=32)
+    p.add_argument(
+        "--min-supervised-rate",
+        type=float,
+        default=0.01,
+        help=(
+            "minimum supervised label ratio required in prebuilt JSONL shards; "
+            "set 0 only to explicitly disable this safety gate"
+        ),
+    )
+    p.add_argument(
+        "--data-gate-rows",
+        type=int,
+        default=10_000,
+        help="number of JSONL rows sampled for pretraining data gate; 0 scans all rows",
+    )
     p.add_argument("--bptt-window", type=int, default=None)
     p.add_argument("--recurrent-steps-start", type=int, default=None)
     p.add_argument("--recurrent-steps-ramp", type=int, default=0)
@@ -328,6 +344,53 @@ def _smoke_batches(model_cfg: RDTConfig, train_cfg: TrainingConfig):
         yield collator([row] * train_cfg.micro_batch_size)
 
 
+def _sample_supervision_metrics(shards: list[Path], max_rows: int) -> dict[str, float]:
+    rows_seen = 0
+    active_tokens = 0
+    supervised_tokens = 0
+    for shard in shards:
+        with shard.open("r", encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh, start=1):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid JSON in {shard}:{line_no}: {exc}") from exc
+                labels = row.get("labels")
+                if not isinstance(labels, list):
+                    raise ValueError(f"missing labels list in {shard}:{line_no}")
+                mask = row.get("attention_mask")
+                if mask is None:
+                    mask = [1] * len(labels)
+                if not isinstance(mask, list) or len(mask) != len(labels):
+                    raise ValueError(
+                        f"attention_mask must align with labels in {shard}:{line_no}"
+                    )
+                for label, active in zip(labels, mask):
+                    if int(active):
+                        active_tokens += 1
+                        if int(label) != IGNORE_INDEX:
+                            supervised_tokens += 1
+                rows_seen += 1
+                if max_rows > 0 and rows_seen >= max_rows:
+                    return {
+                        "rows": float(rows_seen),
+                        "active_tokens": float(active_tokens),
+                        "supervised_tokens": float(supervised_tokens),
+                        "supervised_rate": (
+                            supervised_tokens / active_tokens if active_tokens else 0.0
+                        ),
+                    }
+    return {
+        "rows": float(rows_seen),
+        "active_tokens": float(active_tokens),
+        "supervised_tokens": float(supervised_tokens),
+        "supervised_rate": supervised_tokens / active_tokens if active_tokens else 0.0,
+    }
+
+
 def _validate_args(args: argparse.Namespace) -> int:
     """Argument-level validation.
 
@@ -358,6 +421,18 @@ def _validate_args(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if not (0.0 <= args.min_supervised_rate <= 1.0):
+        print(
+            "scripts/train_rdt: --min-supervised-rate must be in [0, 1]",
+            file=sys.stderr,
+        )
+        return 2
+    if args.data_gate_rows < 0:
+        print(
+            "scripts/train_rdt: --data-gate-rows must be non-negative",
+            file=sys.stderr,
+        )
+        return 2
     # Resolve the data spec **here** rather than waiting for build_dataloader
     # so an empty glob (typo'd shard pattern) fails *before* we allocate a
     # multi-billion-parameter model and initialize the process group.
@@ -371,6 +446,35 @@ def _validate_args(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
+        if args.min_supervised_rate > 0:
+            try:
+                metrics = _sample_supervision_metrics(shards, args.data_gate_rows)
+            except ValueError as exc:
+                print(f"scripts/train_rdt: data gate failed: {exc}", file=sys.stderr)
+                return 2
+            if metrics["rows"] <= 0:
+                print(
+                    f"scripts/train_rdt: data gate found no JSONL rows: {args.data!r}",
+                    file=sys.stderr,
+                )
+                return 2
+            if metrics["active_tokens"] <= 0:
+                print(
+                    "scripts/train_rdt: data gate found zero active tokens in "
+                    f"{int(metrics['rows'])} sampled rows",
+                    file=sys.stderr,
+                )
+                return 2
+            if metrics["supervised_rate"] < args.min_supervised_rate:
+                print(
+                    "scripts/train_rdt: supervised_rate "
+                    f"{metrics['supervised_rate']:.6f} is below "
+                    f"{args.min_supervised_rate:.6f} over "
+                    f"{int(metrics['rows'])} sampled rows; check labels or pass "
+                    "--min-supervised-rate 0 only for an intentional unsupervised run.",
+                    file=sys.stderr,
+                )
+                return 2
         if args.eval_data:
             eval_shards = _resolve_shards(args.eval_data)
             if not eval_shards:
@@ -570,6 +674,7 @@ def main(argv: list[str] | None = None) -> int:
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=train_cfg.tensorboard)
     t0 = time.time()
     tokens_window = 0
+    completed = False
     try:
         while state.step < train_cfg.max_steps:
             metrics = train_one_step(
@@ -623,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
                     keep_last_n=train_cfg.keep_last_n,
                     scaler=state.extra.get("grad_scaler"),
                 )
+        completed = True
     finally:
         try:
             logger.close()
@@ -631,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
             # so we must enter it on every rank; the helper internally limits
             # the actual file write to rank 0. Guarding the call with
             # `is_main_process()` would deadlock rank 0 at shutdown.
-            if not args.smoke:
+            if completed and not args.smoke:
                 save_checkpoint(
                     train_cfg.output_dir,
                     state.step,

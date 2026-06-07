@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -79,6 +80,54 @@ def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
         else:
             out[k] = v
     return out
+
+
+def _local_grad_norm(parameters) -> torch.Tensor:
+    """Return a local L2 grad norm without mutating gradients."""
+
+    total: torch.Tensor | None = None
+    for param in parameters:
+        grad = param.grad
+        if grad is None:
+            continue
+        grad = grad.detach()
+        if grad.is_sparse:
+            grad = grad.coalesce().values()
+        grad_sq = grad.float().pow(2).sum()
+        total = grad_sq if total is None else total + grad_sq
+    if total is None:
+        return torch.tensor(0.0)
+    return total.sqrt()
+
+
+def clip_or_check_grad_norm(
+    model: nn.Module,
+    max_norm: float | None,
+    *,
+    step: int,
+    allow_nonfinite: bool = False,
+) -> float:
+    """Clip gradients when requested and fail fast on non-finite norms.
+
+    ``allow_nonfinite=True`` is intended for fp16 ``GradScaler`` paths, where
+    scaler.step() already skips overflow updates. bf16/fp32 paths do not have
+    that protection, so non-finite gradients must never reach optimizer.step().
+    """
+
+    if max_norm is not None and max_norm > 0:
+        if hasattr(model, "clip_grad_norm_"):
+            grad_norm = model.clip_grad_norm_(max_norm)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+    else:
+        grad_norm = _local_grad_norm(model.parameters())
+
+    grad_norm_val = float(grad_norm)
+    if not allow_nonfinite and not math.isfinite(grad_norm_val):
+        raise FloatingPointError(
+            f"non-finite gradients at step {step} (grad_norm={grad_norm_val})"
+        )
+    return grad_norm_val
 
 
 def train_one_step(
@@ -158,16 +207,12 @@ def train_one_step(
         # Unscale before clipping so grad_clip is applied to true gradients.
         scaler.unscale_(optimizer)
 
-    if cfg.grad_clip and cfg.grad_clip > 0:
-        if hasattr(model, "clip_grad_norm_"):
-            grad_norm = model.clip_grad_norm_(cfg.grad_clip)
-        else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), cfg.grad_clip
-            )
-        grad_norm_val = float(grad_norm)
-    else:
-        grad_norm_val = float("nan")
+    grad_norm_val = clip_or_check_grad_norm(
+        model,
+        cfg.grad_clip,
+        step=state.step,
+        allow_nonfinite=scaler is not None,
+    )
 
     if scaler is not None:
         # GradScaler.step() may SKIP the underlying optimizer update when the

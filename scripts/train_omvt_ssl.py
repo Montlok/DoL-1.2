@@ -39,7 +39,7 @@ from Model.omvt import (
     ocr_reconstruction_loss,
     orientation_loss,
 )
-from Model.training import RankZeroLogger, build_optimizer
+from Model.training import RankZeroLogger, build_optimizer, clip_or_check_grad_norm
 from Model.config import TrainingConfig
 from Tokenizer.multimodal import PILImageProcessor
 
@@ -376,9 +376,11 @@ def main(argv=None):
             + cfg.w_orientation * loss_ori
             + cfg.w_layout_order * loss_layout
         )
+        if not bool(torch.isfinite(loss.detach())):
+            raise FloatingPointError(f"non-finite OMVT SSL loss at step {step}")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(modules.parameters(), 1.0)
+        clip_or_check_grad_norm(modules, 1.0, step=step)
         optimizer.step()
 
         logger.log(step, {

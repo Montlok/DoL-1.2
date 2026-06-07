@@ -219,6 +219,59 @@ class TrainingLoopSmokeTest(unittest.TestCase):
             )
         self.assertEqual(sched.last_epoch, 0)
 
+    def test_non_finite_grad_raises_before_optimizer_step(self):
+        class FiniteLossNanGrad(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, weight):
+                return weight.new_zeros(())
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                return grad_output.new_full((), float("nan"))
+
+        class BadGradModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(()))
+
+            def forward(self, *args, **kwargs):
+                loss = FiniteLossNanGrad.apply(self.weight)
+                return {"loss": loss, "loss_parts": {}, "rec_info": {}}
+
+        train_cfg = TrainingConfig(
+            train_data="",
+            seq_len=8,
+            micro_batch_size=2,
+            grad_accum_steps=1,
+            num_workers=0,
+            learning_rate=1e-3,
+            max_steps=1,
+            warmup_steps=1,
+            precision="fp32",
+            grad_clip=1.0,
+        )
+        model = BadGradModel()
+        optim = build_optimizer(model, train_cfg)
+        sched = build_scheduler(optim, train_cfg)
+        batch = _make_batch(_tiny_cfg(), length=8)
+
+        def _iter():
+            while True:
+                yield batch
+
+        with self.assertRaisesRegex(FloatingPointError, "non-finite gradients"):
+            train_one_step(
+                model,
+                _iter(),
+                optim,
+                sched,
+                train_cfg,
+                TrainState(),
+                device=torch.device("cpu"),
+            )
+        self.assertTrue(torch.isfinite(model.weight.detach()))
+        self.assertEqual(sched.last_epoch, 0)
+
     def test_train_step_and_resume(self):
         torch.manual_seed(0)
         cfg = _tiny_cfg()

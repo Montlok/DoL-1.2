@@ -32,7 +32,12 @@ from Model.training.dist import (
     wrap_fsdp,
 )
 from Model.training.logging import RankZeroLogger, throughput_str
-from Model.training.loop import TrainState, evaluate, train_one_step
+from Model.training.loop import (
+    TrainState,
+    clip_or_check_grad_norm,
+    evaluate,
+    train_one_step,
+)
 from Model.training.multimodal_cli import (
     add_multimodal_args,
     build_image_processor,
@@ -57,6 +62,7 @@ __all__ = [
     "build_omvt_cfg",
     "build_optimizer",
     "build_scheduler",
+    "clip_or_check_grad_norm",
     "destroy_distributed",
     "evaluate",
     "init_distributed",
