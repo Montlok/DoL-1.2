@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from Model.config import MIN_OFFICIAL_MAMBA3_D_STATE
 from Model.layers.rmsnorm import GroupedRMSNorm
 
 
@@ -19,6 +20,14 @@ except ImportError:
 
 def official_available() -> bool:
     return OfficialMamba3 is not None
+
+
+def _validate_official_cfg(cfg) -> None:
+    if cfg.mamba_d_state < MIN_OFFICIAL_MAMBA3_D_STATE:
+        raise ValueError(
+            "official Mamba3 requires mamba_d_state >= "
+            f"{MIN_OFFICIAL_MAMBA3_D_STATE}; got {cfg.mamba_d_state}"
+        )
 
 
 def _init_dt_bias(
@@ -312,6 +321,7 @@ class Mamba3Layer(nn.Module):
             )
 
         if use_official:
+            _validate_official_cfg(cfg)
             self.mamba = self._build_official(cfg, layer_idx)
             self.backend = "official"
         else:
