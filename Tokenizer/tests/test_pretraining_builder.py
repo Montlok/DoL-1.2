@@ -349,6 +349,43 @@ class PretrainingBuilderTest(unittest.TestCase):
         self.assertTrue(shards[0].endswith("out-00000.jsonl"))
         self.assertTrue(shards[1].endswith("out-00001.jsonl"))
 
+    def test_build_pretraining_data_cli_streams_without_pack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = build_smoke_bundle(tmp)
+            bundle_dir = os.path.join(tmp, "bundle")
+            bundle.save_dir(bundle_dir)
+            inp = os.path.join(tmp, "input.txt")
+            out = os.path.join(tmp, "out.jsonl")
+            with open(inp, "w", encoding="utf-8") as f:
+                f.write("ᠮᠣᠩᠭᠣᠯ 文字 test\n")
+                f.write("hello\n")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "Tokenizer.tools.build_pretraining_data",
+                    "--tokenizer-bundle",
+                    bundle_dir,
+                    "--input",
+                    inp,
+                    "--output",
+                    out,
+                    "--max-length",
+                    "128",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            summary = json.loads(proc.stdout)
+            with open(out, "r", encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+
+        self.assertEqual(summary["num_samples"], 2)
+        self.assertEqual(len(rows), 2)
+        self.assertIn("input_ids", rows[0])
+        self.assertGreater(summary["supervised_tokens"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
