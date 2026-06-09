@@ -35,6 +35,7 @@ from Model.training import (
     build_dataloader,
     build_optimizer,
     build_scheduler,
+    clip_or_check_grad_norm,
     load_checkpoint,
     resume_state,
     save_checkpoint,
@@ -263,6 +264,7 @@ def main(argv=None):
     logger = RankZeroLogger(args.output, enable_tensorboard=False)
 
     t0 = time.time()
+    completed = False
     try:
         if args.data:
             # Real-data path: pull pixel-aware batches from the streaming
@@ -322,10 +324,14 @@ def main(argv=None):
                     pixel_values=dict(batch),
                 )
                 loss = out["loss"]
+                if not bool(torch.isfinite(loss.detach())):
+                    raise FloatingPointError(
+                        f"non-finite VLM align loss at step {state.step}"
+                    )
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+                clip_or_check_grad_norm(model, 1.0, step=step)
                 optimizer.step()
                 scheduler.step()
                 state.step = step
@@ -340,9 +346,10 @@ def main(argv=None):
                         scheduler,
                         metadata={"phase": "vlm_align", "config": args.config},
                     )
+        completed = True
     finally:
         logger.close()
-        if not args.smoke:
+        if completed and not args.smoke:
             save_checkpoint(
                 args.output,
                 state.step,

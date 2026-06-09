@@ -59,6 +59,7 @@ from Model.training import (  # noqa: E402
     apply_parallelism,
     build_optimizer,
     build_scheduler,
+    clip_or_check_grad_norm,
     destroy_distributed,
     init_distributed,
     is_main_process,
@@ -309,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=False)
     t0 = time.time()
+    completed = False
     try:
         while state.step < train_cfg.max_steps:
             optimizer.zero_grad()
@@ -326,11 +328,18 @@ def main(argv: list[str] | None = None) -> int:
                     chosen_attn=batch["chosen_attention_mask"].to(device),
                     rejected_attn=batch["rejected_attention_mask"].to(device),
                 )
+                if not bool(torch.isfinite(loss.detach())):
+                    raise FloatingPointError(
+                        f"non-finite DPO loss at step {state.step}"
+                    )
                 (loss / train_cfg.grad_accum_steps).backward()
                 for k, v in metrics.items():
                     accum[k] = accum.get(k, 0.0) + v / train_cfg.grad_accum_steps
-            if train_cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), train_cfg.grad_clip)
+            accum["grad_norm"] = clip_or_check_grad_norm(
+                policy,
+                train_cfg.grad_clip,
+                step=state.step,
+            )
             optimizer.step()
             scheduler.step()
             state.step += 1
@@ -351,10 +360,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             if args.smoke and state.step >= 4:
                 break
+        completed = True
     finally:
         try:
             logger.close()
-            if not args.smoke:
+            if completed and not args.smoke:
                 save_checkpoint(
                     train_cfg.output_dir, state.step, policy, optimizer, scheduler,
                     metadata={"config": args.config, "phase": "dpo", "final": True},
