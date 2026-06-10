@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from Model.blocks import RecurrentBlock
+from Model.layers.rmsnorm import RMSNorm
 
 
 class RecurrentCore(nn.Module):
@@ -31,6 +32,10 @@ class RecurrentCore(nn.Module):
             if not (0.0 < cfg.act_threshold <= 1.0):
                 raise ValueError("act_threshold must be in (0, 1]")
             self.halt_proj = nn.Linear(cfg.d_model, 1)
+            # Normalize before the halt head: the hidden-state norm grows
+            # across recurrent steps, which would otherwise saturate the
+            # sigmoid and make halting depth-dependent at init.
+            self.halt_norm = RMSNorm(cfg.d_model, eps=cfg.rmsnorm_eps)
 
     def forward(
         self,
@@ -165,7 +170,7 @@ class RecurrentCore(nn.Module):
                 causal=causal,
             )
 
-            p = torch.sigmoid(self.halt_proj(h)).squeeze(-1).float()
+            p = torch.sigmoid(self.halt_proj(self.halt_norm(h))).squeeze(-1).float()
             p = p * running
 
             new_halt = halt_accum + p

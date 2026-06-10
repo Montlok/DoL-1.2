@@ -25,6 +25,7 @@ dist = ["torch>=2.1"]
 vis = ["timm>=1.0"]
 image = ["Pillow>=9"]
 log = ["tensorboard>=2.14"]
+cli = ["rich>=13"]
 dev = ["pytest>=8.0", "ruff>=0.5"]
 
 [tool.setuptools.packages.find]

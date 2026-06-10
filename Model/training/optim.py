@@ -20,6 +20,7 @@ MiniCPM arXiv:2404.06395).
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Iterable
 
 import torch
@@ -438,6 +439,46 @@ def recurrent_steps_for_step(
     cfg: TrainingConfig,
     target_steps: int,
 ) -> int:
+    """Recurrent depth for one optimizer step.
+
+    Applies the optional ramp curriculum (start → target), then — when
+    ``cfg.recurrent_steps_sampling == "poisson"`` — replaces the fixed depth
+    with a log-normal Poisson draw centered on the ramped target (Geiping et
+    al. 2025, "Scaling up Test-Time Compute with Latent Reasoning"):
+
+        tau ~ Normal(log(t - 1) - sigma^2 / 2, sigma)
+        r = 1 + Poisson(exp(tau)),  clamped to [min, max]
+
+    so ``E[r] ≈ t``. Training across depths is what makes the model usable
+    at depths other than the default at inference time; fixed-depth training
+    measurably degrades both shallower and deeper evaluation.
+
+    The draw is seeded from ``(cfg.seed, step)`` only — never the rank — so
+    every rank unrolls the same depth. Under FSDP each recurrent step issues
+    its own all-gathers; rank-divergent depths would deadlock collectives.
+    """
+
+    target = _ramp_target(step, cfg, target_steps)
+
+    if cfg.recurrent_steps_sampling != "poisson":
+        return target
+
+    lo = cfg.recurrent_steps_min
+    hi = cfg.recurrent_steps_max
+    if hi is None:
+        hi = max(2 * target_steps, lo)
+
+    sigma = cfg.recurrent_steps_sigma
+    mu = max(target - 1, 1)
+
+    rng = random.Random((cfg.seed << 32) ^ (step * 0x9E3779B97F4A7C15))
+    tau = rng.gauss(math.log(mu) - 0.5 * sigma * sigma, sigma)
+    r = 1 + _poisson_sample(rng, math.exp(tau))
+
+    return max(lo, min(r, hi))
+
+
+def _ramp_target(step: int, cfg: TrainingConfig, target_steps: int) -> int:
     """Optional recurrent-depth curriculum: ramp from start → target."""
 
     start = cfg.recurrent_steps_start
@@ -445,6 +486,21 @@ def recurrent_steps_for_step(
         return target_steps
     progress = min(1.0, max(0.0, step / cfg.recurrent_steps_ramp))
     return int(round(start + (target_steps - start) * progress))
+
+
+def _poisson_sample(rng: random.Random, lam: float) -> int:
+    """Knuth Poisson sampler; fine for the small lambdas used here."""
+
+    if lam <= 0.0:
+        return 0
+    threshold = math.exp(-lam)
+    k = 0
+    p = 1.0
+    while True:
+        p *= rng.random()
+        if p <= threshold:
+            return k
+        k += 1
 
 
 def _unused_iterable(_: Iterable[nn.Parameter]) -> None:  # pragma: no cover

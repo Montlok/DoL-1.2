@@ -66,6 +66,7 @@ from Model.training import (  # noqa: E402
     throughput_str,
     train_one_step,
 )
+from Model.training.status import StatusReporter
 
 
 CONFIG_CHOICES = {
@@ -146,6 +147,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="number of JSONL rows sampled for pretraining data gate; 0 scans all rows",
     )
     p.add_argument("--bptt-window", type=int, default=None)
+    p.add_argument(
+        "--rec-steps-sampling",
+        choices=["fixed", "poisson"],
+        default="poisson",
+        help=(
+            "poisson = sample the recurrent depth per optimizer step "
+            "(log-normal Poisson around the target) so the model stays "
+            "usable at non-default depths; fixed = always cfg.recurrent_steps"
+        ),
+    )
+    p.add_argument("--rec-steps-min", type=int, default=1)
+    p.add_argument(
+        "--rec-steps-max",
+        type=int,
+        default=None,
+        help="cap for sampled depth (default: 2x target steps)",
+    )
+    p.add_argument("--rec-steps-sigma", type=float, default=0.5)
     p.add_argument("--recurrent-steps-start", type=int, default=None)
     p.add_argument("--recurrent-steps-ramp", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=2)
@@ -307,6 +326,10 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         eval_every=args.eval_every,
         eval_max_batches=args.eval_max_batches,
         bptt_window=args.bptt_window,
+        recurrent_steps_sampling=args.rec_steps_sampling,
+        recurrent_steps_min=args.rec_steps_min,
+        recurrent_steps_max=args.rec_steps_max,
+        recurrent_steps_sigma=args.rec_steps_sigma,
         recurrent_steps_start=args.recurrent_steps_start,
         recurrent_steps_ramp=args.recurrent_steps_ramp,
         seed=args.seed,
@@ -643,6 +666,8 @@ def main(argv: list[str] | None = None) -> int:
             train_cfg.resume, model, optimizer, scheduler, state=state
         )
 
+    image_processor = build_image_processor(args)
+
     if args.smoke:
         batch_iter = _smoke_batches(model_cfg, train_cfg)
         eval_loader = None
@@ -653,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
             world_size=world_size,
             rank=rank,
             pad_id=PAD_ID,
-            image_processor=build_image_processor(args),
+            image_processor=image_processor,
             omvt_cfg=omvt_cfg,
         )
         batch_iter = iter(dataloader)
@@ -672,11 +697,23 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=train_cfg.tensorboard)
+    reporter = None
+    if is_main_process():
+        reporter = StatusReporter(
+            train_cfg.output_dir,
+            run_metadata={
+                "config_name": args.config,
+                "world_size": world_size,
+                "git": run_metadata["git"],
+            },
+            max_steps=train_cfg.max_steps,
+        )
+    stop_requested = False
     t0 = time.time()
     tokens_window = 0
     completed = False
     try:
-        while state.step < train_cfg.max_steps:
+        while state.step < train_cfg.max_steps and not stop_requested:
             metrics = train_one_step(
                 model,
                 batch_iter,
@@ -694,30 +731,43 @@ def main(argv: list[str] | None = None) -> int:
 
             if state.step % train_cfg.log_every == 0 or args.smoke:
                 dt = max(1e-6, time.time() - t0)
-                logger.log(state.step, {**metrics, "throughput": throughput_str(tokens_window, dt)})
+                tp = throughput_str(tokens_window, dt)
+                logger.log(state.step, {**metrics, "throughput": tp})
+                if reporter is not None:
+                    reporter.update(state.step, {**metrics, "throughput": tp})
                 t0 = time.time()
                 tokens_window = 0
 
-            if (
+            # Control plane: rank0 reads commands, all ranks act in lockstep
+            # (save/eval are collectives under FSDP and must run everywhere).
+            commands = reporter.poll_control() if reporter is not None else []
+            if world_size > 1:
+                box = [commands]
+                torch.distributed.broadcast_object_list(box, src=0)
+                commands = box[0]
+
+            want_eval = (
                 eval_loader is not None
                 and train_cfg.eval_every
                 and state.step % train_cfg.eval_every == 0
-            ):
-                logger.log(
-                    state.step,
-                    _evaluate_distributed(
-                        model,
-                        eval_loader,
-                        train_cfg,
-                        device=device,
-                    ),
+            ) or ("eval" in commands and eval_loader is not None)
+            if want_eval:
+                eval_metrics = _evaluate_distributed(
+                    model,
+                    eval_loader,
+                    train_cfg,
+                    device=device,
                 )
+                logger.log(state.step, eval_metrics)
+                if reporter is not None:
+                    reporter.update(state.step, eval_metrics, state="running")
 
-            if (
+            want_save = (
                 train_cfg.save_every
                 and state.step % train_cfg.save_every == 0
                 and not args.smoke
-            ):
+            ) or ("save" in commands and not args.smoke)
+            if want_save:
                 save_checkpoint(
                     train_cfg.output_dir,
                     state.step,
@@ -728,10 +778,18 @@ def main(argv: list[str] | None = None) -> int:
                     keep_last_n=train_cfg.keep_last_n,
                     scaler=state.extra.get("grad_scaler"),
                 )
+
+            if "stop" in commands:
+                stop_requested = True
         completed = True
     finally:
         try:
             logger.close()
+            if reporter is not None:
+                reporter.finish(
+                    state="stopped" if stop_requested else "finished",
+                    step=state.step,
+                )
             # NOTE: `save_checkpoint` is a collective under FSDP (the
             # `state_dict(FullStateDictConfig)` call gathers from every rank),
             # so we must enter it on every rank; the helper internally limits

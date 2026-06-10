@@ -64,6 +64,7 @@ class RDTForCausalLM(nn.Module):
         self.reverse_loss_enabled = True
 
         self.apply(self._init_weights)
+        self._scale_residual_projections()
 
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.embed.weight
@@ -524,6 +525,34 @@ class RDTForCausalLM(nn.Module):
             if module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].zero_()
+
+    # Last linear of every residual write: attention output, SwiGLU down
+    # projection, and the SSM output projection (both NaiveSSM and the
+    # official Mamba3 expose it as ``out_proj``).
+    _RESIDUAL_PROJ_SUFFIXES = ("attn.o_proj", "ffn.w_down", "mamba.out_proj")
+
+    @torch.no_grad()
+    def _scale_residual_projections(self) -> None:
+        """GPT-2-style depth-scaled init, extended to the unrolled loop.
+
+        Every sublayer writes ``x + f(x)`` into the residual stream. With a
+        weight-shared recurrent core the stream sees ``effective_depth``
+        layers (prelude + block_layers x recurrent_steps + coda), so leaving
+        the output projections at ``init_std`` makes the hidden-state norm
+        grow linearly across recurrent steps (and costs bf16 mantissa
+        precision late in the loop). Scaling them by
+        ``1/sqrt(2 * effective_depth)`` keeps the residual variance roughly
+        depth-invariant at init.
+        """
+
+        scale = (2.0 * self.cfg.effective_depth) ** -0.5
+
+        for container in (self.prelude, self.recurrent, self.coda):
+            for name, module in container.named_modules():
+                if isinstance(module, nn.Linear) and name.endswith(
+                    self._RESIDUAL_PROJ_SUFFIXES
+                ):
+                    module.weight.mul_(scale)
 
     def _kl_exit_active(self, recurrent_steps: int | None) -> bool:
         """Whether zero-shot KL early-exit governs this decode step.

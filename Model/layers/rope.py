@@ -102,6 +102,8 @@ class MorphologicalRoPE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if seq_len <= 0:
             raise ValueError("seq_len must be positive")
+        if pos_offset < 0:
+            raise ValueError("pos_offset must be non-negative")
 
         if device is None:
             device = self._device()
@@ -134,15 +136,26 @@ class MorphologicalRoPE(nn.Module):
         return emb.cos(), emb.sin()
 
     def _standard(
-        self, seq_len: int, device, pos_offset: int = 0
+        self,
+        seq_len: int,
+        device,
+        pos_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Token-index RoPE. ``pos_offset`` shifts the absolute positions so
+        cached incremental decoding sees the same angles as a full forward
+        (morphological mode carries absolute positions in ``word_pos`` values
+        and needs no offset)."""
+
         freqs = (
             self.freqs.to(device=device)
             if hasattr(self, "freqs")
             else _build_freqs(self.rope_dim, self.theta, device=device)
         )
         pos = torch.arange(
-            pos_offset, pos_offset + seq_len, dtype=torch.float32, device=device
+            pos_offset,
+            pos_offset + seq_len,
+            dtype=torch.float32,
+            device=device,
         )
         angles = pos.unsqueeze(-1) * freqs.unsqueeze(0)
         emb = self._angles_to_emb(angles)
