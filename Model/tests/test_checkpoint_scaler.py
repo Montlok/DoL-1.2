@@ -74,6 +74,22 @@ class CheckpointScalerStateTest(unittest.TestCase):
             resume_state(Path(tmp) / "latest", model, optimizer, scheduler, state=state)
             self.assertNotIn("grad_scaler_state", state.extra)
 
+    def test_missing_checkpoint_path_does_not_fallback_to_sibling_latest(self) -> None:
+        model, optimizer, scheduler = self._make_artifacts()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_checkpoint(root, 1, model, optimizer, scheduler, keep_last_n=0)
+            with self.assertRaises(FileNotFoundError):
+                load_checkpoint(root / "typo")
+
+    def test_run_directory_loads_latest(self) -> None:
+        model, optimizer, scheduler = self._make_artifacts()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            save_checkpoint(root, 3, model, optimizer, scheduler, keep_last_n=0)
+            payload = load_checkpoint(root)
+            self.assertEqual(payload.step, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

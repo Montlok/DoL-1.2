@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from typing import Callable, Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from Model.blocks import StandardBlock
-from Model.cache import RDTCache
 from Model.config import RDTConfig
 from Model.layers.rmsnorm import RMSNorm
 from Model.recurrent import RecurrentCore
+from Model.segmented import SegmentedCore
+from Model.two_stage import TwoStageCore
 from Model.vision import VisionInjector
 
 
@@ -34,7 +37,12 @@ class RDTForCausalLM(nn.Module):
             StandardBlock(cfg, layer_idx=i) for i in range(cfg.n_prelude)
         )
 
-        self.recurrent = RecurrentCore(cfg)
+        if cfg.core_type == "two_stage":
+            self.recurrent = TwoStageCore(cfg)
+        elif cfg.core_type == "segmented":
+            self.recurrent = SegmentedCore(cfg)
+        else:
+            self.recurrent = RecurrentCore(cfg)
 
         self.coda = nn.ModuleList(
             StandardBlock(cfg, layer_idx=cfg.n_prelude + i) for i in range(cfg.n_coda)
@@ -50,6 +58,11 @@ class RDTForCausalLM(nn.Module):
         else:
             self.reverse_head = None
 
+        # Runtime toggle: alignment phases (SFT/DPO/GRPO) disable the
+        # bidirectional reverse-LM auxiliary loss so it does not pollute the
+        # supervised/preference gradient. Pretraining keeps it enabled.
+        self.reverse_loss_enabled = True
+
         self.apply(self._init_weights)
         self._scale_residual_projections()
 
@@ -57,6 +70,76 @@ class RDTForCausalLM(nn.Module):
             self.lm_head.weight = self.embed.weight
             if self.reverse_head is not None:
                 self.reverse_head.weight = self.embed.weight
+
+    def _forward_decode(
+        self,
+        input_ids: torch.Tensor,
+        word_pos: torch.Tensor,
+        morph_depth: torch.Tensor,
+        cache,
+        pixel_values: torch.Tensor | None = None,
+        steps: int | None = None,
+    ) -> torch.Tensor:
+        """Incremental forward over the new tokens ``input_ids`` (``[B, m]``).
+
+        ``word_pos`` / ``morph_depth`` are the *absolute* per-position values of
+        the new tokens (computed by the caller from the full running sequence).
+        Reuses ``cache`` so the result is bit-exact with a full
+        :meth:`forward` over the whole prefix. Returns logits ``[B, m, vocab]``;
+        callers typically read the last position. Generation is pad-free, so
+        ``attn_mask`` is omitted throughout.
+        """
+
+        if self.cfg.core_type not in {"two_stage", "segmented"}:
+            raise NotImplementedError(
+                "incremental KV/state cache is implemented for core_type="
+                "'two_stage' / 'segmented' only"
+            )
+
+        bsz, seq_len = input_ids.shape
+        pos_offset = cache.seq_len
+
+        h = self.embed(input_ids)
+        if pixel_values is not None:
+            h = self.vision(h, input_ids, pixel_values)
+
+        for i, block in enumerate(self.prelude):
+            h = block(
+                h,
+                word_pos=word_pos,
+                morph_depth=morph_depth,
+                attn_mask=None,
+                causal=True,
+                cache=cache.mla_cache(f"prelude.{i}"),
+                pos_offset=pos_offset,
+            )
+
+        h, _rec_info = self.recurrent(
+            h,
+            word_pos=word_pos,
+            morph_depth=morph_depth,
+            attn_mask=None,
+            causal=True,
+            cache=cache,
+            pos_offset=pos_offset,
+            steps=steps,
+        )
+
+        for i, block in enumerate(self.coda):
+            h = block(
+                h,
+                word_pos=word_pos,
+                morph_depth=morph_depth,
+                attn_mask=None,
+                causal=True,
+                cache=cache.mla_cache(f"coda.{i}"),
+                pos_offset=pos_offset,
+            )
+
+        h = self.final_norm(h)
+        logits = self.lm_head(h)
+        cache.seq_len = pos_offset + seq_len
+        return logits
 
     def forward(
         self,
@@ -70,28 +153,14 @@ class RDTForCausalLM(nn.Module):
         bptt_window: int | None = None,
         return_logits: bool = True,
         loss_chunk_size: int | None = None,
-        cache=None,
     ) -> dict[str, torch.Tensor | dict | None]:
-        past_len = 0 if cache is None else cache.seq_len
-        self._check_inputs(input_ids, attention_mask, labels, past_len=past_len)
+        self._check_inputs(input_ids, attention_mask, labels)
         if loss_chunk_size is None:
             loss_chunk_size = self.cfg.loss_chunk_size
         elif loss_chunk_size <= 0:
             raise ValueError("loss_chunk_size must be positive")
 
         bsz, seq_len = input_ids.shape
-
-        if cache is not None:
-            if attention_mask is not None and not bool(attention_mask.bool().all()):
-                raise ValueError(
-                    "cached decoding requires an all-ones attention_mask"
-                )
-            attention_mask = torch.ones_like(input_ids)
-            if past_len > 0 and (word_pos is None or morph_depth is None):
-                raise ValueError(
-                    "incremental decoding requires explicit word_pos/morph_depth "
-                    "(derive on the full sequence and slice the new positions)"
-                )
 
         if attention_mask is None:
             attention_mask = (input_ids != self.cfg.pad_id).long()
@@ -107,7 +176,7 @@ class RDTForCausalLM(nn.Module):
         if pixel_values is not None:
             h = self.vision(h, input_ids, pixel_values)
 
-        for i, block in enumerate(self.prelude):
+        for block in self.prelude:
             h = self._maybe_ckpt(
                 block,
                 h,
@@ -115,7 +184,6 @@ class RDTForCausalLM(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attention_mask,
                 causal=True,
-                cache_entry=cache.attn_entry(("prelude", i)) if cache is not None else None,
             )
 
         e0 = h
@@ -128,10 +196,9 @@ class RDTForCausalLM(nn.Module):
             causal=True,
             steps=steps,
             bptt_window=bptt_window,
-            cache=cache,
         )
 
-        for i, block in enumerate(self.coda):
+        for block in self.coda:
             h = self._maybe_ckpt(
                 block,
                 h,
@@ -139,11 +206,7 @@ class RDTForCausalLM(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attention_mask,
                 causal=True,
-                cache_entry=cache.attn_entry(("coda", i)) if cache is not None else None,
             )
-
-        if cache is not None:
-            cache.advance(seq_len)
 
         h = self.final_norm(h)
         logits = None
@@ -172,144 +235,6 @@ class RDTForCausalLM(nn.Module):
             "rec_info": rec_info,
         }
 
-    @torch.no_grad()
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_tokens: int,
-        attention_mask: torch.Tensor | None = None,
-        pixel_values: torch.Tensor | None = None,
-        steps: int | None = None,
-        temperature: float = 0.0,
-        top_k: int | None = None,
-        eos_id: int | None = None,
-    ) -> torch.Tensor:
-        """Incremental greedy/sampled decoding with KV + SSM state caching.
-
-        Prompts must be un-padded (all-ones ``attention_mask`` or ``None``);
-        batch with equal-length prompts or run with bsz 1. ``temperature <= 0``
-        is greedy. Finished rows are filled with EOS. ``steps`` fixes the
-        recurrent depth for both prefill and decode; ACT is not supported.
-        """
-
-        if self.cfg.use_act:
-            raise NotImplementedError(
-                "generate() supports fixed recurrent steps only (use_act=False)"
-            )
-        if input_ids.ndim != 2 or input_ids.numel() == 0:
-            raise ValueError("input_ids must be a non-empty [B, L] tensor")
-        if max_new_tokens <= 0:
-            raise ValueError("max_new_tokens must be positive")
-        if attention_mask is not None and not bool(attention_mask.bool().all()):
-            raise ValueError("generate requires un-padded prompts (all-ones mask)")
-        if top_k is not None and top_k <= 0:
-            raise ValueError("top_k must be positive")
-
-        bsz, prompt_len = input_ids.shape
-        if prompt_len + max_new_tokens > self.cfg.max_seq_len:
-            raise ValueError("prompt_len + max_new_tokens exceeds max_seq_len")
-
-        eos = self.cfg.eos_id if eos_id is None else eos_id
-        was_training = self.training
-        self.eval()
-
-        try:
-            cache = RDTCache()
-            ids = input_ids
-            ones = torch.ones_like(ids)
-            word_pos, morph_depth = self._default_morph_info(ids, ones)
-
-            out = self.forward(
-                ids,
-                attention_mask=ones,
-                word_pos=word_pos,
-                morph_depth=morph_depth,
-                pixel_values=pixel_values,
-                steps=steps,
-                cache=cache,
-            )
-
-            finished = torch.zeros(bsz, dtype=torch.bool, device=ids.device)
-
-            # Incremental morph-position state (per row) so each decode step
-            # is O(B) instead of re-deriving (word_pos, morph_depth) over the
-            # whole growing sequence (which would make generation O(L^2)).
-            wb = int(self.cfg.word_boundary_id)
-            mb = int(self.cfg.morpheme_boundary_id)
-            is_wb0 = ids.eq(wb)
-            is_content0 = ~((ids >= 0) & (ids < 256))
-            wb_cum = is_wb0.long().sum(dim=1)
-            any_wb = is_wb0.any(dim=1)
-            any_content = is_content0.any(dim=1)
-            # word_pos = clamp(wb_cum + shift); at the last prompt position
-            # the clamp is inactive, so shift is recoverable by subtraction.
-            shift = word_pos[:, -1] - wb_cum
-            depth_last = morph_depth[:, -1]
-            ones_col = torch.ones((bsz, 1), dtype=ones.dtype, device=ids.device)
-
-            for _ in range(max_new_tokens):
-                logits = out["logits"][:, -1].float()
-                next_id = self._sample_token(logits, temperature, top_k)
-                if eos is not None and eos >= 0:
-                    next_id = torch.where(
-                        finished, torch.full_like(next_id, eos), next_id
-                    )
-                ids = torch.cat([ids, next_id.unsqueeze(1)], dim=1)
-                if eos is not None and eos >= 0:
-                    finished = finished | next_id.eq(eos)
-                    if bool(finished.all()):
-                        break
-
-                n_wb = next_id.eq(wb)
-                n_mb = next_id.eq(mb)
-                n_special = (next_id >= 0) & (next_id < 256)
-                n_other = n_special & ~n_wb & ~n_mb
-                # The first wb/content token fixes the per-row shift: a wb
-                # before any content anchors word 0 (shift -1).
-                undecided = ~any_wb & ~any_content
-                shift = torch.where(undecided & n_wb, shift - 1, shift)
-                any_wb = any_wb | n_wb
-                any_content = any_content | ~n_special
-                wb_cum = wb_cum + n_wb.long()
-                wp_new = (wb_cum + shift).clamp(min=0)
-                depth_last = torch.where(
-                    n_wb | n_other,
-                    torch.zeros_like(depth_last),
-                    depth_last + n_mb.long(),
-                )
-                if self.cfg.max_morph_depth > 0:
-                    depth_last = depth_last.clamp(max=self.cfg.max_morph_depth - 1)
-
-                out = self.forward(
-                    ids[:, -1:],
-                    attention_mask=ones_col,
-                    word_pos=wp_new.unsqueeze(1),
-                    morph_depth=depth_last.unsqueeze(1),
-                    steps=steps,
-                    cache=cache,
-                )
-        finally:
-            if was_training:
-                self.train()
-
-        return ids
-
-    @staticmethod
-    def _sample_token(
-        logits: torch.Tensor,
-        temperature: float,
-        top_k: int | None,
-    ) -> torch.Tensor:
-        if temperature <= 0:
-            return logits.argmax(dim=-1)
-        logits = logits / temperature
-        if top_k is not None:
-            k = min(top_k, logits.shape[-1])
-            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
-            logits = logits.masked_fill(logits < kth, float("-inf"))
-        probs = F.softmax(logits, dim=-1)
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
-
     def _losses(
         self,
         h: torch.Tensor,
@@ -321,7 +246,7 @@ class RDTForCausalLM(nn.Module):
         loss = forward
         parts = {"forward": float(forward.detach())}
 
-        if self.reverse_head is not None:
+        if self.reverse_head is not None and self.reverse_loss_enabled:
             rev_logits = self.reverse_head(h)
             reverse = self._reverse_loss(rev_logits, labels)
             loss = loss + self.cfg.reverse_loss_weight * reverse
@@ -345,7 +270,7 @@ class RDTForCausalLM(nn.Module):
         loss = forward
         parts = {"forward": float(forward.detach())}
 
-        if self.reverse_head is not None:
+        if self.reverse_head is not None and self.reverse_loss_enabled:
             reverse = self._chunked_reverse_loss(
                 h,
                 labels,
@@ -451,13 +376,11 @@ class RDTForCausalLM(nn.Module):
         morph_depth: torch.Tensor | None,
         attn_mask: torch.Tensor | None,
         causal: bool,
-        cache_entry=None,
     ) -> torch.Tensor:
         if (
             getattr(self.cfg, "grad_ckpt_prelude_coda", False)
             and self.training
             and h.requires_grad
-            and cache_entry is None
         ):
             def _fn(x):
                 return block(
@@ -475,7 +398,6 @@ class RDTForCausalLM(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
-            cache=cache_entry,
         )
 
     def _default_morph_info(
@@ -567,7 +489,6 @@ class RDTForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
         labels: torch.Tensor | None,
-        past_len: int = 0,
     ) -> None:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [B, L]")
@@ -588,7 +509,7 @@ class RDTForCausalLM(nn.Module):
         if labels is not None and labels.shape != input_ids.shape:
             raise ValueError("labels must have shape [B, L]")
 
-        if past_len + input_ids.shape[1] > self.cfg.max_seq_len:
+        if input_ids.shape[1] > self.cfg.max_seq_len:
             raise ValueError("sequence length exceeds max_seq_len")
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -633,7 +554,348 @@ class RDTForCausalLM(nn.Module):
                 ):
                     module.weight.mul_(scale)
 
+    def _kl_exit_active(self, recurrent_steps: int | None) -> bool:
+        """Whether zero-shot KL early-exit governs this decode step.
+
+        Gated on ``cfg.kl_exit_threshold > 0`` and only on the cache-free path
+        with no explicit ``recurrent_steps`` override; when disabled the decode
+        is bit-exact with a single fixed-depth forward.
+        """
+
+        return (
+            self.cfg.kl_exit_threshold > 0.0
+            and recurrent_steps is None
+            and self.cfg.core_type in {"two_stage", "segmented"}
+        )
+
     @torch.no_grad()
+    def _adaptive_depth_logits(
+        self,
+        window: torch.Tensor,
+        pixel_values: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Last-position logits with per-token adaptive recurrent depth.
+
+        Runs the refinement at increasing depth ``d = 1 .. recurrent_steps`` and
+        stops as soon as the symmetric-free KL between the depth-``d`` and
+        depth-``d-1`` last-token distributions drops below
+        ``cfg.kl_exit_threshold`` for every row (Huginn arXiv:2502.05171 §6.1,
+        zero-shot convergence of the latent recurrence). Saves test-time compute
+        on "easy" tokens while spending full depth on hard / rare ones. Always
+        returns the deepest distribution actually computed.
+        """
+
+        max_steps = self.cfg.recurrent_steps
+        threshold = self.cfg.kl_exit_threshold
+        prev_logp = None
+        logits = None
+        for d in range(1, max_steps + 1):
+            if pixel_values is not None:
+                out = self.forward(
+                    window, steps=d, return_logits=True, pixel_values=pixel_values
+                )
+            else:
+                out = self.forward(window, steps=d, return_logits=True)
+            logits = out["logits"][:, -1, :].float()
+            logp = F.log_softmax(logits, dim=-1)
+            if prev_logp is not None:
+                # KL(p_d || p_{d-1}) per row; exit when all rows have converged.
+                kl = (logp.exp() * (logp - prev_logp)).sum(dim=-1)
+                if bool((kl < threshold).all()):
+                    break
+            prev_logp = logp
+        return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 64,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        min_p: float | None = None,
+        greedy: bool = False,
+        eos_id: int | None = None,
+        pad_id: int | None = None,
+        repetition_penalty: float = 1.0,
+        use_cache: bool = False,
+        stop_ids: Sequence[int] | None = None,
+        on_token: Callable[[int, torch.Tensor], None] | None = None,
+        recurrent_steps: int | None = None,
+        pixel_values: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Autoregressively continue ``input_ids`` (``[B, L]``) with sampling.
+
+        Sampling controls: ``temperature`` then ``min_p`` (ICLR 2025), ``top_k``
+        and nucleus ``top_p`` truncation, plus CTRL-style ``repetition_penalty``;
+        ``greedy=True`` takes the argmax.
+
+        With ``use_cache=True`` (``core_type='two_stage'`` only) decoding runs an
+        incremental KV/state cache that is numerically identical to the cache-
+        free path but processes one token per step instead of re-running the
+        whole prefix:
+
+        * **Stage 1 (Mamba)** keeps a constant-size ``(conv_state, ssm_state)``
+          per layer and steps the selective SSM once per new token -- O(1) time
+          and memory per step (Gu & Dao, "Mamba", 2023/2024).
+        * **Stage 2 (MLA)** appends the new token's ``K``/``V`` to a per-layer
+          cache and attends over the frozen prefix; because each refinement pass
+          is causal and earlier positions are frozen once computed, one cache is
+          kept per ``(refinement step, layer)`` pair.
+
+        The cached path keeps the full context (no sliding-window eviction), so
+        ``L + max_new_tokens`` must stay within ``max_seq_len``; the cache-free
+        path instead slides a ``max_seq_len`` window. ``use_cache`` is only
+        supported for ``core_type='two_stage'``.
+
+        Returns the full sequence ``[B, L + n]`` where ``n <= max_new_tokens``.
+        Generation stops early for a row once it emits ``eos_id`` (subsequent
+        positions are filled with ``pad_id``).
+
+        ``stop_ids`` adds extra stop tokens: a row also finishes once it emits
+        any id in ``stop_ids`` (the stop token itself is kept in the output, so
+        a harness can see *which* delimiter — e.g. ``</think>`` or a tool-call
+        close token — ended the segment, then resume by calling ``generate``
+        again on the returned sequence). ``eos_id`` is always a stop token.
+
+        ``on_token`` is an optional callback invoked as ``on_token(step, tok)``
+        after each decoding step with the step index and the ``[B]`` tensor of
+        ids that were just appended to the sequence; use it for streaming. Note
+        rows that have already finished receive ``pad_id`` (not a freshly
+        sampled id), matching exactly what is written to the output. Both are
+        backward compatible: when unset, behaviour is identical to before.
+
+        ``recurrent_steps`` overrides the recurrent-depth refinement count for
+        this decode call (default ``None`` -> ``cfg.recurrent_steps``). Because
+        RDT reasons in latent depth, raising this spends more test-time compute
+        ("think harder") per token without emitting any extra tokens; lowering
+        it trades quality for speed. The override is constant for the whole call
+        so the incremental KV/state cache stays consistent across positions.
+
+        ``pixel_values`` optionally supplies image features for prompts containing
+        ``<image_patch>`` slots. Cached decoding consumes them only during the
+        prefill step; cache-free decoding refuses sliding-window truncation with
+        images because dropping patch slots would desync the visual payload.
+        """
+
+        if input_ids.dim() != 2:
+            raise ValueError("input_ids must have shape [B, L]")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if top_k is not None and top_k <= 0:
+            raise ValueError("top_k must be positive when set")
+        if top_p is not None and not (0.0 < top_p <= 1.0):
+            raise ValueError("top_p must be in (0, 1] when set")
+        if min_p is not None and not (0.0 < min_p <= 1.0):
+            raise ValueError("min_p must be in (0, 1] when set")
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive")
+        if recurrent_steps is not None and recurrent_steps <= 0:
+            raise ValueError("recurrent_steps must be positive when set")
+        if use_cache and self.cfg.core_type not in {"two_stage", "segmented"}:
+            raise NotImplementedError(
+                "use_cache=True is only supported for core_type="
+                "'two_stage' / 'segmented'"
+            )
+        if use_cache and self.cfg.use_official_mamba:
+            raise NotImplementedError(
+                "use_cache=True requires the NaiveSSM fallback backend; "
+                "official Mamba kernels are not steppable by the decode cache. "
+                "Pass --mamba=naive for cached decoding or use_cache=False."
+            )
+
+        cfg = self.cfg
+        eos_id = cfg.eos_id if eos_id is None else eos_id
+        pad_id = cfg.pad_id if pad_id is None else pad_id
+
+        was_training = self.training
+        self.eval()
+
+        seq = input_ids
+        device = seq.device
+        finished = torch.zeros(seq.shape[0], dtype=torch.bool, device=device)
+
+        stop_token_ids: list[int] = []
+        if eos_id is not None:
+            stop_token_ids.append(int(eos_id))
+        if stop_ids is not None:
+            stop_token_ids.extend(int(s) for s in stop_ids)
+        stop_tensor = (
+            torch.tensor(sorted(set(stop_token_ids)), device=device, dtype=seq.dtype)
+            if stop_token_ids
+            else None
+        )
+
+        decode_cache = None
+        if use_cache:
+            from Model.inference.cache import DecodeCache
+
+            # The incremental cache prefills every prompt position into the
+            # MLA/Mamba state with an all-ones mask, so a padded prompt would
+            # fold pad embeddings into the cache and change logits for shorter
+            # rows. Reject padded prompts (use the cache-free path for those).
+            if pad_id is not None and bool((input_ids == pad_id).any()):
+                raise ValueError(
+                    "use_cache=True requires pad-free prompts; the incremental "
+                    "cache cannot mask padding. Use use_cache=False for padded "
+                    "batches."
+                )
+            # The cache has no eviction, so the whole run must fit in context.
+            # Guard up front (counting the tokens about to be appended) instead
+            # of generating one token past the limit before raising.
+            if input_ids.shape[1] + max_new_tokens > cfg.max_seq_len:
+                raise ValueError(
+                    "cached generation requires L + max_new_tokens <= "
+                    f"max_seq_len ({cfg.max_seq_len}); got L={input_ids.shape[1]}"
+                    f" + max_new_tokens={max_new_tokens}. Reduce max_new_tokens "
+                    "or use use_cache=False."
+                )
+            decode_cache = DecodeCache()
+
+        try:
+            for step in range(max_new_tokens):
+                if use_cache:
+                    if decode_cache.seq_len == 0:
+                        step_ids = seq
+                        step_pixels = pixel_values
+                    else:
+                        step_ids = seq[:, -1:]
+                        # The image was folded into the cache at prefill; later
+                        # steps process only the new token and carry no
+                        # <image_patch> slots, so pixel_values must be dropped.
+                        step_pixels = None
+                    mask = (seq != pad_id).long()
+                    word_pos, morph_depth = self._default_morph_info(seq, mask)
+                    m = step_ids.shape[1]
+                    logits = self._forward_decode(
+                        step_ids,
+                        word_pos=word_pos[:, -m:],
+                        morph_depth=morph_depth[:, -m:],
+                        cache=decode_cache,
+                        pixel_values=step_pixels,
+                        steps=recurrent_steps,
+                    )[:, -1, :].float()
+                else:
+                    window = seq
+                    if window.shape[1] > cfg.max_seq_len:
+                        window = window[:, -cfg.max_seq_len:]
+                        if pixel_values is not None:
+                            # Left-truncation could drop <image_patch> slots while
+                            # pixel_values still holds the full visual payload,
+                            # desyncing the injector. Refuse loudly.
+                            raise ValueError(
+                                "cache-free image generation cannot truncate the "
+                                "context (L + generated tokens exceeded "
+                                "max_seq_len); the <image_patch> slots would "
+                                "desync from pixel_values. Use use_cache=True or "
+                                "keep L + max_new_tokens <= max_seq_len."
+                            )
+
+                    if self._kl_exit_active(recurrent_steps):
+                        logits = self._adaptive_depth_logits(
+                            window, pixel_values
+                        )
+                    elif pixel_values is not None:
+                        out = self.forward(
+                            window,
+                            steps=recurrent_steps,
+                            return_logits=True,
+                            pixel_values=pixel_values,
+                        )
+                        logits = out["logits"][:, -1, :].float()
+                    else:
+                        out = self.forward(
+                            window, steps=recurrent_steps, return_logits=True
+                        )
+                        logits = out["logits"][:, -1, :].float()
+
+                if repetition_penalty != 1.0:
+                    logits = self._apply_repetition_penalty(
+                        logits, seq, repetition_penalty
+                    )
+
+                if greedy:
+                    next_token = torch.argmax(logits, dim=-1)
+                else:
+                    logits = logits / temperature
+                    logits = self._filter_logits(logits, top_k, top_p, min_p)
+                    probs = F.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+                next_token = torch.where(
+                    finished, torch.full_like(next_token, pad_id), next_token
+                )
+                next_token = next_token.to(seq.dtype)
+                seq = torch.cat([seq, next_token.unsqueeze(1)], dim=1)
+                if on_token is not None:
+                    on_token(step, next_token)
+                if stop_tensor is not None:
+                    finished = finished | torch.isin(next_token, stop_tensor)
+                else:
+                    finished = finished | (next_token == eos_id)
+                if bool(finished.all()):
+                    break
+        finally:
+            if was_training:
+                self.train()
+
+        return seq
+
+    @staticmethod
+    def _apply_repetition_penalty(
+        logits: torch.Tensor, seq: torch.Tensor, penalty: float
+    ) -> torch.Tensor:
+        """Divide logits of already-seen tokens by ``penalty`` (CTRL-style)."""
+
+        for row in range(seq.shape[0]):
+            seen = torch.unique(seq[row])
+            row_logits = logits[row, seen]
+            logits[row, seen] = torch.where(
+                row_logits > 0, row_logits / penalty, row_logits * penalty
+            )
+        return logits
+
+    @staticmethod
+    def _filter_logits(
+        logits: torch.Tensor,
+        top_k: int | None,
+        top_p: float | None,
+        min_p: float | None = None,
+    ) -> torch.Tensor:
+        """Apply top-k, nucleus (top-p) and min-p masking to ``[B, V]`` logits.
+
+        min-p (Nguyen et al., "Turning Up the Heat: Min-p Sampling for
+        Creative and Coherent LLM Outputs", ICLR 2025) keeps only tokens whose
+        probability is at least ``min_p * p_max`` where ``p_max`` is the top
+        token's probability. The candidate pool scales with the model's own
+        confidence: sharp distributions prune hard, flat ones stay permissive.
+        It is applied before top-k/top-p so it can act as the primary truncation.
+        """
+
+        if min_p is not None:
+            probs = F.softmax(logits, dim=-1)
+            p_max = probs.max(dim=-1, keepdim=True).values
+            logits = logits.masked_fill(probs < min_p * p_max, float("-inf"))
+
+        if top_k is not None:
+            k = min(top_k, logits.shape[-1])
+            kth = torch.topk(logits, k, dim=-1).values[:, -1, None]
+            logits = logits.masked_fill(logits < kth, float("-inf"))
+
+        if top_p is not None:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            remove = cum_probs > top_p
+            remove[:, 1:] = remove[:, :-1].clone()
+            remove[:, 0] = False
+            remove_idx = remove.scatter(1, sorted_idx, remove)
+            logits = logits.masked_fill(remove_idx, float("-inf"))
+
+        return logits
+
     def count_params(self, trainable_only: bool = False) -> int:
         seen: set[int] = set()
         total = 0

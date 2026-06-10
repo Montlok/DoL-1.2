@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Iterator
 
@@ -36,7 +39,7 @@ from Model.omvt import (
     ocr_reconstruction_loss,
     orientation_loss,
 )
-from Model.training import RankZeroLogger, build_optimizer
+from Model.training import RankZeroLogger, build_optimizer, clip_or_check_grad_norm
 from Model.config import TrainingConfig
 from Tokenizer.multimodal import PILImageProcessor
 
@@ -56,6 +59,8 @@ def parse_args(argv=None):
         "(ocr_labels / reading_order optional)",
     )
     p.add_argument("--output", default="outputs/omvt_ssl")
+    p.add_argument("--resume", default="")
+    p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=42)
@@ -180,6 +185,85 @@ def _masked_patch_step(
     return masked_patch_loss(predicted, target, mask=mask)
 
 
+def _resolve_checkpoint_path(path: str | Path) -> Path:
+    p = Path(path)
+    if p.is_file():
+        return p
+    candidates = [
+        p / "omvt_ssl.pt",
+        p / "latest" / "omvt_ssl.pt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"OMVT SSL checkpoint not found: {path}")
+
+
+def _save_checkpoint(
+    output: str | Path,
+    step: int,
+    cfg: OMVTConfig,
+    tower: OMVTVisionTower,
+    ocr_head: OCRReconstructionHead,
+    mp_head: MaskedPatchHead,
+    ori_head: OrientationHead,
+    layout_head: LayoutOrderHead,
+    optimizer: torch.optim.Optimizer,
+) -> Path:
+    out = Path(output)
+    step_dir = out / f"step_{step:08d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "step": int(step),
+            "omvt_config": asdict(cfg),
+            "tower": tower.state_dict(),
+            "ocr_head": ocr_head.state_dict(),
+            "masked_patch_head": mp_head.state_dict(),
+            "orientation_head": ori_head.state_dict(),
+            "layout_head": layout_head.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        },
+        step_dir / "omvt_ssl.pt",
+    )
+    latest = out / "latest"
+    if latest.exists() or latest.is_symlink():
+        try:
+            latest.unlink()
+        except OSError:
+            shutil.rmtree(latest, ignore_errors=True)
+    try:
+        os.symlink(step_dir.name, latest)
+    except OSError:
+        # Some filesystems disallow symlinks; the step dir remains valid.
+        pass
+    return step_dir
+
+
+def _load_checkpoint(
+    path: str | Path,
+    tower: OMVTVisionTower,
+    ocr_head: OCRReconstructionHead,
+    mp_head: MaskedPatchHead,
+    ori_head: OrientationHead,
+    layout_head: LayoutOrderHead,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> int:
+    payload = torch.load(
+        _resolve_checkpoint_path(path),
+        map_location="cpu",
+        weights_only=False,
+    )
+    tower.load_state_dict(payload["tower"])
+    ocr_head.load_state_dict(payload["ocr_head"])
+    mp_head.load_state_dict(payload["masked_patch_head"])
+    ori_head.load_state_dict(payload["orientation_head"])
+    layout_head.load_state_dict(payload["layout_head"])
+    if optimizer is not None and payload.get("optimizer") is not None:
+        optimizer.load_state_dict(payload["optimizer"])
+    return int(payload.get("step", 0))
+
+
 def main(argv=None):
     args = parse_args(argv)
     torch.manual_seed(args.seed)
@@ -204,6 +288,17 @@ def main(argv=None):
         precision="fp32",
     )
     optimizer = build_optimizer(modules, train_cfg)
+    start_step = 0
+    if args.resume:
+        start_step = _load_checkpoint(
+            args.resume,
+            tower,
+            ocr_head,
+            mp_head,
+            ori_head,
+            layout_head,
+            optimizer,
+        )
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
     logger = RankZeroLogger(args.output, enable_tensorboard=False)
@@ -218,7 +313,9 @@ def main(argv=None):
             seed=args.seed,
         )
 
-    for step in range(1, args.steps + 1):
+    last_step = start_step
+    for step in range(start_step + 1, args.steps + 1):
+        last_step = step
         if real_iter is None:
             images = torch.randn(args.batch_size, cfg.in_channels, cfg.image_size, cfg.image_size, device=device)
             ocr_labels_real: list | None = None
@@ -279,9 +376,11 @@ def main(argv=None):
             + cfg.w_orientation * loss_ori
             + cfg.w_layout_order * loss_layout
         )
+        if not bool(torch.isfinite(loss.detach())):
+            raise FloatingPointError(f"non-finite OMVT SSL loss at step {step}")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(modules.parameters(), 1.0)
+        clip_or_check_grad_norm(modules, 1.0, step=step)
         optimizer.step()
 
         logger.log(step, {
@@ -291,10 +390,35 @@ def main(argv=None):
             "ori": float(loss_ori.detach()),
             "layout": float(loss_layout.detach()),
         })
+        if args.save_every and step % args.save_every == 0 and not args.smoke:
+            _save_checkpoint(
+                args.output,
+                step,
+                cfg,
+                tower,
+                ocr_head,
+                mp_head,
+                ori_head,
+                layout_head,
+                optimizer,
+            )
 
     logger.close()
+    if not args.smoke:
+        _save_checkpoint(
+            args.output,
+            last_step,
+            cfg,
+            tower,
+            ocr_head,
+            mp_head,
+            ori_head,
+            layout_head,
+            optimizer,
+        )
     dt = time.time() - t0
-    print(f"OMVT SSL smoke OK in {dt:.1f}s")
+    mode = "real-data" if args.data else "smoke"
+    print(f"OMVT SSL {mode} OK in {dt:.1f}s")
     return 0
 
 

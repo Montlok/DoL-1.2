@@ -28,7 +28,7 @@ Model/
     heads.py / losses.py  # OCR / masked-patch / orientation / layout-order SSL
   training/
     data.py            # JSONL + StreamingJsonlDataset + pixel-aware collator + dataloader
-    optim.py           # AdamW (no-decay groups) + warmup/cosine
+    optim.py           # AdamW / Adam-atan2 / Muon (+CombinedOptimizer) + warmup/cosine/WSD
     dist.py            # init_distributed + wrap_ddp + wrap_fsdp
     checkpoint.py      # FSDP-aware save / resume
     loop.py            # train_one_step + evaluate (autocast + grad accum + clip)
@@ -39,7 +39,13 @@ Model/
 ## 2. Configs
 
 ```python
-from Model.config import tiny_config, small_config, base_config, pretrain_config
+from Model.config import (
+    tiny_config,
+    small_config,
+    base_config,
+    pretrain_config,
+    segmented_pretrain_config,
+)
 cfg = pretrain_config()  # ~1.1B params: d_model=2048, 16 heads, 8 recurrent steps
 ```
 
@@ -49,6 +55,7 @@ cfg = pretrain_config()  # ~1.1B params: d_model=2048, 16 heads, 8 recurrent ste
 | small      | 1024    | 16    | 64       | 3 / 3                   | 8               | 4096    |
 | base       | 2048    | 32    | 64       | 4 / 4                   | 16              | 8192    |
 | pretrain   | 2048    | 16    | 128      | 3 / 3                   | 8               | 4096    |
+| segmented_pretrain | 2048 | 16 | 128     | 3 / 3                   | random 2-8      | 4096    |
 
 Activation-memory controls (in `RDTConfig`):
 
@@ -57,6 +64,86 @@ Activation-memory controls (in `RDTConfig`):
 - `use_act` switches to PonderNet-style adaptive halting with
   `act_max_steps` upper bound; the loop runs the full bound without
   host-syncs so CUDA streams stay pipelined.
+
+### Two-stage core (`core_type="two_stage"`)
+
+`TwoStageCore` (`Model/two_stage.py`) is a drop-in replacement for
+`RecurrentCore` with the same forward signature/return contract. It splits the
+recurrent core into a **pure-Mamba encoding stage** (order-preserving,
+equal-length compression of the *raw* context) followed by a **pure-attention
+refinement stage** (recurrent MLA on top of the Mamba backbone — the
+Transformer never touches raw context).
+
+```python
+from Model.config import two_stage_tiny_config, two_stage_pretrain_config
+cfg = two_stage_pretrain_config()  # mHC drift control, official Mamba on CUDA
+```
+
+Drift control for the refinement loop (`recurrent_drift_mode`):
+
+- `none` / `norm` / `decay` / `both` — plain recurrent attention with optional
+  boundary RMSNorm and/or decayed Stage-1 injection (`recurrent_inject_decay`).
+- `mhc` — Manifold-Constrained Hyper-Connections (arXiv:2512.24880) sunk into
+  **every attention/ffn residual** via `MHCAttnSubLayer`. Streams are expanded
+  once, kept across all steps/layers, and collapsed once; stability comes from
+  the per-layer doubly-stochastic (Sinkhorn) constraint, not from loop-level
+  injection or boundary norm. Tunables: `mhc_n_streams` (default 4),
+  `mhc_sinkhorn_iters` (default 20).
+
+Constraints: `core_type="two_stage"` requires `use_act=False`, and
+`two_stage_downsample` must stay `False` (the downsample path is not implemented
+for the causal pretraining core — pooling a word's characters would leak
+intra-word future, so `True` raises). Tests run under the standard runner:
+`python3 -m unittest discover Model` (covers `Model/tests/test_mhc.py` and
+`Model/tests/test_two_stage_integration.py`). Optional manual smoke:
+`python3 smoke_two_stage.py`.
+
+### Segmented causal core (`core_type="segmented"`)
+
+`SegmentedCore` (`Model/segmented.py`) is the **Block-Transformer-style**
+(arXiv:2406.02657) core that runs the expensive attention + RDT recurrence over
+**`n_seg` block summaries instead of all `n_tok` tokens**, cutting the quadratic
+cost (`n_seg = ceil(L / segment_len) << n_tok`). It is a drop-in replacement for
+`RecurrentCore` (same forward signature / `(hidden, info)` contract) and is fully
+causal end-to-end — zero future leakage is the red line, guarded by
+`Model/tests/test_segmented.py`.
+
+```python
+from Model.config import segmented_tiny_config, segmented_pretrain_config
+cfg = segmented_pretrain_config()  # segment_len=8, official Mamba on CUDA
+```
+
+Pipeline (all forward-only / block-causal):
+
+1. **S1 segment encoding** — causal Mamba over every token; each block's summary
+   is the causal hidden state at its boundary (sees only `<=` that token).
+2. **S2 block refinement** — block-causal MLA + shared-weight RDT recurrent depth
+   over the `n_seg` summaries (Huginn arXiv:2502.05171; random-r + truncated
+   BPTT via `recurrent_random_r`, `bptt_window`).
+3. **S3 local head** — token `t` (block `s = t // segment_len`) is decoded from
+   the refined summary of block `s-1` (block 0 → learned `start_ctx`) plus a
+   causal local Mamba decoder; a summary therefore only ever conditions the
+   *next* block.
+
+New knobs:
+
+- `segment_len` — block length `L_B` (tiny default 4, pretrain 8; smaller blocks
+  model more easily, BD3LM/Block-Transformer).
+- `segmented_local_layers` — depth of the S3 local causal decoder.
+- `kv_share_budget` — reserved for future cached-decode recurrent KV sharing.
+  Keep this at `0` today: cache-equivalent decode needs one MLA cache per
+  `(step, layer)`, and the cached path rejects `>0` rather than silently mixing
+  recurrent-step histories.
+- `kl_exit_threshold` — zero-shot KL early-exit for `generate()` (Huginn §6.1):
+  `>0` adaptively stops the recurrent-depth loop once successive step
+  distributions converge (cache-free path only); `0` (default) keeps fixed depth
+  and is bit-exact. Naturally spends more depth on rare/hard Mongolian segments.
+
+Cached incremental decoding (`generate(..., use_cache=True)`) is supported for
+`segmented` (in addition to `two_stage`) and matches the cache-free path within
+fp tolerance; it requires the NaiveSSM backend (`--mamba=naive`). Tests:
+`Model/tests/test_segmented.py`, `test_early_exit.py`, `test_multilingual.py`.
+
 
 ## 3. Training entry points
 
@@ -88,6 +175,24 @@ python -m scripts.train_rdt --config pretrain --multimodal \
 ```
 
 Resume: `--resume runs/rdt/latest` (auto-detects FSDP / DDP / single).
+
+### Learning framework (optimizer + LR schedule)
+
+`build_optimizer` / `build_scheduler` (`Model/training/optim.py`) are config-gated
+so defaults stay **AdamW + warmup/cosine** (no regression to alignment phases):
+
+- `adam_use_atan2` — replace the Adam update with **Adam-atan2** (arXiv:2407.05872):
+  `update = -lr·a·atan2(m̂, b·√v̂)`, eps-free and bf16-underflow-proof. Drop-in.
+- `lr_schedule` — `cosine` (default) or `wsd` (**Warmup-Stable-Decay**,
+  MiniCPM arXiv:2404.06395): constant plateau then a short decay tail
+  controlled by `wsd_stable_ratio` and `wsd_decay_shape`, ideal for a late
+  Mongolian-domain decay phase.
+- `muon_*` — route 2-D non-embedding weights through **Muon** (Moonlight
+  arXiv:2502.16982; quintic Newton-Schulz orthogonalization) while
+  embeddings/lm_head/norms/biases stay on AdamW via `CombinedOptimizer`.
+  **Experimental only** — shared-weight RDT amplifies gradients `r×`, so the
+  Muon×muP interaction is an open question; keep it off by default and document
+  any run that enables it. Tests: `Model/tests/test_optim_framework.py`.
 
 ## 4. From cold-start to formal pretraining
 

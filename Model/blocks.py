@@ -31,6 +31,7 @@ class StandardBlock(nn.Module):
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
         cache=None,
+        pos_offset: int = 0,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.attn_norm(x),
@@ -39,6 +40,7 @@ class StandardBlock(nn.Module):
             attn_mask=attn_mask,
             causal=causal,
             cache=cache,
+            pos_offset=pos_offset,
         )
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -64,6 +66,7 @@ class AttnSubLayer(nn.Module):
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
         cache=None,
+        pos_offset: int = 0,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.attn_norm(x),
@@ -72,6 +75,7 @@ class AttnSubLayer(nn.Module):
             attn_mask=attn_mask,
             causal=causal,
             cache=cache,
+            pos_offset=pos_offset,
         )
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -97,7 +101,7 @@ class MambaSubLayer(nn.Module):
         x = self.mamba(x, attn_mask=attn_mask, cache=cache)
         x = x + self.ffn(self.ffn_norm(x))
 
-        if attn_mask is not None and cache is None:
+        if attn_mask is not None:
             x = x * attn_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
 
         return x
@@ -170,19 +174,14 @@ class RecurrentBlock(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
-        caches: list | None = None,
     ) -> torch.Tensor:
-        if caches is not None and len(caches) != len(self.layers):
-            raise ValueError("caches must have one entry per sublayer")
-
-        for idx, layer in enumerate(self.layers):
+        for layer in self.layers:
             x = layer(
                 x,
                 word_pos=word_pos,
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
-                cache=caches[idx] if caches is not None else None,
             )
 
         return x

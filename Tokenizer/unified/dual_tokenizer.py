@@ -2,39 +2,31 @@
 """Dual-track tokenizer with one unified id space.
 
 Tracks:
-    mn    -> MorphBPE
-    zh/en -> HuggingFace BPE tokenizer
-    misc  -> byte fallback / punctuation / digits
+    mn       -> MorphBPE (morphology-aware traditional Mongolian)
+    general  -> byte-level BPE (Chinese / English / Japanese / Cyrillic /
+                digits / punctuation / symbols), lossless, never ``<unk>``
 """
 
 from __future__ import annotations
 
-import json
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
 try:
-    from ..generic_bpe import HFTrackTokenizer, encode_byte_fallback, is_byte_token
-    from ..traditional_mongolian.stemmer import MongolStemmer
+    from ..generic_bpe import encode_byte_fallback, is_byte_token
     from .encoded import DualTrackResult, EncodedToken
     from .vocab import (
         SEGMENT,
         SPECIAL_TOKENS,
-        build_misc_tokens,
         build_unified_vocab,
     )
 except ImportError:  # pragma: no cover - supports direct script execution.
-    from Tokenizer.generic_bpe import (
-        HFTrackTokenizer,
-        encode_byte_fallback,
-        is_byte_token,
-    )
-    from Tokenizer.traditional_mongolian.stemmer import MongolStemmer
+    from Tokenizer.generic_bpe import encode_byte_fallback, is_byte_token
     from Tokenizer.unified.encoded import DualTrackResult, EncodedToken
     from Tokenizer.unified.vocab import (
         SEGMENT,
         SPECIAL_TOKENS,
-        build_misc_tokens,
         build_unified_vocab,
     )
 
@@ -64,38 +56,6 @@ MONGOLIAN_PUNCTUATION = {
     "\u1809",
 }
 
-CJK_RANGES = [
-    (0x3400, 0x4DBF),
-    (0x4E00, 0x9FFF),
-    (0xF900, 0xFAFF),
-    (0x20000, 0x2A6DF),
-    (0x2A700, 0x2B73F),
-    (0x2B740, 0x2B81F),
-    (0x2B820, 0x2CEAF),
-]
-
-LATIN_RANGES = [
-    (0x0041, 0x005A),
-    (0x0061, 0x007A),
-    (0x00C0, 0x024F),
-    (0x1E00, 0x1EFF),
-]
-
-FULLWIDTH_LATIN_RANGES = [
-    (0xFF21, 0xFF3A),
-    (0xFF41, 0xFF5A),
-]
-
-DIGIT_RANGES = [
-    (0x0030, 0x0039),
-    (0xFF10, 0xFF19),
-]
-
-CJK_SYMBOL_RANGES = [
-    (0x3000, 0x303F),
-    (0xFF00, 0xFFEF),
-]
-
 SPACE_CHARS = {
     " ",
     "\u00a0",
@@ -117,24 +77,15 @@ def in_ranges(cp: int, ranges: list[tuple[int, int]]) -> bool:
 
 
 def char_lang(ch: str) -> str:
-    cp = ord(ch)
-
     if ch in SPACE_CHARS:
         return "space"
+    # Mongolian punctuation lives inside the Mongolian block but is not part of
+    # word morphology, so it goes to the general track (not MorphBPE).
     if ch in MONGOLIAN_PUNCTUATION:
-        return "misc"
-    if in_ranges(cp, MONGOLIAN_RANGES):
+        return "general"
+    if in_ranges(ord(ch), MONGOLIAN_RANGES):
         return "mn"
-    if in_ranges(cp, DIGIT_RANGES):
-        return "misc"
-    if in_ranges(cp, LATIN_RANGES) or in_ranges(cp, FULLWIDTH_LATIN_RANGES):
-        return "en"
-    if in_ranges(cp, CJK_SYMBOL_RANGES):
-        return "misc"
-    if in_ranges(cp, CJK_RANGES):
-        return "zh"
-
-    return "misc"
+    return "general"
 
 
 def _is_mongolian_char(ch: str) -> bool:
@@ -197,47 +148,19 @@ def segment_by_language(text: str) -> list[Span]:
     return spans
 
 
-def _strip_hf_boundary_markers(text: str) -> str:
-    # HuggingFace tokenizers keep word-boundary markers in their raw token
-    # strings (SentencePiece "▁" / GPT-2 "Ġ"). Mirror HF's
-    # convert_tokens_to_string behavior so decode() yields natural text
-    # instead of artifacts like "▁hello" / "Ġhello".
-    return text.replace("\u2581", " ").replace("\u0120", " ")
+def _general_piece_track(surface: str) -> str:
+    """Classify a general-track piece as a word piece or a punctuation piece.
 
+    Punctuation/symbol pieces use the ``general_punct`` track so the model-side
+    morphology derivation resets ``word_pos``/``morph_depth`` around them (the
+    same boundary behavior the retired ``misc`` track provided), while real
+    word pieces (containing any letter or number) keep grouping under
+    ``general`` so contiguous subtokens of one word share a word position.
+    """
 
-def extract_hf_vocab_tokens(
-    model_name: str, lang: str, limit: int
-) -> tuple[list[str], dict[str, int]]:
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:
-        raise ImportError("pip install transformers") from exc
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    vocab = tokenizer.get_vocab()
-    sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
-
-    selected: list[str] = []
-    for token, _local_id in sorted_vocab:
-        cleaned = token.replace("Ġ", " ").replace("▁", " ")
-        if not cleaned.strip():
-            continue
-
-        if lang == "zh":
-            keep = any(char_lang(ch) == "zh" for ch in cleaned)
-        elif lang == "en":
-            keep = any(char_lang(ch) == "en" for ch in cleaned) and all(
-                char_lang(ch) in {"en", "space", "misc"} for ch in cleaned
-            )
-        else:
-            keep = False
-
-        if keep:
-            selected.append(token)
-        if len(selected) >= limit:
-            break
-
-    return selected, vocab
+    if surface and any(unicodedata.category(ch)[0] in ("L", "N") for ch in surface):
+        return "general"
+    return "general_punct"
 
 
 class DualTrackTokenizer:
@@ -245,13 +168,13 @@ class DualTrackTokenizer:
         self,
         unified_vocab: dict[str, int],
         morphbpe: Any,
-        zh_hf_tokenizer: Any,
-        en_hf_tokenizer: Any,
+        general: Any,
     ):
         self.vocab = unified_vocab
         self.id_to_token = {idx: tok for tok, idx in unified_vocab.items()}
         self.unk_id = unified_vocab["<unk>"]
         self.morphbpe = morphbpe
+        self.general = general
 
         self.mn_local_to_global = {
             local_id: unified_vocab[token]
@@ -264,31 +187,14 @@ class DualTrackTokenizer:
             local_id: token for token, local_id in morphbpe.vocab.items()
         }
 
-        self.zh_local_to_global = self._build_hf_map(zh_hf_tokenizer, "zh")
-        self.en_local_to_global = self._build_hf_map(en_hf_tokenizer, "en")
-
-        self.zh = HFTrackTokenizer(
-            zh_hf_tokenizer,
-            prefix="zh▁",
-            local_to_global=self.zh_local_to_global,
-            unk_id=self.unk_id,
-            track="zh",
-        )
-        self.en = HFTrackTokenizer(
-            en_hf_tokenizer,
-            prefix="en▁",
-            local_to_global=self.en_local_to_global,
-            unk_id=self.unk_id,
-            track="en",
-        )
-
-    def _build_hf_map(self, hf_tokenizer: Any, lang: str) -> dict[int, int]:
-        result: dict[int, int] = {}
-        for token, local_id in hf_tokenizer.get_vocab().items():
-            global_id = self.vocab.get(f"{lang}▁{token}")
-            if global_id is not None:
-                result[local_id] = global_id
-        return result
+        gen_lo, gen_hi = SEGMENT["general"]
+        self.general_local_to_global: dict[int, int] = {}
+        self.general_global_to_local: dict[int, int] = {}
+        for token, local_id in general.get_vocab().items():
+            global_id = unified_vocab.get(token)
+            if global_id is not None and gen_lo <= global_id < gen_hi:
+                self.general_local_to_global[local_id] = global_id
+                self.general_global_to_local[global_id] = local_id
 
     @property
     def vocab_size(self) -> int:
@@ -313,14 +219,10 @@ class DualTrackTokenizer:
                 tokens.extend(self._encode_special(span))
             elif span.lang == "mn":
                 tokens.extend(self._encode_mongolian(span))
-            elif span.lang == "zh":
-                tokens.extend(self._encode_hf_track(self.zh, span))
-            elif span.lang == "en":
-                tokens.extend(self._encode_hf_track(self.en, span))
             elif span.lang == "space":
                 tokens.extend(self._encode_space(span))
             else:
-                tokens.extend(self._encode_misc(span))
+                tokens.extend(self._encode_general(span))
 
         if add_eos:
             tokens.append(EncodedToken(self.vocab["<eos>"], "<eos>", "special", -1, -1))
@@ -362,10 +264,8 @@ class DualTrackTokenizer:
         local_ids = self.morphbpe.encode(span.text)
         # No per-token offsets available: recover each piece's surface from the
         # reverse vocab and walk a cursor through the span so offsets stay
-        # monotonic and non-overlapping. (The previous behavior assigned the
-        # whole span's text/offsets to *every* token, which corrupts offsets
-        # for any multi-piece word.)
-        tokens: list[EncodedToken] = []
+        # monotonic and non-overlapping.
+        tokens = []
         cursor = 0
         text = span.text
         for local_id in local_ids:
@@ -376,9 +276,6 @@ class DualTrackTokenizer:
                 surface = piece
                 cursor = end
             else:
-                # Piece not locatable in the raw text (e.g. normalization
-                # dropped variation selectors): emit a zero-width span at the
-                # cursor rather than overlapping the whole word.
                 start = end = cursor
                 surface = piece
             tokens.append(
@@ -392,139 +289,79 @@ class DualTrackTokenizer:
             )
         return tokens
 
-    def _encode_hf_track(
-        self, track_tokenizer: HFTrackTokenizer, span: Span
-    ) -> list[EncodedToken]:
-        encoded = track_tokenizer.encode_with_offsets(span.text, span.start)
-        if not encoded and span.text:
+    def _encode_general(self, span: Span) -> list[EncodedToken]:
+        pieces = self.general.encode_pieces(span.text)
+        if not pieces and span.text:
             return encode_byte_fallback(
-                span.text, self.vocab, self.unk_id, span.start, "misc"
+                span.text, self.vocab, self.unk_id, span.start, "general"
             )
-
         tokens: list[EncodedToken] = []
-        for token in encoded:
-            if token.id != self.unk_id:
-                tokens.append(token)
-                continue
-
-            rel_start = max(0, token.start - span.start)
-            rel_end = min(len(span.text), max(rel_start, token.end - span.start))
-            surface = span.text[rel_start:rel_end] or token.surface or token.token
-            tokens.extend(
-                encode_byte_fallback(
-                    surface, self.vocab, self.unk_id, token.start, "misc"
+        for local_id, token, start, end in pieces:
+            tokens.append(
+                EncodedToken(
+                    self.general_local_to_global.get(local_id, self.unk_id),
+                    token,
+                    _general_piece_track(span.text[start:end]),
+                    span.start + start,
+                    span.start + end,
                 )
             )
         return tokens
 
     def _encode_space(self, span: Span) -> list[EncodedToken]:
-        space_id = self.vocab.get("▁", self.unk_id)
+        space_id = self.vocab.get("\u2581", self.unk_id)
         return [
-            EncodedToken(space_id, "▁", "space", pos, pos + 1)
+            EncodedToken(space_id, "\u2581", "space", pos, pos + 1)
             for pos in range(span.start, span.end)
         ]
-
-    def _encode_misc(self, span: Span) -> list[EncodedToken]:
-        return encode_byte_fallback(
-            span.text, self.vocab, self.unk_id, span.start, "misc"
-        )
 
     def decode(self, ids: list[int]) -> str:
         parts: list[str] = []
         byte_buf: list[int] = []
+        gen_buf: list[int] = []
 
         def flush_bytes() -> None:
-            nonlocal byte_buf
             if byte_buf:
                 parts.append(bytes(byte_buf).decode("utf-8", errors="replace"))
-                byte_buf = []
+                byte_buf.clear()
+
+        def flush_general() -> None:
+            if gen_buf:
+                parts.append(self.general.decode(list(gen_buf)))
+                gen_buf.clear()
 
         for idx in ids:
-            token = self.id_to_token.get(idx, "")
-            if token in {"<pad>", "<unk>", "<bos>", "<eos>", "<img>"}:
+            local = self.general_global_to_local.get(idx)
+            if local is not None:
                 flush_bytes()
+                gen_buf.append(local)
                 continue
 
+            token = self.id_to_token.get(idx, "")
+
             if is_byte_token(token):
+                flush_general()
                 try:
                     byte_buf.append(int(token[3:5], 16))
                     continue
                 except ValueError:
                     pass
 
+            flush_general()
             flush_bytes()
 
-            if token.startswith("zh▁"):
-                parts.append(_strip_hf_boundary_markers(token[3:]))
-            elif token.startswith("en▁"):
-                parts.append(_strip_hf_boundary_markers(token[3:]))
-            elif token == "▁":
+            if token in {"<pad>", "<unk>", "<bos>", "<eos>", "<img>"}:
+                continue
+            if token == "\u2581":
                 parts.append(" ")
-            elif token == "◈":
+            elif token == "\u25c8":
                 continue
             else:
                 parts.append(token)
 
+        flush_general()
         flush_bytes()
         return "".join(parts)
-
-    def save(self, path: str, config: dict[str, Any] | None = None) -> None:
-        payload = {
-            "vocab": self.vocab,
-            "segment": SEGMENT,
-            "special_tokens": SPECIAL_TOKENS,
-            "config": config or {},
-        }
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-
-
-def load_morphbpe_tokenizer(morphbpe_model_path: str, stemmer: MongolStemmer) -> Any:
-    try:
-        from Tokenizer.morphbpe import MorphBPETokenizer
-    except ImportError as exc:
-        raise ImportError(
-            "Tokenizer.morphbpe.MorphBPETokenizer is not implemented yet"
-        ) from exc
-
-    return MorphBPETokenizer.from_file(morphbpe_model_path, stemmer)
-
-
-def build_dual_tokenizer(
-    morphbpe_model_path: str,
-    zh_source: str = "Qwen/Qwen2.5-0.5B",
-    en_source: str = "meta-llama/Llama-3.2-1B",
-    n_chinese: int = 15000,
-    n_english: int = 8000,
-) -> DualTrackTokenizer:
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:
-        raise ImportError("pip install transformers") from exc
-
-    stemmer = MongolStemmer()
-    morphbpe = load_morphbpe_tokenizer(morphbpe_model_path, stemmer)
-
-    zh_tokens, _ = extract_hf_vocab_tokens(zh_source, "zh", n_chinese)
-    en_tokens, _ = extract_hf_vocab_tokens(en_source, "en", n_english)
-
-    unified_vocab = build_unified_vocab(
-        morphbpe_vocab=morphbpe.vocab,
-        chinese_tokens=zh_tokens,
-        english_tokens=en_tokens,
-        misc_tokens=build_misc_tokens(),
-    )
-
-    zh_hf = AutoTokenizer.from_pretrained(zh_source)
-    en_hf = AutoTokenizer.from_pretrained(en_source)
-
-    return DualTrackTokenizer(
-        unified_vocab=unified_vocab,
-        morphbpe=morphbpe,
-        zh_hf_tokenizer=zh_hf,
-        en_hf_tokenizer=en_hf,
-    )
 
 
 def run_segment(text: str) -> None:
@@ -532,53 +369,26 @@ def run_segment(text: str) -> None:
         print(f"[{span.lang}] {span.start}:{span.end} {span.text!r}")
 
 
-def run_build(args: list[str]) -> None:
-    morphbpe_path = args[2]
-    out_path = args[3] if len(args) > 3 else "unified_tokenizer.json"
-
-    tokenizer = build_dual_tokenizer(morphbpe_path)
-    tokenizer.save(
-        out_path,
-        config={
-            "type": "dual_track_tokenizer",
-            "tracks": ["mn:morphbpe", "zh:hf", "en:hf", "misc:byte"],
-        },
-    )
-
-    print(f"vocab_size={tokenizer.vocab_size}")
-    print(f"saved={out_path}")
-
-
 def main() -> None:
     import sys
 
-    if len(sys.argv) < 2:
-        print("Usage:")
-        print("  python -m Tokenizer.unified.dual_tokenizer segment <text>")
-        print(
-            "  python -m Tokenizer.unified.dual_tokenizer build <morphbpe.json> [out.json]"
-        )
+    if len(sys.argv) < 3 or sys.argv[1] != "segment":
+        print("Usage: python -m Tokenizer.unified.dual_tokenizer segment <text>")
         return
-
-    cmd = sys.argv[1]
-    if cmd == "segment":
-        if len(sys.argv) < 3:
-            print("Usage: python -m Tokenizer.unified.dual_tokenizer segment <text>")
-            return
-        run_segment(sys.argv[2])
-        return
-
-    if cmd == "build":
-        if len(sys.argv) < 3:
-            print(
-                "Usage: python -m Tokenizer.unified.dual_tokenizer build <morphbpe.json> [out.json]"
-            )
-            return
-        run_build(sys.argv)
-        return
-
-    print(f"Unknown command: {cmd}")
+    run_segment(sys.argv[2])
 
 
 if __name__ == "__main__":
     main()
+
+
+__all__ = [
+    "DualTrackTokenizer",
+    "Span",
+    "SEGMENT",
+    "SPECIAL_TOKENS",
+    "build_unified_vocab",
+    "char_lang",
+    "contextual_char_lang",
+    "segment_by_language",
+]

@@ -54,6 +54,36 @@ def _get_model_state(model: nn.Module) -> dict[str, Any]:
     return _unwrap(model).state_dict()
 
 
+def _get_optimizer_state(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, Any]:
+    if _is_fsdp(model):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        if hasattr(FSDP, "full_optim_state_dict"):
+            return FSDP.full_optim_state_dict(
+                model, optimizer, rank0_only=True
+            )
+
+        from torch.distributed.fsdp import (
+            FullOptimStateDictConfig,
+            StateDictType,
+        )
+
+        optim_cfg = FullOptimStateDictConfig(
+            offload_to_cpu=True,
+            rank0_only=True,
+        )
+        with FSDP.state_dict_type(
+            model,
+            StateDictType.FULL_STATE_DICT,
+            optim_state_dict_config=optim_cfg,
+        ):
+            return FSDP.optim_state_dict(model, optimizer)
+    return optimizer.state_dict()
+
+
 def _load_model_state(model: nn.Module, state: dict[str, Any]) -> None:
     if _is_fsdp(model):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -64,6 +94,21 @@ def _load_model_state(model: nn.Module, state: dict[str, Any]) -> None:
             model.load_state_dict(state)
     else:
         _unwrap(model).load_state_dict(state)
+
+
+def _load_optimizer_state(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    state: dict[str, Any],
+) -> None:
+    if _is_fsdp(model):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        if hasattr(FSDP, "optim_state_dict_to_load"):
+            state = FSDP.optim_state_dict_to_load(model, optimizer, state)
+        else:
+            state = FSDP.shard_full_optim_state_dict(state, model)
+    optimizer.load_state_dict(state)
 
 
 def _rng_state() -> dict[str, Any]:
@@ -114,13 +159,18 @@ def save_checkpoint(
     step_dir = out / f"step_{step:08d}"
 
     model_state = _get_model_state(model)
+    optimizer_state = (
+        _get_optimizer_state(model, optimizer)
+        if optimizer is not None
+        else None
+    )
     if not is_main_process():
         return None
 
     step_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model_state, step_dir / "model.pt")
-    if optimizer is not None:
-        torch.save(optimizer.state_dict(), step_dir / "optimizer.pt")
+    if optimizer_state is not None:
+        torch.save(optimizer_state, step_dir / "optimizer.pt")
     if scheduler is not None:
         torch.save(scheduler.state_dict(), step_dir / "scheduler.pt")
     torch.save(_rng_state(), step_dir / "rng.pt")
@@ -152,10 +202,14 @@ def save_checkpoint(
 
 def load_checkpoint(path: str | Path) -> CheckpointPayload:
     p = Path(path)
-    if p.name == "latest" or not p.exists():
-        candidate = p.parent / "latest" if p.parent.exists() else None
-        if candidate and candidate.exists():
-            p = candidate.resolve()
+    if p.name == "latest":
+        if not p.exists():
+            raise FileNotFoundError(f"checkpoint not found: {p}")
+        p = p.resolve()
+    elif p.is_dir() and not (p / "model.pt").exists() and (p / "latest").exists():
+        p = (p / "latest").resolve()
+    elif not p.exists():
+        raise FileNotFoundError(f"checkpoint not found: {p}")
 
     model_state = torch.load(p / "model.pt", map_location="cpu", weights_only=False)
     opt_path = p / "optimizer.pt"
@@ -219,7 +273,7 @@ def resume_state(
     payload = load_checkpoint(path)
     _load_model_state(model, payload.model_state)
     if optimizer is not None and payload.optimizer_state is not None:
-        optimizer.load_state_dict(payload.optimizer_state)
+        _load_optimizer_state(model, optimizer, payload.optimizer_state)
     if scheduler is not None and payload.scheduler_state is not None:
         scheduler.load_state_dict(payload.scheduler_state)
     if payload.rng_state:

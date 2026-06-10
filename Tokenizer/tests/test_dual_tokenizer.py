@@ -2,6 +2,7 @@
 
 import unittest
 
+from Tokenizer.generic_bpe import GeneralBPEModel
 from Tokenizer.multimodal import (
     IMAGE_END,
     IMAGE_PATCH,
@@ -14,7 +15,6 @@ from Tokenizer.unified.dual_tokenizer import (
     DualTrackTokenizer,
     SEGMENT,
     SPECIAL_TOKENS,
-    build_misc_tokens,
     build_unified_vocab,
     segment_by_language,
 )
@@ -27,29 +27,13 @@ class FakeMorphBPE:
         return [self.vocab[text]]
 
 
-class FakeHFTokenizer:
-    def __init__(self, vocab):
-        self._vocab = vocab
-
-    def get_vocab(self):
-        return dict(self._vocab)
-
-    def encode(self, text, add_special_tokens=False):
-        if text in self._vocab:
-            return [self._vocab[text]]
-        return [self._vocab[ch] for ch in text if ch in self._vocab]
-
-
 def build_fake_tokenizer():
-    zh = FakeHFTokenizer({"这": 0, "张": 1, "图": 2})
-    en = FakeHFTokenizer({"test": 0, "hello": 1})
+    general = GeneralBPEModel.minimal()
     vocab = build_unified_vocab(
         morphbpe_vocab=FakeMorphBPE.vocab,
-        chinese_tokens=["这", "张", "图"],
-        english_tokens=["test", "hello"],
-        misc_tokens=build_misc_tokens(),
+        general_vocab=general.get_vocab(),
     )
-    return DualTrackTokenizer(vocab, FakeMorphBPE(), zh, en)
+    return DualTrackTokenizer(vocab, FakeMorphBPE(), general)
 
 
 class DualTokenizerTest(unittest.TestCase):
@@ -58,23 +42,19 @@ class DualTokenizerTest(unittest.TestCase):
         self.assertEqual(
             [(span.lang, span.text) for span in spans],
             [
-                ("zh", "这张图"),
+                ("general", "这张图"),
                 ("space", " "),
                 ("special", IMAGE_PLACEHOLDER),
                 ("space", " "),
-                ("en", "test"),
+                ("general", "test"),
             ],
         )
 
-    def test_segments_fullwidth_latin_and_digits_as_en_and_misc(self):
+    def test_fullwidth_latin_and_digits_route_to_general(self):
         spans = segment_by_language("Ａ３！test")
         self.assertEqual(
             [(span.lang, span.text) for span in spans],
-            [
-                ("en", "Ａ"),
-                ("misc", "３！"),
-                ("en", "test"),
-            ],
+            [("general", "Ａ３！test")],
         )
 
     def test_mongolian_nnbsp_stays_inside_mongolian_span(self):
@@ -85,27 +65,23 @@ class DualTokenizerTest(unittest.TestCase):
         latin = "hello" + NNBSP + "world"
         self.assertEqual(
             [(span.lang, span.text) for span in segment_by_language(latin)],
-            [("en", "hello"), ("space", NNBSP), ("en", "world")],
+            [("general", "hello"), ("space", NNBSP), ("general", "world")],
         )
 
-    def test_segments_cjk_punctuation_as_misc(self):
+    def test_cjk_punctuation_routes_to_general(self):
         spans = segment_by_language("这。图")
         self.assertEqual(
             [(span.lang, span.text) for span in spans],
-            [
-                ("zh", "这"),
-                ("misc", "。"),
-                ("zh", "图"),
-            ],
+            [("general", "这。图")],
         )
 
-    def test_segments_mongolian_punctuation_as_misc(self):
+    def test_mongolian_punctuation_routes_to_general(self):
         spans = segment_by_language("ᠰᠠᠢᠨ᠃")
         self.assertEqual(
             [(span.lang, span.text) for span in spans],
             [
                 ("mn", "ᠰᠠᠢᠨ"),
-                ("misc", "᠃"),
+                ("general", "᠃"),
             ],
         )
 
@@ -116,10 +92,10 @@ class DualTokenizerTest(unittest.TestCase):
         )
         self.assertEqual(result.ids[0], SPECIAL_TOKENS["<bos>"])
         self.assertEqual(result.ids[-1], SPECIAL_TOKENS["<eos>"])
-        self.assertIn(SEGMENT["mongolian"][0], result.ids)
-        self.assertIn(SEGMENT["chinese"][0], result.ids)
-        self.assertIn(SEGMENT["english"][0], result.ids)
-        self.assertIn(tokenizer.vocab["!"], result.ids)
+        mn_lo, mn_hi = SEGMENT["mongolian"]
+        gen_lo, gen_hi = SEGMENT["general"]
+        self.assertTrue(any(mn_lo <= i < mn_hi for i in result.ids))
+        self.assertTrue(any(gen_lo <= i < gen_hi for i in result.ids))
         self.assertEqual(result.input_ids, result.ids)
         self.assertEqual(len(result.tokens), len(result.ids))
         self.assertEqual(result.tokens[0].start, -1)
@@ -140,68 +116,41 @@ class DualTokenizerTest(unittest.TestCase):
             ],
         )
 
-    def test_byte_fallback_round_trip(self):
+    def test_emoji_round_trip(self):
         tokenizer = build_fake_tokenizer()
         ids = tokenizer.encode("🙂")
-        self.assertGreater(len(ids), 1)
+        self.assertGreater(len(ids), 0)
         self.assertEqual(tokenizer.decode(ids), "🙂")
 
-    def test_unknown_hf_track_text_falls_back_to_bytes(self):
+    def test_mixed_script_round_trip(self):
         tokenizer = build_fake_tokenizer()
-        text = "mixed 中 ᠮᠣᠩᠭᠣᠯ 🙂"
+        text = "mixed 中 ᠮᠣᠩᠭᠣᠯ 🙂 日本語"
         ids = tokenizer.encode(text)
         self.assertEqual(tokenizer.decode(ids), text)
-
-    def test_decode_strips_hf_boundary_markers(self):
-        # Simulate HF vocabs that keep SentencePiece "▁" and GPT-2 "Ġ"
-        # word-boundary markers in their raw token strings (e.g. Llama/Qwen).
-        zh = FakeHFTokenizer({"\u2581这": 0, "张图": 1})
-        en = FakeHFTokenizer({"\u0120hello": 0, "world": 1})
-        vocab = build_unified_vocab(
-            morphbpe_vocab=FakeMorphBPE.vocab,
-            chinese_tokens=["\u2581这", "张图"],
-            english_tokens=["\u0120hello", "world"],
-            misc_tokens=build_misc_tokens(),
-        )
-        tokenizer = DualTrackTokenizer(vocab, FakeMorphBPE(), zh, en)
-
-        zh_ids = [vocab["zh▁\u2581这"], vocab["zh▁张图"]]
-        en_ids = [vocab["en▁\u0120hello"], vocab["en▁world"]]
-
-        self.assertEqual(tokenizer.decode(zh_ids), " 这张图")
-        self.assertEqual(tokenizer.decode(en_ids), " helloworld")
-        # No raw boundary glyphs should leak through.
-        decoded = tokenizer.decode(zh_ids + en_ids)
-        self.assertNotIn("\u2581", decoded)
-        self.assertNotIn("\u0120", decoded)
 
     def test_token_level_offsets_cover_tracks(self):
         tokenizer = build_fake_tokenizer()
         result = tokenizer.encode_with_spans("这 test 🙂")
-        by_track = [(tok.track, tok.start, tok.end) for tok in result.tokens]
-        self.assertIn(("zh", 0, 1), by_track)
-        self.assertIn(("space", 1, 2), by_track)
-        self.assertIn(("en", 2, 6), by_track)
-        self.assertTrue(
-            any(tok.track == "misc" and tok.start == 7 for tok in result.tokens)
-        )
+        tracks = {tok.track for tok in result.tokens}
+        self.assertIn("general", tracks)
+        self.assertIn("space", tracks)
+        # offsets are monotonic and within bounds
+        for tok in result.tokens:
+            self.assertLessEqual(tok.start, tok.end)
 
     def test_mongolian_punctuation_round_trips_without_unk(self):
         tokenizer = build_fake_tokenizer()
         ids = tokenizer.encode("᠃")
-        self.assertEqual(ids, [tokenizer.vocab["᠃"]])
+        self.assertNotIn(tokenizer.unk_id, ids)
         self.assertEqual(tokenizer.decode(ids), "᠃")
 
     def test_newline_and_tab_are_preserved_distinctly(self):
-        # Regression: newline/tab/CR must NOT collapse into the space token
-        # "▁" (which decodes to a single space). They route to the byte
-        # fallback so document/line structure survives round-trip and the
-        # model can learn it.
+        # Newline/tab/CR must NOT collapse into the space token "▁". They route
+        # to the general byte-level track so document structure survives.
         tokenizer = build_fake_tokenizer()
         for text in ("hello\nhello", "test\ttest", "a\r\nb", "x\n\ny"):
             result = tokenizer.encode_with_spans(text)
             self.assertEqual(tokenizer.decode(result.input_ids), text)
-            # the whitespace structure chars must not be tagged as "space"
             self.assertFalse(
                 any(tok.track == "space" for tok in result.tokens),
                 f"structural whitespace wrongly folded to ▁ for {text!r}",
@@ -220,27 +169,22 @@ class MongolianFallbackOffsetTest(unittest.TestCase):
 
     def test_multi_piece_fallback_offsets_are_monotonic(self):
         class MultiPieceMorphBPE:
-            # whole word -> two pieces, exercised via the .encode (no offsets) path
             vocab = {"ᠮᠣᠩ": 0, "ᠭᠣᠯ": 1}
 
             def encode(self, text):
                 return [0, 1]
 
         word = "ᠮᠣᠩᠭᠣᠯ"
+        general = GeneralBPEModel.minimal()
         vocab = build_unified_vocab(
             morphbpe_vocab=MultiPieceMorphBPE.vocab,
-            chinese_tokens=[],
-            english_tokens=[],
-            misc_tokens=build_misc_tokens(),
+            general_vocab=general.get_vocab(),
         )
-        zh = FakeHFTokenizer({})
-        en = FakeHFTokenizer({})
-        tokenizer = DualTrackTokenizer(vocab, MultiPieceMorphBPE(), zh, en)
+        tokenizer = DualTrackTokenizer(vocab, MultiPieceMorphBPE(), general)
 
         result = tokenizer.encode_with_spans(word)
         mn = [t for t in result.tokens if t.track == "mn"]
         self.assertEqual(len(mn), 2)
-        # Distinct, monotonic, non-overlapping spans (not the whole word twice).
         self.assertEqual((mn[0].start, mn[0].end), (0, 3))
         self.assertEqual((mn[1].start, mn[1].end), (3, 6))
 

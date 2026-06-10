@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -29,27 +30,34 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from Model.config import (
+from Model.config import (  # noqa: E402
+    IGNORE_INDEX,
     PAD_ID,
     RDTConfig,
     TrainingConfig,
     base_config,
     pretrain_config,
+    segmented_pretrain_config,
+    segmented_tiny_config,
     small_config,
     tiny_config,
+    two_stage_pretrain_config,
+    two_stage_tiny_config,
 )
-from Model.model import RDTForCausalLM
-from Model.training import (
+from Model.model import RDTForCausalLM  # noqa: E402
+from Model.layers.mamba3_layer import official_available  # noqa: E402
+from Model.training import (  # noqa: E402
     PretrainingCollator,
     RankZeroLogger,
     TrainState,
+    add_multimodal_args,
     apply_parallelism,
     build_dataloader,
     build_image_processor,
     build_omvt_cfg,
-    add_multimodal_args,
     build_optimizer,
     build_scheduler,
+    destroy_distributed,
     evaluate,
     init_distributed,
     is_main_process,
@@ -66,6 +74,10 @@ CONFIG_CHOICES = {
     "small": small_config,
     "base": base_config,
     "pretrain": pretrain_config,
+    "two_stage_tiny": two_stage_tiny_config,
+    "two_stage_pretrain": two_stage_pretrain_config,
+    "segmented_tiny": segmented_tiny_config,
+    "segmented_pretrain": segmented_pretrain_config,
 }
 
 
@@ -83,16 +95,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--resume", default="")
     p.add_argument("--dist", choices=["single", "ddp", "fsdp"], default="single")
     p.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
+    p.add_argument(
+        "--mamba",
+        choices=["auto", "official", "naive"],
+        default="auto",
+        help=(
+            "Mamba backend selection. 'auto' (default) uses official CUDA "
+            "Mamba on CUDA/Linux and NaiveSSM on macOS/CPU; 'official' fails "
+            "fast unless a CUDA-matched mamba_ssm is usable; 'naive' forces "
+            "the fallback for macOS or cached decoding."
+        ),
+    )
     p.add_argument("--seq-len", type=int, default=None)
     p.add_argument("--micro-batch-size", type=int, default=1)
     p.add_argument("--grad-accum-steps", type=int, default=1)
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.1)
+    p.add_argument("--optimizer", choices=["adamw", "muon"], default="adamw")
+    p.add_argument("--adam-use-atan2", action="store_true")
+    p.add_argument("--muon-momentum", type=float, default=0.95)
+    p.add_argument("--muon-ns-steps", type=int, default=5)
     p.add_argument("--max-steps", type=int, default=100_000)
     p.add_argument("--warmup-steps", type=int, default=2000)
+    p.add_argument("--lr-decay-steps", type=int, default=None)
+    p.add_argument("--min-lr-ratio", type=float, default=0.1)
+    p.add_argument("--lr-schedule", choices=["cosine", "wsd"], default="cosine")
+    p.add_argument("--wsd-stable-ratio", type=float, default=0.8)
+    p.add_argument(
+        "--wsd-decay-shape",
+        choices=["1-sqrt", "linear", "cosine"],
+        default="1-sqrt",
+    )
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--eval-every", type=int, default=1000)
+    p.add_argument("--eval-max-batches", type=int, default=32)
+    p.add_argument(
+        "--min-supervised-rate",
+        type=float,
+        default=0.01,
+        help=(
+            "minimum supervised label ratio required in prebuilt JSONL shards; "
+            "set 0 only to explicitly disable this safety gate"
+        ),
+    )
+    p.add_argument(
+        "--data-gate-rows",
+        type=int,
+        default=10_000,
+        help="number of JSONL rows sampled for pretraining data gate; 0 scans all rows",
+    )
     p.add_argument("--bptt-window", type=int, default=None)
     p.add_argument(
         "--rec-steps-sampling",
@@ -112,6 +165,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="cap for sampled depth (default: 2x target steps)",
     )
     p.add_argument("--rec-steps-sigma", type=float, default=0.5)
+    p.add_argument("--recurrent-steps-start", type=int, default=None)
+    p.add_argument("--recurrent-steps-ramp", type=int, default=0)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--dist-backend", choices=["nccl", "gloo"], default="nccl")
     p.add_argument(
@@ -138,12 +193,88 @@ def _tri_to_bool(value: str) -> bool | None:
     return value == "on"
 
 
+def _official_mamba_usable(device: str | torch.device | None = None) -> tuple[bool, str]:
+    """Return whether this host should run the official CUDA Mamba backend."""
+
+    if device is not None:
+        try:
+            device_type = torch.device(device).type
+        except (RuntimeError, TypeError) as exc:
+            return False, f"invalid target device {device!r}: {exc}"
+        if device_type != "cuda":
+            return False, f"target device is {device_type}, not cuda"
+    host_os = platform.system()
+    if host_os == "Darwin":
+        return False, "macOS uses the NaiveSSM fallback"
+    if host_os != "Linux":
+        return False, f"{host_os} is not Linux"
+    if not torch.cuda.is_available():
+        return False, "CUDA is not available"
+    if not official_available():
+        return False, "mamba_ssm is not importable"
+    return True, "official CUDA Mamba is available"
+
+
+def _resolve_mamba_backend(
+    cfg: RDTConfig,
+    mode: str,
+    *,
+    use_cache: bool = False,
+    device: str | torch.device | None = None,
+    context: str = "scripts.train_rdt",
+) -> RDTConfig:
+    """Apply the ``--mamba`` override using deployment-oriented defaults.
+
+    * ``official`` forces ``use_official_mamba=True`` (model construction will
+      raise a clear error if the kernel is unusable).
+    * ``naive`` forces the pure-PyTorch fallback, which is the expected macOS
+      path and the only backend that supports incremental decode cache.
+    * ``auto`` means production by default: use official Mamba on CUDA/Linux,
+      otherwise use NaiveSSM. This deliberately overrides tiny configs on CUDA
+      so smoke tests exercise the same backend as pretraining.
+    """
+
+    if use_cache and mode != "naive":
+        raise ValueError(
+            f"{context}: --use-cache requires --mamba naive and a NaiveSSM "
+            "checkpoint; official Mamba kernels are not steppable by the decode "
+            "cache, and official/naive checkpoints are not interchangeable."
+        )
+
+    if mode == "official":
+        usable, reason = _official_mamba_usable(device=device)
+        if not usable:
+            raise RuntimeError(
+                f"{context}: --mamba official requested but official Mamba is "
+                f"not usable on this host ({reason}). Use --mamba naive on "
+                "macOS/CPU, or install a CUDA-matched mamba-ssm wheel."
+            )
+        return replace(cfg, use_official_mamba=True)
+    if mode == "naive":
+        return replace(cfg, use_official_mamba=False)
+
+    usable, reason = _official_mamba_usable(device=device)
+    if usable:
+        return replace(cfg, use_official_mamba=True)
+
+    if cfg.use_official_mamba:
+        sys.stderr.write(
+            "WARNING: --mamba=auto falling back to NaiveSSM because "
+            f"{reason}. This is expected for local fallback runs (macOS, "
+            "CPU-only/CPU-target, or unsupported OSes); CUDA/Linux training "
+            "should use --mamba=official to fail fast if the official backend "
+            "is missing.\n"
+        )
+    return replace(cfg, use_official_mamba=False)
+
+
 def _build_model_cfg(args: argparse.Namespace) -> RDTConfig:
     cfg = CONFIG_CHOICES[args.config]()
     if args.seq_len is not None:
         cfg = replace(cfg, max_seq_len=args.seq_len)
     if args.smoke and args.seq_len is None:
         cfg = replace(cfg, max_seq_len=64)
+    cfg = _resolve_mamba_backend(cfg, args.mamba)
     return cfg
 
 
@@ -170,10 +301,19 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         micro_batch_size=args.micro_batch_size,
         grad_accum_steps=args.grad_accum_steps,
         num_workers=args.num_workers if not args.smoke else 0,
+        optimizer=args.optimizer,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        adam_use_atan2=args.adam_use_atan2,
+        muon_momentum=args.muon_momentum,
+        muon_ns_steps=args.muon_ns_steps,
         max_steps=4 if args.smoke else args.max_steps,
         warmup_steps=1 if args.smoke else args.warmup_steps,
+        lr_decay_steps=args.lr_decay_steps,
+        min_lr_ratio=args.min_lr_ratio,
+        lr_schedule=args.lr_schedule,
+        wsd_stable_ratio=args.wsd_stable_ratio,
+        wsd_decay_shape=args.wsd_decay_shape,
         precision=args.precision,
         grad_clip=args.grad_clip,
         parallel=args.dist,
@@ -183,14 +323,33 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         output_dir=args.output,
         save_every=args.save_every,
         log_every=args.log_every,
+        eval_every=args.eval_every,
+        eval_max_batches=args.eval_max_batches,
         bptt_window=args.bptt_window,
         recurrent_steps_sampling=args.rec_steps_sampling,
         recurrent_steps_min=args.rec_steps_min,
         recurrent_steps_max=args.rec_steps_max,
         recurrent_steps_sigma=args.rec_steps_sigma,
+        recurrent_steps_start=args.recurrent_steps_start,
+        recurrent_steps_ramp=args.recurrent_steps_ramp,
         seed=args.seed,
         resume=args.resume,
     )
+
+
+def _target_recurrent_steps_for_train(
+    model_cfg: RDTConfig,
+    train_cfg: TrainingConfig,
+) -> int | None:
+    """Return an explicit depth only when the training curriculum needs one.
+
+    Passing ``steps`` unconditionally disables ``SegmentedCore`` random-r
+    sampling. Let the model resolve its own depth unless a depth ramp is active.
+    """
+
+    if train_cfg.recurrent_steps_start is None or train_cfg.recurrent_steps_ramp <= 0:
+        return None
+    return model_cfg.recurrent_steps
 
 
 def _smoke_batches(model_cfg: RDTConfig, train_cfg: TrainingConfig):
@@ -206,6 +365,53 @@ def _smoke_batches(model_cfg: RDTConfig, train_cfg: TrainingConfig):
     collator = PretrainingCollator(max_seq_len=train_cfg.seq_len)
     while True:
         yield collator([row] * train_cfg.micro_batch_size)
+
+
+def _sample_supervision_metrics(shards: list[Path], max_rows: int) -> dict[str, float]:
+    rows_seen = 0
+    active_tokens = 0
+    supervised_tokens = 0
+    for shard in shards:
+        with shard.open("r", encoding="utf-8") as fh:
+            for line_no, line in enumerate(fh, start=1):
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid JSON in {shard}:{line_no}: {exc}") from exc
+                labels = row.get("labels")
+                if not isinstance(labels, list):
+                    raise ValueError(f"missing labels list in {shard}:{line_no}")
+                mask = row.get("attention_mask")
+                if mask is None:
+                    mask = [1] * len(labels)
+                if not isinstance(mask, list) or len(mask) != len(labels):
+                    raise ValueError(
+                        f"attention_mask must align with labels in {shard}:{line_no}"
+                    )
+                for label, active in zip(labels, mask):
+                    if int(active):
+                        active_tokens += 1
+                        if int(label) != IGNORE_INDEX:
+                            supervised_tokens += 1
+                rows_seen += 1
+                if max_rows > 0 and rows_seen >= max_rows:
+                    return {
+                        "rows": float(rows_seen),
+                        "active_tokens": float(active_tokens),
+                        "supervised_tokens": float(supervised_tokens),
+                        "supervised_rate": (
+                            supervised_tokens / active_tokens if active_tokens else 0.0
+                        ),
+                    }
+    return {
+        "rows": float(rows_seen),
+        "active_tokens": float(active_tokens),
+        "supervised_tokens": float(supervised_tokens),
+        "supervised_rate": supervised_tokens / active_tokens if active_tokens else 0.0,
+    }
 
 
 def _validate_args(args: argparse.Namespace) -> int:
@@ -238,6 +444,18 @@ def _validate_args(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    if not (0.0 <= args.min_supervised_rate <= 1.0):
+        print(
+            "scripts/train_rdt: --min-supervised-rate must be in [0, 1]",
+            file=sys.stderr,
+        )
+        return 2
+    if args.data_gate_rows < 0:
+        print(
+            "scripts/train_rdt: --data-gate-rows must be non-negative",
+            file=sys.stderr,
+        )
+        return 2
     # Resolve the data spec **here** rather than waiting for build_dataloader
     # so an empty glob (typo'd shard pattern) fails *before* we allocate a
     # multi-billion-parameter model and initialize the process group.
@@ -251,17 +469,72 @@ def _validate_args(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-    if not args.smoke and args.eval_data:
-        from Model.training.data import _resolve_shards
-
-        shards = _resolve_shards(args.eval_data)
-        if not shards:
-            print(
-                f"scripts/train_rdt: --eval-data resolved zero shards: {args.eval_data!r}",
-                file=sys.stderr,
-            )
-            return 2
+        if args.min_supervised_rate > 0:
+            try:
+                metrics = _sample_supervision_metrics(shards, args.data_gate_rows)
+            except ValueError as exc:
+                print(f"scripts/train_rdt: data gate failed: {exc}", file=sys.stderr)
+                return 2
+            if metrics["rows"] <= 0:
+                print(
+                    f"scripts/train_rdt: data gate found no JSONL rows: {args.data!r}",
+                    file=sys.stderr,
+                )
+                return 2
+            if metrics["active_tokens"] <= 0:
+                print(
+                    "scripts/train_rdt: data gate found zero active tokens in "
+                    f"{int(metrics['rows'])} sampled rows",
+                    file=sys.stderr,
+                )
+                return 2
+            if metrics["supervised_rate"] < args.min_supervised_rate:
+                print(
+                    "scripts/train_rdt: supervised_rate "
+                    f"{metrics['supervised_rate']:.6f} is below "
+                    f"{args.min_supervised_rate:.6f} over "
+                    f"{int(metrics['rows'])} sampled rows; check labels or pass "
+                    "--min-supervised-rate 0 only for an intentional unsupervised run.",
+                    file=sys.stderr,
+                )
+                return 2
+        if args.eval_data:
+            eval_shards = _resolve_shards(args.eval_data)
+            if not eval_shards:
+                print(
+                    f"scripts/train_rdt: --eval-data resolved zero shards: "
+                    f"{args.eval_data!r}",
+                    file=sys.stderr,
+                )
+                return 2
     return 0
+
+
+def _evaluate_distributed(
+    model,
+    eval_loader,
+    train_cfg: TrainingConfig,
+    *,
+    device: torch.device,
+) -> dict[str, float]:
+    metrics = evaluate(
+        model,
+        eval_loader,
+        train_cfg,
+        device=device,
+        max_batches=train_cfg.eval_max_batches,
+    )
+    tokens = float(metrics["eval_tokens"])
+    loss_sum = float(metrics["eval_loss"]) * tokens
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        packed = torch.tensor([loss_sum, tokens], device=device, dtype=torch.float64)
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+        loss_sum = float(packed[0].item())
+        tokens = float(packed[1].item())
+    return {
+        "eval_loss": loss_sum / max(1.0, tokens),
+        "eval_tokens": tokens,
+    }
 
 
 def _file_sha256(path: Path) -> str:
@@ -277,7 +550,13 @@ def _tokenizer_bundle_metadata(path: str) -> dict:
         return {}
     root = Path(path)
     files: dict[str, str] = {}
-    for name in ("config.json", "morphbpe.json", "vocab.json", "manifest.json"):
+    for name in (
+        "config.json",
+        "morphbpe.json",
+        "general.json",
+        "vocab.json",
+        "manifest.json",
+    ):
         candidate = root / name
         if candidate.exists():
             files[name] = _file_sha256(candidate)
@@ -333,7 +612,11 @@ def main(argv: list[str] | None = None) -> int:
     rc = _validate_args(args)
     if rc != 0:
         return rc
-    model_cfg_preview = _build_model_cfg(args)
+    try:
+        model_cfg_preview = _build_model_cfg(args)
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     train_cfg_preview = _build_train_cfg(args, model_cfg_preview)
     omvt_cfg = build_omvt_cfg(args)
     rank, world_size, local_rank = init_distributed(backend=train_cfg_preview.dist_backend)
@@ -387,6 +670,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.smoke:
         batch_iter = _smoke_batches(model_cfg, train_cfg)
+        eval_loader = None
     else:
         dataloader = build_dataloader(
             train_cfg.train_data,
@@ -398,19 +682,19 @@ def main(argv: list[str] | None = None) -> int:
             omvt_cfg=omvt_cfg,
         )
         batch_iter = iter(dataloader)
-
-    eval_dataloader = None
-    if not args.smoke and train_cfg.eval_data:
-        eval_dataloader = build_dataloader(
-            train_cfg.eval_data,
-            train_cfg,
-            world_size=world_size,
-            rank=rank,
-            pad_id=PAD_ID,
-            infinite=False,
-            image_processor=image_processor,
-            omvt_cfg=omvt_cfg,
-        )
+        eval_loader = None
+        if train_cfg.eval_data:
+            eval_loader = build_dataloader(
+                train_cfg.eval_data,
+                replace(train_cfg, shuffle_buffer=0),
+                world_size=world_size,
+                rank=rank,
+                pad_id=PAD_ID,
+                infinite=False,
+                drop_last=False,
+                image_processor=build_image_processor(args),
+                omvt_cfg=omvt_cfg,
+            )
 
     logger = RankZeroLogger(train_cfg.output_dir, enable_tensorboard=train_cfg.tensorboard)
     reporter = None
@@ -427,6 +711,7 @@ def main(argv: list[str] | None = None) -> int:
     stop_requested = False
     t0 = time.time()
     tokens_window = 0
+    completed = False
     try:
         while state.step < train_cfg.max_steps and not stop_requested:
             metrics = train_one_step(
@@ -437,7 +722,10 @@ def main(argv: list[str] | None = None) -> int:
                 train_cfg,
                 state,
                 device=device,
-                target_recurrent_steps=model_cfg.recurrent_steps,
+                target_recurrent_steps=_target_recurrent_steps_for_train(
+                    model_cfg,
+                    train_cfg,
+                ),
             )
             tokens_window += int(metrics["tokens"])
 
@@ -459,17 +747,16 @@ def main(argv: list[str] | None = None) -> int:
                 commands = box[0]
 
             want_eval = (
-                eval_dataloader is not None
+                eval_loader is not None
                 and train_cfg.eval_every
                 and state.step % train_cfg.eval_every == 0
-            ) or ("eval" in commands and eval_dataloader is not None)
+            ) or ("eval" in commands and eval_loader is not None)
             if want_eval:
-                eval_metrics = evaluate(
+                eval_metrics = _evaluate_distributed(
                     model,
-                    iter(eval_dataloader),
+                    eval_loader,
                     train_cfg,
                     device=device,
-                    max_batches=train_cfg.eval_max_batches,
                 )
                 logger.log(state.step, eval_metrics)
                 if reporter is not None:
@@ -494,29 +781,33 @@ def main(argv: list[str] | None = None) -> int:
 
             if "stop" in commands:
                 stop_requested = True
+        completed = True
     finally:
-        logger.close()
-        if reporter is not None:
-            reporter.finish(
-                state="stopped" if stop_requested else "finished",
-                step=state.step,
-            )
-        # NOTE: `save_checkpoint` is a collective under FSDP (the
-        # `state_dict(FullStateDictConfig)` call gathers from every rank),
-        # so we must enter it on every rank; the helper internally limits
-        # the actual file write to rank 0. Guarding the call with
-        # `is_main_process()` would deadlock rank 0 at shutdown.
-        if not args.smoke:
-            save_checkpoint(
-                train_cfg.output_dir,
-                state.step,
-                model,
-                optimizer,
-                scheduler,
-                metadata={**run_metadata, "checkpoint": "final"},
-                keep_last_n=train_cfg.keep_last_n,
-                scaler=state.extra.get("grad_scaler"),
-            )
+        try:
+            logger.close()
+            if reporter is not None:
+                reporter.finish(
+                    state="stopped" if stop_requested else "finished",
+                    step=state.step,
+                )
+            # NOTE: `save_checkpoint` is a collective under FSDP (the
+            # `state_dict(FullStateDictConfig)` call gathers from every rank),
+            # so we must enter it on every rank; the helper internally limits
+            # the actual file write to rank 0. Guarding the call with
+            # `is_main_process()` would deadlock rank 0 at shutdown.
+            if completed and not args.smoke:
+                save_checkpoint(
+                    train_cfg.output_dir,
+                    state.step,
+                    model,
+                    optimizer,
+                    scheduler,
+                    metadata={**run_metadata, "checkpoint": "final"},
+                    keep_last_n=train_cfg.keep_last_n,
+                    scaler=state.extra.get("grad_scaler"),
+                )
+        finally:
+            destroy_distributed()
     return 0
 
 

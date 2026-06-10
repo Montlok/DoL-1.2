@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -24,7 +25,6 @@ from Model.config import (
     OMVTConfig,
     PAD_ID,
     TrainingConfig,
-    tiny_config,
 )
 from Model.model import RDTForCausalLM
 from Model.omvt import OMVTInjector
@@ -35,14 +35,29 @@ from Model.training import (
     build_dataloader,
     build_optimizer,
     build_scheduler,
+    clip_or_check_grad_norm,
+    load_checkpoint,
+    resume_state,
+    save_checkpoint,
     train_one_step,
 )
 from Tokenizer.multimodal import PILImageProcessor
 from Tokenizer.multimodal.image_placeholders import image_patch_count
+from scripts.train_rdt import CONFIG_CHOICES, _resolve_mamba_backend
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser()
+    p.add_argument("--config", choices=list(CONFIG_CHOICES), default="tiny")
+    p.add_argument(
+        "--mamba",
+        choices=["auto", "official", "naive"],
+        default="auto",
+        help=(
+            "Mamba backend for the RDT side. auto uses official CUDA Mamba on "
+            "CUDA/Linux and NaiveSSM on macOS/CPU."
+        ),
+    )
     p.add_argument("--steps", type=int, default=4)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--image-size", type=int, default=56)
@@ -61,6 +76,10 @@ def parse_args(argv=None):
     )
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--output", default="outputs/vlm_align")
+    p.add_argument("--init-rdt-checkpoint", default="")
+    p.add_argument("--init-omvt-checkpoint", default="")
+    p.add_argument("--resume", default="")
+    p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args(argv)
@@ -99,6 +118,53 @@ def _make_text_batch(args, vocab_floor=300, vocab_ceil=320):
     return input_ids, attention_mask, labels
 
 
+def _resolve_model_state(path: str):
+    p = Path(path)
+    if p.is_file():
+        state = torch.load(p, map_location="cpu", weights_only=False)
+    else:
+        state = load_checkpoint(p).model_state
+    if isinstance(state, dict) and "model" in state and "embed.weight" not in state:
+        state = state["model"]
+    return state
+
+
+def _load_rdt_init(model: RDTForCausalLM, path: str) -> None:
+    if not path:
+        return
+    missing, unexpected = model.load_state_dict(_resolve_model_state(path), strict=False)
+    if missing or unexpected:
+        print(
+            f"[init] loaded RDT checkpoint {path} "
+            f"(missing={len(missing)} unexpected={len(unexpected)})"
+        )
+
+
+def _resolve_omvt_state(path: str):
+    p = Path(path)
+    if p.is_dir():
+        candidates = [
+            p / "omvt_ssl.pt",
+            p / "latest" / "omvt_ssl.pt",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                p = candidate
+                break
+    if not p.exists():
+        raise FileNotFoundError(f"OMVT checkpoint not found: {path}")
+    payload = torch.load(p, map_location="cpu", weights_only=False)
+    return payload["tower"] if isinstance(payload, dict) and "tower" in payload else payload
+
+
+def _load_omvt_init(model: RDTForCausalLM, path: str) -> None:
+    if not path:
+        return
+    if model.vision.omvt is None:
+        raise ValueError("OMVT injector must be installed before loading tower weights")
+    model.vision.omvt.tower.load_state_dict(_resolve_omvt_state(path))
+
+
 def main(argv=None):
     args = parse_args(argv)
     # Fast-fail validation **before** any device alloc / model construction
@@ -121,15 +187,31 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 2
+    if args.resume and (args.init_rdt_checkpoint or args.init_omvt_checkpoint):
+        print(
+            "scripts/train_vlm_align: --resume cannot be combined with "
+            "--init-rdt-checkpoint or --init-omvt-checkpoint",
+            file=sys.stderr,
+        )
+        return 2
 
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    rdt_cfg = tiny_config()
+    rdt_cfg = CONFIG_CHOICES[args.config]()
     # cap seq_len to the synthetic layout (tiny config is 2048 by default but
     # the smoke layout is much shorter)
-    from dataclasses import replace
     rdt_cfg = replace(rdt_cfg, max_seq_len=args.seq_len)
+    try:
+        rdt_cfg = _resolve_mamba_backend(
+            rdt_cfg,
+            args.mamba,
+            device=device,
+            context="scripts.train_vlm_align",
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     omvt_cfg = _build_omvt_cfg(args)
 
@@ -138,6 +220,8 @@ def main(argv=None):
     # a default-sized one on first forward and fail on tiny synthetic inputs).
     model.vision._omvt_cfg = omvt_cfg
     model.vision.omvt = OMVTInjector(rdt_cfg, omvt_cfg).to(device)
+    _load_rdt_init(model, args.init_rdt_checkpoint)
+    _load_omvt_init(model, args.init_omvt_checkpoint)
 
     if args.freeze_rdt:
         for p in model.parameters():
@@ -145,7 +229,7 @@ def main(argv=None):
         for p in model.vision.omvt.parameters():
             p.requires_grad_(True)
     if args.frozen_vision:
-        for p in model.vision.omvt.parameters():
+        for p in model.vision.omvt.tower.parameters():
             p.requires_grad_(False)
 
     train_cfg = TrainingConfig(
@@ -157,80 +241,125 @@ def main(argv=None):
         max_steps=args.steps,
         warmup_steps=1,
         precision="fp32",
+        output_dir=args.output,
+        save_every=args.save_every,
+        resume=args.resume,
     )
     trainable = [p for p in model.parameters() if p.requires_grad]
     if not trainable:
         raise ValueError("model has no trainable parameters")
     optimizer = build_optimizer(model, train_cfg)
     scheduler = build_scheduler(optimizer, train_cfg)
+    state = TrainState()
+    if args.resume:
+        state.step = resume_state(
+            args.resume,
+            model,
+            optimizer,
+            scheduler,
+            state=state,
+        )
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
     logger = RankZeroLogger(args.output, enable_tensorboard=False)
 
     t0 = time.time()
-    if args.data:
-        # Real-data path: pull pixel-aware batches from the streaming
-        # JSONL dataloader and reuse the canonical train_one_step so
-        # CLI behaviour matches train_rdt.
-        dataloader = build_dataloader(
-            args.data,
-            train_cfg,
-            world_size=1,
-            rank=0,
-            pad_id=PAD_ID,
-            image_processor=PILImageProcessor(image_size=args.image_size),
-            omvt_cfg=omvt_cfg,
-        )
-        batch_iter = iter(dataloader)
-        state = TrainState()
-        while state.step < args.steps:
-            metrics = train_one_step(
+    completed = False
+    try:
+        if args.data:
+            # Real-data path: pull pixel-aware batches from the streaming
+            # JSONL dataloader and reuse the canonical train_one_step so
+            # CLI behaviour matches train_rdt.
+            dataloader = build_dataloader(
+                args.data,
+                train_cfg,
+                world_size=1,
+                rank=0,
+                pad_id=PAD_ID,
+                image_processor=PILImageProcessor(image_size=args.image_size),
+                omvt_cfg=omvt_cfg,
+            )
+            batch_iter = iter(dataloader)
+            while state.step < args.steps:
+                metrics = train_one_step(
+                    model,
+                    batch_iter,
+                    optimizer,
+                    scheduler,
+                    train_cfg,
+                    state,
+                    device=device,
+                )
+                logger.log(state.step, {"loss": metrics["loss"]})
+                if args.save_every and state.step % args.save_every == 0:
+                    save_checkpoint(
+                        args.output,
+                        state.step,
+                        model,
+                        optimizer,
+                        scheduler,
+                        metadata={"phase": "vlm_align", "config": args.config},
+                    )
+        else:
+            while state.step < args.steps:
+                step = state.step + 1
+                input_ids, attention_mask, labels = _make_text_batch(args)
+                input_ids = input_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                labels = labels.to(device)
+
+                images = torch.randn(
+                    args.batch_size,
+                    omvt_cfg.in_channels,
+                    omvt_cfg.image_size,
+                    omvt_cfg.image_size,
+                    device=device,
+                )
+                batch = collate_omvt_batch(images, omvt_cfg)
+
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    pixel_values=dict(batch),
+                )
+                loss = out["loss"]
+                if not bool(torch.isfinite(loss.detach())):
+                    raise FloatingPointError(
+                        f"non-finite VLM align loss at step {state.step}"
+                    )
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                clip_or_check_grad_norm(model, 1.0, step=step)
+                optimizer.step()
+                scheduler.step()
+                state.step = step
+
+                logger.log(step, {"loss": float(loss.detach())})
+                if args.save_every and step % args.save_every == 0:
+                    save_checkpoint(
+                        args.output,
+                        step,
+                        model,
+                        optimizer,
+                        scheduler,
+                        metadata={"phase": "vlm_align", "config": args.config},
+                    )
+        completed = True
+    finally:
+        logger.close()
+        if completed and not args.smoke:
+            save_checkpoint(
+                args.output,
+                state.step,
                 model,
-                batch_iter,
                 optimizer,
                 scheduler,
-                train_cfg,
-                state,
-                device=device,
+                metadata={"phase": "vlm_align", "config": args.config, "final": True},
             )
-            logger.log(state.step, {"loss": metrics["loss"]})
-        logger.close()
-        print(f"VLM align real-data run OK in {time.time() - t0:.1f}s")
-        return 0
-
-    for step in range(1, args.steps + 1):
-        input_ids, attention_mask, labels = _make_text_batch(args)
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        labels = labels.to(device)
-
-        images = torch.randn(
-            args.batch_size,
-            omvt_cfg.in_channels,
-            omvt_cfg.image_size,
-            omvt_cfg.image_size,
-            device=device,
-        )
-        batch = collate_omvt_batch(images, omvt_cfg)
-
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            pixel_values=dict(batch),
-        )
-        loss = out["loss"]
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(trainable, 1.0)
-        optimizer.step()
-        scheduler.step()
-
-        logger.log(step, {"loss": float(loss.detach())})
-
-    logger.close()
-    print(f"VLM align smoke OK in {time.time() - t0:.1f}s")
+    mode = "real-data" if args.data else "smoke"
+    print(f"VLM align {mode} run OK in {time.time() - t0:.1f}s")
     return 0
 
 

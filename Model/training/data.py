@@ -318,7 +318,7 @@ def _resolve_shards(spec: str | Sequence[str | Path]) -> list[Path]:
             # and is the right tool for user-supplied shard specs that may
             # be absolute mount paths like ``/mnt/corpus/*.jsonl``.
             return sorted(Path(p) for p in glob.glob(str(spec), recursive=True))
-        return [path]
+        return [path] if path.is_file() else []
     return [Path(p) for p in spec]
 
 
@@ -332,6 +332,7 @@ def build_dataloader(
     pad_id: int = PAD_ID,
     ignore_index: int = IGNORE_INDEX,
     infinite: bool = True,
+    drop_last: bool = True,
     image_processor: Any = None,
     omvt_cfg: Any = None,
 ) -> DataLoader:
@@ -346,6 +347,12 @@ def build_dataloader(
     paths = _resolve_shards(spec)
     if not paths:
         raise FileNotFoundError(f"no shards resolved from spec: {spec!r}")
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "resolved shard paths do not exist: "
+            + ", ".join(str(path) for path in missing[:5])
+        )
 
     dataset = StreamingJsonlDataset(
         paths,
@@ -371,7 +378,7 @@ def build_dataloader(
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
         collate_fn=collator,
-        drop_last=True,
+        drop_last=drop_last,
         persistent_workers=cfg.num_workers > 0,
     )
 

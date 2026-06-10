@@ -12,7 +12,7 @@ from .morphology import (
     derive_morph_info_from_offsets,
     derive_morph_info_from_tokens,
 )
-from .packing import pack_samples
+from .packing import iter_pack_samples, pack_samples
 
 __all__ = [
     "EncodedSample",
@@ -23,5 +23,6 @@ __all__ = [
     "derive_morph_info_from_tokens",
     "encoded_sample_to_dict",
     "nested_int_lists",
+    "iter_pack_samples",
     "pack_samples",
 ]

@@ -63,6 +63,13 @@ def init_distributed(backend: str | None = None) -> tuple[int, int, int]:
     return rank, world_size, local_rank
 
 
+def destroy_distributed() -> None:
+    """Tear down the torch.distributed process group if this process owns one."""
+
+    if is_distributed():
+        dist.destroy_process_group()
+
+
 def _transformer_block_classes() -> set[type]:
     from Model.blocks import (
         AttnSubLayer,
@@ -152,6 +159,7 @@ def apply_parallelism(
 
 __all__ = [
     "apply_parallelism",
+    "destroy_distributed",
     "get_rank",
     "get_world_size",
     "init_distributed",

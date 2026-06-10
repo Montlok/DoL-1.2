@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import io
 import unittest
+from unittest import mock
 
 from scripts import train_vlm_align
 
@@ -30,6 +31,27 @@ class TrainVlmAlignCliGuardsTest(unittest.TestCase):
             rc = train_vlm_align.main(["--image-size", "6", "--seq-len", "16"])
         self.assertEqual(rc, 2)
         self.assertIn("--image-size", stderr.getvalue())
+
+    def test_official_mamba_failure_returns_exit_code_two(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                train_vlm_align.torch.cuda,
+                "is_available",
+                return_value=False,
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = train_vlm_align.main([
+                "--mamba", "official",
+                "--image-size", "4",
+                "--n-image-tokens", "1",
+                "--seq-len", "8",
+            ])
+        self.assertEqual(rc, 2)
+        msg = stderr.getvalue()
+        self.assertIn("--mamba official", msg)
+        self.assertIn("target device is cpu", msg)
 
 
 if __name__ == "__main__":
