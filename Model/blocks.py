@@ -30,6 +30,7 @@ class StandardBlock(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        cache=None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.attn_norm(x),
@@ -37,6 +38,7 @@ class StandardBlock(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
+            cache=cache,
         )
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -61,6 +63,7 @@ class AttnSubLayer(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        cache=None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.attn_norm(x),
@@ -68,6 +71,7 @@ class AttnSubLayer(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
+            cache=cache,
         )
         x = x + self.ffn(self.ffn_norm(x))
         return x
@@ -87,12 +91,13 @@ class MambaSubLayer(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache=None,
         **kwargs,
     ) -> torch.Tensor:
-        x = self.mamba(x, attn_mask=attn_mask)
+        x = self.mamba(x, attn_mask=attn_mask, cache=cache)
         x = x + self.ffn(self.ffn_norm(x))
 
-        if attn_mask is not None:
+        if attn_mask is not None and cache is None:
             x = x * attn_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
 
         return x
@@ -165,14 +170,19 @@ class RecurrentBlock(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        caches: list | None = None,
     ) -> torch.Tensor:
-        for layer in self.layers:
+        if caches is not None and len(caches) != len(self.layers):
+            raise ValueError("caches must have one entry per sublayer")
+
+        for idx, layer in enumerate(self.layers):
             x = layer(
                 x,
                 word_pos=word_pos,
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
+                cache=caches[idx] if caches is not None else None,
             )
 
         return x

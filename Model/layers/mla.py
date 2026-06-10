@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from Model.cache import AttnCacheEntry
 from Model.layers.rope import MorphologicalRoPE, apply_rope
 
 
@@ -82,6 +83,7 @@ class MLA(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        cache: AttnCacheEntry | None = None,
     ) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError("x must have shape [B, L, d_model]")
@@ -93,6 +95,15 @@ class MLA(nn.Module):
 
         if attn_mask is not None and attn_mask.shape != (bsz, seq_len):
             raise ValueError("attn_mask must have shape [B, L]")
+
+        past_len = 0
+        if cache is not None:
+            if not causal:
+                raise ValueError("cached decoding requires causal attention")
+            if attn_mask is not None and not bool(attn_mask.bool().all()):
+                raise ValueError("cached decoding requires an all-ones attn_mask")
+            attn_mask = None
+            past_len = cache.past_len
 
         if word_pos is not None and word_pos.shape != (bsz, seq_len):
             raise ValueError("word_pos must have shape [B, L]")
@@ -111,6 +122,7 @@ class MLA(nn.Module):
             word_pos=word_pos,
             morph_depth=morph_depth,
             device=x.device,
+            pos_offset=past_len,
         )
 
         q_rope = apply_rope(q_rope, cos, sin)
@@ -119,7 +131,11 @@ class MLA(nn.Module):
         q = torch.cat([q_nope, q_rope], dim=-1)
         k = torch.cat([k_nope, k_rope], dim=-1)
 
-        out = self._attention(q, k, v, attn_mask=attn_mask, causal=causal)
+        if cache is not None:
+            k, v = cache.update(k, v)
+            out = self._attention_cached(q, k, v, past_len=past_len)
+        else:
+            out = self._attention(q, k, v, attn_mask=attn_mask, causal=causal)
         out = out.transpose(1, 2).reshape(bsz, seq_len, self.n_heads * self.head_dim)
         out = self.o_proj(out)
 
@@ -175,6 +191,48 @@ class MLA(nn.Module):
             return self._attention_sdpa(q, k, v, attn_mask=attn_mask, causal=causal)
 
         return self._attention_math(q, k, v, attn_mask=attn_mask, causal=causal)
+
+    def _attention_cached(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        past_len: int,
+    ) -> torch.Tensor:
+        """Causal attention where q covers only the last q_len tokens of k/v."""
+
+        q_len, k_len = q.shape[-2], k.shape[-2]
+        dropout_p = self.dropout if self.training and self.dropout > 0 else 0.0
+
+        if q_len == 1:
+            allowed = None
+        else:
+            # query i (global pos past_len + i) attends keys j <= past_len + i
+            allowed = torch.ones(
+                q_len,
+                k_len,
+                dtype=torch.bool,
+                device=q.device,
+            ).tril(diagonal=past_len).view(1, 1, q_len, k_len)
+
+        if self.use_sdpa:
+            return F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=allowed,
+                dropout_p=dropout_p,
+                is_causal=False,
+                scale=self.scale,
+            )
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if allowed is not None:
+            scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+        attn = F.softmax(scores.float(), dim=-1).to(dtype=q.dtype)
+        if dropout_p > 0:
+            attn = F.dropout(attn, p=dropout_p)
+        return torch.matmul(attn, v)
 
     def _attention_sdpa(
         self,

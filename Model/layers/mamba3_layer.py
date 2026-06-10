@@ -111,7 +111,9 @@ class NaiveSSM(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         if x.ndim != 3:
             raise ValueError("x must have shape [B, L, d_model]")
         if x.shape[-1] != self.d_model:
@@ -119,17 +121,44 @@ class NaiveSSM(nn.Module):
 
         bsz, seq_len, _ = x.shape
         dtype = x.dtype
+        incremental = state is not None or return_state
 
         mask = None
         if attn_mask is not None:
             if attn_mask.shape != (bsz, seq_len):
                 raise ValueError("attn_mask must have shape [B, L]")
-            mask = attn_mask.to(device=x.device, dtype=torch.float32)
+            if incremental:
+                if not bool(attn_mask.bool().all()):
+                    raise ValueError(
+                        "incremental NaiveSSM requires an all-ones attn_mask"
+                    )
+            else:
+                mask = attn_mask.to(device=x.device, dtype=torch.float32)
 
         xz = self.in_proj(x)
         u, z = xz.chunk(2, dim=-1)
 
-        u = self.conv1d(u.transpose(1, 2))[..., :seq_len].transpose(1, 2)
+        conv_buf: torch.Tensor | None = None
+        ssm_state: torch.Tensor | None = None
+        if state is not None:
+            conv_buf, ssm_state = state
+
+        u_t = u.transpose(1, 2)
+        if incremental:
+            if conv_buf is None:
+                conv_buf = u_t.new_zeros(bsz, self.d_inner, self.d_conv - 1)
+            # exact match with padding=d_conv-1 + right truncation on a fresh buffer
+            u_cat = torch.cat([conv_buf, u_t], dim=-1)
+            u = F.conv1d(
+                u_cat,
+                self.conv1d.weight,
+                self.conv1d.bias,
+                groups=self.d_inner,
+            ).transpose(1, 2)
+            new_conv_buf = u_cat[..., u_cat.shape[-1] - (self.d_conv - 1):]
+        else:
+            u = self.conv1d(u_t)[..., :seq_len].transpose(1, 2)
+            new_conv_buf = None
         u = F.silu(u)
 
         if mask is not None:
@@ -148,14 +177,17 @@ class NaiveSSM(nn.Module):
 
         a = -torch.exp(self.A_log.float())
 
-        state = torch.zeros(
-            bsz,
-            self.nheads,
-            self.headdim,
-            self.d_state,
-            device=x.device,
-            dtype=torch.float32,
-        )
+        if ssm_state is not None:
+            state_t = ssm_state.to(device=x.device, dtype=torch.float32)
+        else:
+            state_t = torch.zeros(
+                bsz,
+                self.nheads,
+                self.headdim,
+                self.d_state,
+                device=x.device,
+                dtype=torch.float32,
+            )
 
         ys: list[torch.Tensor] = []
 
@@ -168,14 +200,14 @@ class NaiveSSM(nn.Module):
             da = torch.exp(dt_t.unsqueeze(-1) * a.view(1, self.nheads, 1, self.d_state))
             bu = dt_t.unsqueeze(-1) * b_t * u_t.unsqueeze(-1)
 
-            next_state = state * da + bu
+            next_state = state_t * da + bu
             if mask is not None:
                 active = mask[:, t].view(bsz, 1, 1, 1).bool()
-                state = torch.where(active, next_state, state)
+                state_t = torch.where(active, next_state, state_t)
             else:
-                state = next_state
+                state_t = next_state
 
-            y_t = (state * c_t).sum(dim=-1)
+            y_t = (state_t * c_t).sum(dim=-1)
             y_t = y_t + self.D.view(1, self.nheads, 1) * u_t
             ys.append(y_t)
 
@@ -186,8 +218,12 @@ class NaiveSSM(nn.Module):
             y = y * mask.unsqueeze(-1).to(dtype=y.dtype)
 
         y = y * F.silu(z)
+        out = self.out_proj(y)
 
-        return self.out_proj(y)
+        if return_state:
+            assert new_conv_buf is not None
+            return out, (new_conv_buf, state_t)
+        return out
 
 
 class Mamba3Layer(nn.Module):
@@ -258,10 +294,20 @@ class Mamba3Layer(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache=None,
         **kwargs,
     ) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError("x must have shape [B, L, d_model]")
+
+        if cache is not None:
+            if attn_mask is not None and not bool(attn_mask.bool().all()):
+                raise ValueError(
+                    "cached decoding requires an all-ones attention mask"
+                )
+            residual = x
+            mamba_input = self.norm(residual)
+            return residual + self._forward_cached(mamba_input, cache)
 
         mask = None
         if attn_mask is not None:
@@ -292,6 +338,45 @@ class Mamba3Layer(nn.Module):
         if mask is not None:
             out = out * mask
         return out
+
+    def _forward_cached(self, mamba_input: torch.Tensor, cache) -> torch.Tensor:
+        """One incremental chunk through the SSM, persisting state in `cache`."""
+
+        if isinstance(self.mamba, NaiveSSM):
+            y, cache.state = self.mamba(
+                mamba_input,
+                state=cache.state,
+                return_state=True,
+            )
+            return y
+
+        # Official backend: reuse upstream InferenceParams machinery. One
+        # InferenceParams per cache slot, so the same shared module can hold
+        # independent state per recurrent step.
+        if self.layer_idx is None:
+            raise RuntimeError(
+                "cached decoding with the official Mamba backend requires layer_idx"
+            )
+
+        ip = cache.inference_params
+        if ip is None:
+            try:
+                from mamba_ssm.utils.generation import InferenceParams
+            except ImportError as exc:
+                raise RuntimeError(
+                    "cached decoding with the official Mamba backend requires "
+                    "mamba_ssm.utils.generation.InferenceParams"
+                ) from exc
+            ip = InferenceParams(
+                max_seqlen=self.cfg.max_seq_len,
+                max_batch_size=mamba_input.shape[0],
+            )
+            cache.inference_params = ip
+
+        ip.seqlen_offset = cache.seqlen_offset
+        y = self.mamba(mamba_input, inference_params=ip)
+        cache.seqlen_offset += mamba_input.shape[1]
+        return y
 
 
 def _is_right_padding_mask(attn_mask: torch.Tensor) -> bool:
