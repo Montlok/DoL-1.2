@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from Model.blocks import RecurrentBlock
+from Model.layers.rmsnorm import RMSNorm
 
 
 class RecurrentCore(nn.Module):
@@ -30,6 +31,10 @@ class RecurrentCore(nn.Module):
                 raise ValueError("act_max_steps must be positive")
             if not (0.0 < cfg.act_threshold <= 1.0):
                 raise ValueError("act_threshold must be in (0, 1]")
+            # The residual stream is unnormalized and its norm grows with
+            # the step index; normalize before the halting head so the
+            # halt logit reads token content, not loop progress.
+            self.halt_norm = RMSNorm(cfg.d_model, eps=cfg.rmsnorm_eps)
             self.halt_proj = nn.Linear(cfg.d_model, 1)
 
     def forward(
@@ -41,10 +46,16 @@ class RecurrentCore(nn.Module):
         causal: bool = True,
         steps: int | None = None,
         bptt_window: int | None = None,
+        cache=None,
     ) -> tuple[torch.Tensor, dict]:
         self._check_inputs(e0, word_pos, morph_depth, attn_mask)
 
         if self.use_act:
+            if cache is not None:
+                raise NotImplementedError(
+                    "cached decoding is not supported with ACT; "
+                    "use fixed recurrent steps for generation"
+                )
             return self._forward_act(
                 e0=e0,
                 word_pos=word_pos,
@@ -61,6 +72,7 @@ class RecurrentCore(nn.Module):
             causal=causal,
             steps=steps,
             bptt_window=bptt_window,
+            cache=cache,
         )
 
     def _forward_fixed(
@@ -72,6 +84,7 @@ class RecurrentCore(nn.Module):
         causal: bool,
         steps: int | None,
         bptt_window: int | None,
+        cache=None,
     ) -> tuple[torch.Tensor, dict]:
         total_steps = int(steps if steps is not None else self.cfg.recurrent_steps)
 
@@ -83,6 +96,9 @@ class RecurrentCore(nn.Module):
                 raise ValueError("bptt_window must be positive")
             bptt_window = min(bptt_window, total_steps)
 
+        n_layers = len(self.block.layers)
+        layer_types = self.block.layer_types
+
         h = e0
 
         for idx in range(total_steps):
@@ -92,12 +108,23 @@ class RecurrentCore(nn.Module):
             if self.inject:
                 h = h + self.inject_scale * e0
 
+            step_caches = None
+            if cache is not None:
+                # one independent slot per (unroll step, sublayer)
+                step_caches = [
+                    cache.attn_entry(("rec", idx, li))
+                    if layer_types[li] == "attn"
+                    else cache.mamba_entry(("rec", idx, li))
+                    for li in range(n_layers)
+                ]
+
             h = self._run_block(
                 h,
                 word_pos=word_pos,
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
+                caches=step_caches,
             )
 
         return h, {
@@ -112,8 +139,9 @@ class RecurrentCore(nn.Module):
         morph_depth: torch.Tensor | None,
         attn_mask: torch.Tensor | None,
         causal: bool,
+        caches: list | None = None,
     ) -> torch.Tensor:
-        if self.grad_ckpt and self.training and h.requires_grad:
+        if self.grad_ckpt and self.training and h.requires_grad and caches is None:
             def _fn(h_in):
                 return self.block(
                     h_in,
@@ -130,6 +158,7 @@ class RecurrentCore(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
+            caches=caches,
         )
 
     def _forward_act(
@@ -165,7 +194,7 @@ class RecurrentCore(nn.Module):
                 causal=causal,
             )
 
-            p = torch.sigmoid(self.halt_proj(h)).squeeze(-1).float()
+            p = torch.sigmoid(self.halt_proj(self.halt_norm(h))).squeeze(-1).float()
             p = p * running
 
             new_halt = halt_accum + p

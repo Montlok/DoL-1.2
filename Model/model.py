@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from Model.blocks import StandardBlock
+from Model.cache import RDTCache
 from Model.config import RDTConfig
 from Model.layers.rmsnorm import RMSNorm
 from Model.recurrent import RecurrentCore
@@ -50,6 +51,7 @@ class RDTForCausalLM(nn.Module):
             self.reverse_head = None
 
         self.apply(self._init_weights)
+        self._scale_residual_projections()
 
         if cfg.tie_word_embeddings:
             self.lm_head.weight = self.embed.weight
@@ -68,14 +70,28 @@ class RDTForCausalLM(nn.Module):
         bptt_window: int | None = None,
         return_logits: bool = True,
         loss_chunk_size: int | None = None,
+        cache=None,
     ) -> dict[str, torch.Tensor | dict | None]:
-        self._check_inputs(input_ids, attention_mask, labels)
+        past_len = 0 if cache is None else cache.seq_len
+        self._check_inputs(input_ids, attention_mask, labels, past_len=past_len)
         if loss_chunk_size is None:
             loss_chunk_size = self.cfg.loss_chunk_size
         elif loss_chunk_size <= 0:
             raise ValueError("loss_chunk_size must be positive")
 
         bsz, seq_len = input_ids.shape
+
+        if cache is not None:
+            if attention_mask is not None and not bool(attention_mask.bool().all()):
+                raise ValueError(
+                    "cached decoding requires an all-ones attention_mask"
+                )
+            attention_mask = torch.ones_like(input_ids)
+            if past_len > 0 and (word_pos is None or morph_depth is None):
+                raise ValueError(
+                    "incremental decoding requires explicit word_pos/morph_depth "
+                    "(derive on the full sequence and slice the new positions)"
+                )
 
         if attention_mask is None:
             attention_mask = (input_ids != self.cfg.pad_id).long()
@@ -91,7 +107,7 @@ class RDTForCausalLM(nn.Module):
         if pixel_values is not None:
             h = self.vision(h, input_ids, pixel_values)
 
-        for block in self.prelude:
+        for i, block in enumerate(self.prelude):
             h = self._maybe_ckpt(
                 block,
                 h,
@@ -99,6 +115,7 @@ class RDTForCausalLM(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attention_mask,
                 causal=True,
+                cache_entry=cache.attn_entry(("prelude", i)) if cache is not None else None,
             )
 
         e0 = h
@@ -111,9 +128,10 @@ class RDTForCausalLM(nn.Module):
             causal=True,
             steps=steps,
             bptt_window=bptt_window,
+            cache=cache,
         )
 
-        for block in self.coda:
+        for i, block in enumerate(self.coda):
             h = self._maybe_ckpt(
                 block,
                 h,
@@ -121,7 +139,11 @@ class RDTForCausalLM(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attention_mask,
                 causal=True,
+                cache_entry=cache.attn_entry(("coda", i)) if cache is not None else None,
             )
+
+        if cache is not None:
+            cache.advance(seq_len)
 
         h = self.final_norm(h)
         logits = None
@@ -149,6 +171,110 @@ class RDTForCausalLM(nn.Module):
             "loss_parts": loss_parts,
             "rec_info": rec_info,
         }
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        steps: int | None = None,
+        temperature: float = 0.0,
+        top_k: int | None = None,
+        eos_id: int | None = None,
+    ) -> torch.Tensor:
+        """Incremental greedy/sampled decoding with KV + SSM state caching.
+
+        Prompts must be un-padded (all-ones ``attention_mask`` or ``None``);
+        batch with equal-length prompts or run with bsz 1. ``temperature <= 0``
+        is greedy. Finished rows are filled with EOS. ``steps`` fixes the
+        recurrent depth for both prefill and decode; ACT is not supported.
+        """
+
+        if self.cfg.use_act:
+            raise NotImplementedError(
+                "generate() supports fixed recurrent steps only (use_act=False)"
+            )
+        if input_ids.ndim != 2 or input_ids.numel() == 0:
+            raise ValueError("input_ids must be a non-empty [B, L] tensor")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        if attention_mask is not None and not bool(attention_mask.bool().all()):
+            raise ValueError("generate requires un-padded prompts (all-ones mask)")
+        if top_k is not None and top_k <= 0:
+            raise ValueError("top_k must be positive")
+
+        bsz, prompt_len = input_ids.shape
+        if prompt_len + max_new_tokens > self.cfg.max_seq_len:
+            raise ValueError("prompt_len + max_new_tokens exceeds max_seq_len")
+
+        eos = self.cfg.eos_id if eos_id is None else eos_id
+        was_training = self.training
+        self.eval()
+
+        try:
+            cache = RDTCache()
+            ids = input_ids
+            ones = torch.ones_like(ids)
+            word_pos, morph_depth = self._default_morph_info(ids, ones)
+
+            out = self.forward(
+                ids,
+                attention_mask=ones,
+                word_pos=word_pos,
+                morph_depth=morph_depth,
+                pixel_values=pixel_values,
+                steps=steps,
+                cache=cache,
+            )
+
+            finished = torch.zeros(bsz, dtype=torch.bool, device=ids.device)
+
+            for _ in range(max_new_tokens):
+                logits = out["logits"][:, -1].float()
+                next_id = self._sample_token(logits, temperature, top_k)
+                if eos is not None and eos >= 0:
+                    next_id = torch.where(
+                        finished, torch.full_like(next_id, eos), next_id
+                    )
+                ids = torch.cat([ids, next_id.unsqueeze(1)], dim=1)
+                if eos is not None and eos >= 0:
+                    finished = finished | next_id.eq(eos)
+                    if bool(finished.all()):
+                        break
+
+                ones = torch.ones_like(ids)
+                word_pos, morph_depth = self._default_morph_info(ids, ones)
+                out = self.forward(
+                    ids[:, -1:],
+                    attention_mask=ones[:, -1:],
+                    word_pos=word_pos[:, -1:],
+                    morph_depth=morph_depth[:, -1:],
+                    steps=steps,
+                    cache=cache,
+                )
+        finally:
+            if was_training:
+                self.train()
+
+        return ids
+
+    @staticmethod
+    def _sample_token(
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: int | None,
+    ) -> torch.Tensor:
+        if temperature <= 0:
+            return logits.argmax(dim=-1)
+        logits = logits / temperature
+        if top_k is not None:
+            k = min(top_k, logits.shape[-1])
+            kth = torch.topk(logits, k, dim=-1).values[..., -1, None]
+            logits = logits.masked_fill(logits < kth, float("-inf"))
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     def _losses(
         self,
@@ -291,11 +417,13 @@ class RDTForCausalLM(nn.Module):
         morph_depth: torch.Tensor | None,
         attn_mask: torch.Tensor | None,
         causal: bool,
+        cache_entry=None,
     ) -> torch.Tensor:
         if (
             getattr(self.cfg, "grad_ckpt_prelude_coda", False)
             and self.training
             and h.requires_grad
+            and cache_entry is None
         ):
             def _fn(x):
                 return block(
@@ -313,6 +441,7 @@ class RDTForCausalLM(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
+            cache=cache_entry,
         )
 
     def _default_morph_info(
@@ -404,6 +533,7 @@ class RDTForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
         labels: torch.Tensor | None,
+        past_len: int = 0,
     ) -> None:
         if input_ids.ndim != 2:
             raise ValueError("input_ids must have shape [B, L]")
@@ -424,7 +554,7 @@ class RDTForCausalLM(nn.Module):
         if labels is not None and labels.shape != input_ids.shape:
             raise ValueError("labels must have shape [B, L]")
 
-        if input_ids.shape[1] > self.cfg.max_seq_len:
+        if past_len + input_ids.shape[1] > self.cfg.max_seq_len:
             raise ValueError("sequence length exceeds max_seq_len")
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -440,6 +570,34 @@ class RDTForCausalLM(nn.Module):
             if module.padding_idx is not None:
                 with torch.no_grad():
                     module.weight[module.padding_idx].zero_()
+
+    # Last linear of every residual write: attention output, SwiGLU down
+    # projection, and the SSM output projection (both NaiveSSM and the
+    # official Mamba3 expose it as ``out_proj``).
+    _RESIDUAL_PROJ_SUFFIXES = ("attn.o_proj", "ffn.w_down", "mamba.out_proj")
+
+    @torch.no_grad()
+    def _scale_residual_projections(self) -> None:
+        """GPT-2-style depth-scaled init, extended to the unrolled loop.
+
+        Every sublayer writes ``x + f(x)`` into the residual stream. With a
+        weight-shared recurrent core the stream sees ``effective_depth``
+        layers (prelude + block_layers x recurrent_steps + coda), so leaving
+        the output projections at ``init_std`` makes the hidden-state norm
+        grow linearly across recurrent steps (and costs bf16 mantissa
+        precision late in the loop). Scaling them by
+        ``1/sqrt(2 * effective_depth)`` keeps the residual variance roughly
+        depth-invariant at init.
+        """
+
+        scale = (2.0 * self.cfg.effective_depth) ** -0.5
+
+        for container in (self.prelude, self.recurrent, self.coda):
+            for name, module in container.named_modules():
+                if isinstance(module, nn.Linear) and name.endswith(
+                    self._RESIDUAL_PROJ_SUFFIXES
+                ):
+                    module.weight.mul_(scale)
 
     @torch.no_grad()
     def count_params(self, trainable_only: bool = False) -> int:

@@ -193,6 +193,7 @@ def train_one_step(
         "grad_norm": grad_norm_val,
         "lr": float(scheduler.get_last_lr()[0]),
         "tokens": float(token_count),
+        "rec_steps": float(rec_steps) if rec_steps is not None else float("nan"),
     }
 
 

@@ -447,6 +447,16 @@ class TrainingConfig:
     recurrent_steps_start: int | None = None  # if set, ramps to cfg.recurrent_steps
     recurrent_steps_ramp: int = 0
 
+    # per-step random depth sampling (Geiping-style log-normal Poisson).
+    # "poisson" draws the loop depth per optimizer step so the model learns
+    # to be usable at depths other than the training default (cheap shallow
+    # inference, deeper test-time compute). Must be identical across ranks;
+    # the sampler is seeded from (seed, step) only.
+    recurrent_steps_sampling: str = "fixed"  # fixed | poisson
+    recurrent_steps_min: int = 1
+    recurrent_steps_max: int | None = None  # None ⇒ 2 * target steps
+    recurrent_steps_sigma: float = 0.5
+
     # distributed
     dist_backend: str = "nccl"  # nccl | gloo
     parallel: str = "single"  # single | ddp | fsdp
@@ -490,6 +500,19 @@ class TrainingConfig:
             self.lr_decay_steps = self.max_steps
         if self.recurrent_steps_ramp < 0:
             raise ValueError("recurrent_steps_ramp must be non-negative")
+        if self.recurrent_steps_sampling not in {"fixed", "poisson"}:
+            raise ValueError(
+                f"unknown recurrent_steps_sampling: {self.recurrent_steps_sampling}"
+            )
+        if self.recurrent_steps_min < 1:
+            raise ValueError("recurrent_steps_min must be >= 1")
+        if (
+            self.recurrent_steps_max is not None
+            and self.recurrent_steps_max < self.recurrent_steps_min
+        ):
+            raise ValueError("recurrent_steps_max must be >= recurrent_steps_min")
+        if self.recurrent_steps_sigma <= 0:
+            raise ValueError("recurrent_steps_sigma must be positive")
 
 
 @dataclass
