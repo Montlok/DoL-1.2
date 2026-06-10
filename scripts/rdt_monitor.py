@@ -116,6 +116,7 @@ def serve(run_dir: str, host: str, port: int) -> int:
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
+        # Ctrl+C is the normal way to stop the server; shut down quietly.
         pass
     finally:
         httpd.server_close()
@@ -235,6 +236,7 @@ def tui(run_dir: str, refresh: float) -> int:
                     queued.append((time.time(), cmd))
                 live.update(render())
     except KeyboardInterrupt:
+        # Ctrl+C exits the TUI like 'q'; treat it as a clean shutdown.
         pass
     return 0
 

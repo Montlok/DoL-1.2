@@ -231,6 +231,22 @@ class RDTForCausalLM(nn.Module):
 
             finished = torch.zeros(bsz, dtype=torch.bool, device=ids.device)
 
+            # Incremental morph-position state (per row) so each decode step
+            # is O(B) instead of re-deriving (word_pos, morph_depth) over the
+            # whole growing sequence (which would make generation O(L^2)).
+            wb = int(self.cfg.word_boundary_id)
+            mb = int(self.cfg.morpheme_boundary_id)
+            is_wb0 = ids.eq(wb)
+            is_content0 = ~((ids >= 0) & (ids < 256))
+            wb_cum = is_wb0.long().sum(dim=1)
+            any_wb = is_wb0.any(dim=1)
+            any_content = is_content0.any(dim=1)
+            # word_pos = clamp(wb_cum + shift); at the last prompt position
+            # the clamp is inactive, so shift is recoverable by subtraction.
+            shift = word_pos[:, -1] - wb_cum
+            depth_last = morph_depth[:, -1]
+            ones_col = torch.ones((bsz, 1), dtype=ones.dtype, device=ids.device)
+
             for _ in range(max_new_tokens):
                 logits = out["logits"][:, -1].float()
                 next_id = self._sample_token(logits, temperature, top_k)
@@ -244,13 +260,31 @@ class RDTForCausalLM(nn.Module):
                     if bool(finished.all()):
                         break
 
-                ones = torch.ones_like(ids)
-                word_pos, morph_depth = self._default_morph_info(ids, ones)
+                n_wb = next_id.eq(wb)
+                n_mb = next_id.eq(mb)
+                n_special = (next_id >= 0) & (next_id < 256)
+                n_other = n_special & ~n_wb & ~n_mb
+                # The first wb/content token fixes the per-row shift: a wb
+                # before any content anchors word 0 (shift -1).
+                undecided = ~any_wb & ~any_content
+                shift = torch.where(undecided & n_wb, shift - 1, shift)
+                any_wb = any_wb | n_wb
+                any_content = any_content | ~n_special
+                wb_cum = wb_cum + n_wb.long()
+                wp_new = (wb_cum + shift).clamp(min=0)
+                depth_last = torch.where(
+                    n_wb | n_other,
+                    torch.zeros_like(depth_last),
+                    depth_last + n_mb.long(),
+                )
+                if self.cfg.max_morph_depth > 0:
+                    depth_last = depth_last.clamp(max=self.cfg.max_morph_depth - 1)
+
                 out = self.forward(
                     ids[:, -1:],
-                    attention_mask=ones[:, -1:],
-                    word_pos=word_pos[:, -1:],
-                    morph_depth=morph_depth[:, -1:],
+                    attention_mask=ones_col,
+                    word_pos=wp_new.unsqueeze(1),
+                    morph_depth=depth_last.unsqueeze(1),
                     steps=steps,
                     cache=cache,
                 )

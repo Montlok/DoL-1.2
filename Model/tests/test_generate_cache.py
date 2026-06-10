@@ -130,6 +130,56 @@ class TestGenerate:
 
         assert torch.equal(fast, slow)
 
+    def test_boundary_tokens_match_full_reforward(self, monkeypatch):
+        """Decode steps that emit word/morpheme-boundary or other special
+        tokens must keep the incremental morph state identical to a full
+        re-derivation over the whole sequence."""
+
+        model = _model()
+        cfg = model.cfg
+        # prompt mixing boundaries: wb, content, mb, other-special, content
+        ids = torch.tensor(
+            [[cfg.word_boundary_id, 300, cfg.morpheme_boundary_id, 20, 301],
+             [400, cfg.word_boundary_id, cfg.morpheme_boundary_id, 401, 20]]
+        )
+        forced = [
+            cfg.word_boundary_id,
+            cfg.morpheme_boundary_id,
+            cfg.morpheme_boundary_id,
+            20,  # other special: resets depth, keeps word_pos
+            350,
+            cfg.word_boundary_id,
+        ]
+        n_free = 4
+
+        orig_sample = RDTForCausalLM._sample_token
+        calls = {"n": 0}
+
+        def forced_sample(logits, temperature, top_k):
+            i = calls["n"]
+            calls["n"] += 1
+            if i < len(forced):
+                return torch.full(
+                    (logits.shape[0],), forced[i], dtype=torch.long
+                )
+            return orig_sample(logits, temperature, top_k)
+
+        monkeypatch.setattr(
+            RDTForCausalLM, "_sample_token", staticmethod(forced_sample)
+        )
+        fast = model.generate(ids, max_new_tokens=len(forced) + n_free, eos_id=-1)
+
+        slow = ids
+        for i in range(len(forced) + n_free):
+            logits = model(slow)["logits"][:, -1].float()
+            if i < len(forced):
+                nxt = torch.full((slow.shape[0], 1), forced[i], dtype=torch.long)
+            else:
+                nxt = logits.argmax(-1, keepdim=True)
+            slow = torch.cat([slow, nxt], dim=1)
+
+        assert torch.equal(fast, slow)
+
     def test_steps_override_matches_full_reforward(self):
         model = _model()
         ids = _ids(1, 5, model.cfg.vocab_size, seed=3)

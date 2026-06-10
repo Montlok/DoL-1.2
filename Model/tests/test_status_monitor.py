@@ -35,6 +35,33 @@ class TestStatusReporter:
         assert len(rows) <= 20
         assert rows[-1]["step"] == 49
 
+    def test_history_lines_resume(self, tmp_path):
+        rep = StatusReporter(tmp_path, history_keep=10)
+        for step in range(15):
+            rep.update(step, {"loss": float(step)})
+
+        # a resumed reporter must count pre-existing lines so the ring
+        # trim threshold doesn't restart from zero
+        rep2 = StatusReporter(tmp_path, history_keep=10)
+        assert rep2._history_lines == 15
+        for step in range(15, 30):
+            rep2.update(step, {"loss": float(step)})
+
+        rows = read_history(tmp_path, last_n=100)
+        assert len(rows) <= 20
+        assert rows[-1]["step"] == 29
+
+    def test_nonfinite_metrics_become_null(self, tmp_path):
+        rep = StatusReporter(tmp_path)
+        rep.update(1, {"loss": float("nan"), "grad_norm": float("inf"), "lr": 0.1})
+
+        raw = (tmp_path / "monitor" / "status.json").read_text(encoding="utf-8")
+        status = json.loads(raw)  # strict: would fail on bare NaN/Infinity
+        assert "NaN" not in raw and "Infinity" not in raw
+        assert status["metrics"]["loss"] is None
+        assert status["metrics"]["grad_norm"] is None
+        assert status["metrics"]["lr"] == 0.1
+
     def test_finish_state(self, tmp_path):
         rep = StatusReporter(tmp_path)
         rep.finish(state="stopped", step=7)

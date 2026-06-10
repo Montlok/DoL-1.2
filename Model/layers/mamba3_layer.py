@@ -374,7 +374,18 @@ class Mamba3Layer(nn.Module):
             cache.inference_params = ip
 
         ip.seqlen_offset = cache.seqlen_offset
-        y = self.mamba(mamba_input, inference_params=ip)
+        if cache.seqlen_offset > 0:
+            # Upstream Mamba3.forward routes the 3-D [B, L, D] tensor into
+            # step(), which expects [B, D] and crashes in its rearrange.
+            # Call step() directly; it updates the cached states in place.
+            states = self.mamba._get_states_from_cache(ip, mamba_input.shape[0])
+            outs = []
+            for t in range(mamba_input.shape[1]):
+                y_t, *_ = self.mamba.step(mamba_input[:, t], *states)
+                outs.append(y_t)
+            y = torch.stack(outs, dim=1)
+        else:
+            y = self.mamba(mamba_input, inference_params=ip)
         cache.seqlen_offset += mamba_input.shape[1]
         return y
 

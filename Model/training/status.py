@@ -22,8 +22,10 @@ Layout::
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
+from collections import deque
 from pathlib import Path
 
 VALID_COMMANDS = ("save", "eval", "stop")
@@ -49,7 +51,7 @@ class StatusReporter:
         self.history_keep = history_keep
         self.run_metadata = run_metadata or {}
         self.started_at = time.time()
-        self._history_lines = 0
+        self._history_lines = self._count_history_lines()
         self._last_step = 0
         self._last_metrics: dict = {}
 
@@ -68,6 +70,8 @@ class StatusReporter:
             self._write_status(step, metrics, state, extra)
             self._append_history(step, metrics)
         except OSError:
+            # Status writes are best-effort; a full or slow disk must never
+            # crash the training loop.
             pass
 
     def finish(self, state: str = "finished", step: int | None = None) -> None:
@@ -78,6 +82,8 @@ class StatusReporter:
                 state=state,
             )
         except OSError:
+            # Final status write is best-effort; never mask the original
+            # exit path (success or exception) of the training run.
             pass
 
     def poll_control(self) -> list[str]:
@@ -93,6 +99,8 @@ class StatusReporter:
         try:
             self.control_path.unlink()
         except OSError:
+            # Commands were already read into memory; failing to delete the
+            # file only means they may be consumed again next poll.
             pass
 
         try:
@@ -123,6 +131,8 @@ class StatusReporter:
             old = json.loads(path.read_text(encoding="utf-8"))
             pending = [c for c in old.get("commands", []) if c in VALID_COMMANDS]
         except (OSError, json.JSONDecodeError):
+            # An unreadable or malformed control file is treated as having no
+            # pending commands; enqueueing stays best-effort and non-fatal.
             pass
         for cmd in commands:
             if cmd not in pending:
@@ -154,6 +164,15 @@ class StatusReporter:
             payload.update(_jsonable(extra))
         _atomic_write(self.status_path, json.dumps(payload))
 
+    def _count_history_lines(self) -> int:
+        """Count lines in a pre-existing history file (resumed runs) so the
+        ring-buffer trim threshold stays accurate across restarts."""
+        try:
+            with self.history_path.open("rb") as fh:
+                return sum(1 for _ in fh)
+        except OSError:
+            return 0
+
     def _append_history(self, step: int, metrics: dict) -> None:
         line = json.dumps({"step": int(step), "t": time.time(), **_jsonable(metrics)})
         with self.history_path.open("a", encoding="utf-8") as fh:
@@ -161,9 +180,11 @@ class StatusReporter:
         self._history_lines += 1
 
         if self._history_lines >= self.history_keep * 2:
-            lines = self.history_path.read_text(encoding="utf-8").splitlines()
-            keep = lines[-self.history_keep:]
-            _atomic_write(self.history_path, "\n".join(keep) + "\n")
+            # Stream through the file keeping only the newest lines so the
+            # trim never materializes a huge file in memory.
+            with self.history_path.open("r", encoding="utf-8") as fh:
+                keep = deque(fh, maxlen=self.history_keep)
+            _atomic_write(self.history_path, "".join(keep))
             self._history_lines = len(keep)
 
 
@@ -201,12 +222,16 @@ def _jsonable(obj):
         return {str(k): _jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_jsonable(v) for v in obj]
-    if isinstance(obj, (str, int, float, bool)) or obj is None:
+    if isinstance(obj, float):
+        # NaN/Inf are not valid JSON; strict parsers (and the HTTP API
+        # consumers) would choke on them, so map to null.
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (str, int, bool)) or obj is None:
         return obj
     item = getattr(obj, "item", None)
     if callable(item):
         try:
-            return item()
+            return _jsonable(item())
         except (TypeError, ValueError, RuntimeError):
             pass
     return str(obj)
