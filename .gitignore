@@ -32,3 +32,9 @@ cookies.txt
 *.secret
 secrets/
 credentials/
+
+# local-only (do not commit)
+.claude/
+.pytest_cache/
+download.pid
+/outputs
