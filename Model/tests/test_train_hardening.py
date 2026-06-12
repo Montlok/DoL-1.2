@@ -28,8 +28,8 @@ class TestResidualInitScaling(unittest.TestCase):
         expected = cfg.init_std * scale
 
         block = model.recurrent.block
-        attn_layer = next(l for l in block.layers if hasattr(l, "attn"))
-        mamba_layer = next(l for l in block.layers if hasattr(l, "mamba"))
+        attn_layer = next(layer for layer in block.layers if hasattr(layer, "attn"))
+        mamba_layer = next(layer for layer in block.layers if hasattr(layer, "mamba"))
 
         for tensor in (
             model.prelude[0].attn.o_proj.weight,

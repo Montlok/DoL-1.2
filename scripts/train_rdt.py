@@ -66,7 +66,7 @@ from Model.training import (  # noqa: E402
     throughput_str,
     train_one_step,
 )
-from Model.training.status import StatusReporter
+from Model.training.status import StatusReporter  # noqa: E402
 
 
 CONFIG_CHOICES = {

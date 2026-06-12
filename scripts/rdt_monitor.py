@@ -38,7 +38,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from Model.training.status import (
+from Model.training.status import (  # noqa: E402
     VALID_COMMANDS,
     StatusReporter,
     read_history,

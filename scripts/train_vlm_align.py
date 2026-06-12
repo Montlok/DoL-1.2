@@ -109,6 +109,21 @@ def parse_args(argv=None):
         default="auto",
         help="'auto' = cuda if available else cpu (legacy behavior)",
     )
+    p.add_argument(
+        "--patch-preset",
+        choices=("derived", "prod"),
+        default="derived",
+        help="for from-scratch towers: 'derived' keeps the legacy smoke "
+        "geometry (patches scaled from --image-size); 'prod' uses the "
+        "OMVTConfig dataclass multi-scale defaults (32x8 / 8x32 / 16x16 / "
+        "56x56). Ignored when --init-omvt-checkpoint provides omvt_config.",
+    )
+    p.add_argument(
+        "--grad-ckpt",
+        action="store_true",
+        help="enable RDT gradient checkpointing (grad_ckpt_recurrent + "
+        "grad_ckpt_prelude_coda) to fit long sequences on small GPUs",
+    )
     return p.parse_args(argv)
 
 
@@ -130,6 +145,14 @@ def _build_omvt_cfg(args) -> OMVTConfig:
     n_image_tokens = args.n_image_tokens
     if n_image_tokens is None:
         n_image_tokens = image_patch_count(args.image_size, args.image_size)
+    if getattr(args, "patch_preset", "derived") == "prod":
+        # Dataclass defaults are the production multi-scale geometry; only
+        # the run-specific knobs come from the CLI (mirrors train_omvt_ssl).
+        return OMVTConfig(
+            image_size=args.image_size,
+            d_vision=args.d_vision,
+            compress_to=n_image_tokens,
+        )
     return OMVTConfig(
         image_size=args.image_size,
         d_vision=args.d_vision,
@@ -259,6 +282,10 @@ def main(argv=None):
     # cap seq_len to the synthetic layout (tiny config is 2048 by default but
     # the smoke layout is much shorter)
     rdt_cfg = replace(rdt_cfg, max_seq_len=args.seq_len)
+    if args.grad_ckpt:
+        rdt_cfg = replace(
+            rdt_cfg, grad_ckpt_recurrent=True, grad_ckpt_prelude_coda=True
+        )
     try:
         rdt_cfg = _resolve_mamba_backend(
             rdt_cfg,
