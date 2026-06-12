@@ -41,6 +41,11 @@ from Model.training import (
     save_checkpoint,
     train_one_step,
 )
+from Model.training.multimodal_cli import make_omvt_cfg
+from Model.training.omvt_checkpoint import (
+    load_omvt_payload,
+    tower_state_from_payload,
+)
 from Tokenizer.multimodal import PILImageProcessor
 from Tokenizer.multimodal.image_placeholders import image_patch_count
 from scripts.train_rdt import CONFIG_CHOICES, _resolve_mamba_backend
@@ -133,7 +138,7 @@ def _build_omvt_cfg(args) -> OMVTConfig:
         # tower geometry: building a CLI-derived config here and loading a
         # prod-geometry tower (e.g. d_vision=512, dataclass patch shapes) into
         # it would fail on shape mismatch.
-        payload = _load_omvt_payload(args.init_omvt_checkpoint)
+        payload = load_omvt_payload(args.init_omvt_checkpoint, weights_only=False)
         if isinstance(payload, dict) and "omvt_config" in payload:
             cfg = OMVTConfig(**payload["omvt_config"])
             if args.image_size != cfg.image_size:
@@ -142,25 +147,11 @@ def _build_omvt_cfg(args) -> OMVTConfig:
                     "(from OMVT checkpoint)",
                 )
             return cfg
-    n_image_tokens = args.n_image_tokens
-    if n_image_tokens is None:
-        n_image_tokens = image_patch_count(args.image_size, args.image_size)
-    if getattr(args, "patch_preset", "derived") == "prod":
-        # Dataclass defaults are the production multi-scale geometry; only
-        # the run-specific knobs come from the CLI (mirrors train_omvt_ssl).
-        return OMVTConfig(
-            image_size=args.image_size,
-            d_vision=args.d_vision,
-            compress_to=n_image_tokens,
-        )
-    return OMVTConfig(
-        image_size=args.image_size,
-        d_vision=args.d_vision,
-        vertical_patch=(args.image_size // 2, args.image_size // 4),
-        horizontal_patch=(args.image_size // 4, args.image_size // 2),
-        square_patch=(args.image_size // 4, args.image_size // 4),
-        layout_patch=(args.image_size, args.image_size),
-        compress_to=n_image_tokens,
+    return make_omvt_cfg(
+        args.image_size,
+        args.d_vision,
+        args.n_image_tokens,
+        preset=getattr(args, "patch_preset", "derived"),
     )
 
 
@@ -204,32 +195,10 @@ def _load_rdt_init(model: RDTForCausalLM, path: str) -> None:
         )
 
 
-def _load_omvt_payload(path: str):
-    p = Path(path)
-    if p.is_dir():
-        candidates = [
-            p / "omvt_ssl.pt",
-            p / "latest" / "omvt_ssl.pt",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                p = candidate
-                break
-    if not p.exists():
-        raise FileNotFoundError(f"OMVT checkpoint not found: {path}")
-    return torch.load(p, map_location="cpu", weights_only=False)
-
-
 def _resolve_omvt_state(path: str, use_ema: bool = False):
-    payload = _load_omvt_payload(path)
-    if not (isinstance(payload, dict) and "tower" in payload):
-        return payload
-    state = payload["tower"]
-    if use_ema and payload.get("tower_ema"):
-        # EMA shadows cover only floating-point entries; overlay them so
-        # buffers keep their trained values.
-        state = dict(state)
-        state.update(payload["tower_ema"])
+    payload = load_omvt_payload(path, weights_only=False)
+    state = tower_state_from_payload(payload, use_ema=use_ema)
+    if use_ema and isinstance(payload, dict) and payload.get("tower_ema"):
         print("[init] using EMA tower weights")
     return state
 

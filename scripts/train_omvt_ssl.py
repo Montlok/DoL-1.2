@@ -44,6 +44,8 @@ from Model.omvt import (
 )
 from Model.training import RankZeroLogger, build_optimizer, clip_or_check_grad_norm
 from Model.training.optim import build_scheduler
+from Model.training.multimodal_cli import make_omvt_cfg
+from Model.training.omvt_checkpoint import resolve_omvt_checkpoint_path
 from Model.config import TrainingConfig
 from Tokenizer.multimodal import PILImageProcessor
 
@@ -108,24 +110,12 @@ def parse_args(argv=None):
 
 
 def _omvt_cfg(args) -> OMVTConfig:
-    if getattr(args, "patch_preset", "derived") == "prod":
-        # Dataclass defaults are the production multi-scale geometry; only
-        # the run-specific knobs come from the CLI.
-        return OMVTConfig(
-            image_size=args.image_size,
-            d_vision=args.d_vision,
-            compress_to=args.compress_to,
-        )
-    cfg = OMVTConfig(
-        image_size=args.image_size,
-        d_vision=args.d_vision,
-        vertical_patch=(args.image_size // 2, args.image_size // 4),
-        horizontal_patch=(args.image_size // 4, args.image_size // 2),
-        square_patch=(args.image_size // 4, args.image_size // 4),
-        layout_patch=(args.image_size, args.image_size),
-        compress_to=args.compress_to,
+    return make_omvt_cfg(
+        args.image_size,
+        args.d_vision,
+        args.compress_to,
+        preset=getattr(args, "patch_preset", "derived"),
     )
-    return cfg
 
 
 def _first_seq(value: object) -> list[int] | None:
@@ -310,20 +300,6 @@ def _masked_patch_step(
     return masked_patch_loss(predicted, target, mask=mask)
 
 
-def _resolve_checkpoint_path(path: str | Path) -> Path:
-    p = Path(path)
-    if p.is_file():
-        return p
-    candidates = [
-        p / "omvt_ssl.pt",
-        p / "latest" / "omvt_ssl.pt",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    raise FileNotFoundError(f"OMVT SSL checkpoint not found: {path}")
-
-
 def _save_checkpoint(
     output: str | Path,
     step: int,
@@ -379,7 +355,7 @@ def _load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
 ) -> int:
     payload = torch.load(
-        _resolve_checkpoint_path(path),
+        resolve_omvt_checkpoint_path(path),
         map_location="cpu",
         weights_only=False,
     )

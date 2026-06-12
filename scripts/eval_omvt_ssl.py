@@ -50,11 +50,11 @@ from Model.omvt.losses import (  # noqa: E402
 )
 from Tokenizer.multimodal import PILImageProcessor  # noqa: E402
 
-from scripts.train_omvt_ssl import (  # noqa: E402
-    _first_seq,
-    _resolve_checkpoint_path,
-    _rotate_batch,
+from Model.training.omvt_checkpoint import (  # noqa: E402
+    load_omvt_payload,
+    tower_state_from_payload,
 )
+from scripts.train_omvt_ssl import _first_seq, _rotate_batch  # noqa: E402
 
 
 def _iter_batches(path: str, batch_size: int, proc: PILImageProcessor, limit: int):
@@ -185,8 +185,7 @@ def main(argv=None) -> int:
     else:
         device = torch.device(args.device)
 
-    ckpt_path = _resolve_checkpoint_path(args.checkpoint)
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    payload = load_omvt_payload(args.checkpoint)
     cfg = OMVTConfig(**payload["omvt_config"])
     # The vocab dim is the largest output dim among the head's linear layers
     # (vocab >> any hidden width by construction).
@@ -195,14 +194,10 @@ def main(argv=None) -> int:
     )
 
     tower = OMVTVisionTower(cfg).to(device)
-    tower_sd = payload["tower"]
-    if payload.get("tower_ema"):
-        # EMA weights only cover floating-point entries; overlay them on the
-        # raw state dict so buffers keep their trained values.
-        tower_sd = dict(tower_sd)
-        tower_sd.update(payload["tower_ema"])
+    use_ema = bool(payload.get("tower_ema"))
+    if use_ema:
         print("[eval] using EMA tower weights")
-    tower.load_state_dict(tower_sd)
+    tower.load_state_dict(tower_state_from_payload(payload, use_ema=use_ema))
     heads = {
         "ocr": OCRReconstructionHead(cfg.d_vision, ocr_vocab).to(device),
         "mp": MaskedPatchHead(
@@ -222,7 +217,7 @@ def main(argv=None) -> int:
     for h in heads.values():
         h.eval()
 
-    print(f"[eval] checkpoint step={payload.get('step')} from {ckpt_path}")
+    print(f"[eval] checkpoint step={payload.get('step')} from {args.checkpoint}")
     results = []
     for spec in args.data:
         name, _, path = spec.partition("=")
