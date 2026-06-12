@@ -100,7 +100,7 @@ class StreamingJsonlDataset(IterableDataset):
         # decorrelate the per-shard buffer order deterministically.
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
-        rng = random.Random(self.seed + 1000 * self.rank + worker_id)
+        base_seed = self.seed + 1000 * self.rank + worker_id
         buffer: list[dict[str, Any]] = []
 
         def _emit(item: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -113,9 +113,16 @@ class StreamingJsonlDataset(IterableDataset):
                 buffer[idx], buffer[-1] = buffer[-1], buffer[idx]
                 yield buffer.pop()
 
-        first_pass = True
-        while first_pass or self.infinite:
-            first_pass = False
+        pass_idx = 0
+        while pass_idx == 0 or self.infinite:
+            # Re-derive the RNG every pass: a pass-stable seed would shuffle
+            # each epoch into the same order, and — worse — a resumed run
+            # rebuilds the iterator from row 0 with the original order, so
+            # epoch 2 after a resume would replay epoch 1's exact stream.
+            # (The multiplier just spaces the per-pass seeds apart; any odd
+            # constant larger than seed+1000*rank+worker collisions works.)
+            rng = random.Random(base_seed + 7_368_787 * pass_idx)
+            pass_idx += 1
             rows_seen = 0
             for path in files:
                 with path.open("r", encoding="utf-8") as f:

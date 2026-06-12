@@ -93,6 +93,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--output", default="outputs/rdt")
     p.add_argument("--resume", default="")
+    p.add_argument(
+        "--no-resume-skip-data",
+        action="store_true",
+        help=(
+            "do not fast-forward the data stream to the checkpointed step on "
+            "--resume (the stream then restarts at row 0; fine for smoke "
+            "resumes, wrong for real continuation)"
+        ),
+    )
     p.add_argument("--dist", choices=["single", "ddp", "fsdp"], default="single")
     p.add_argument("--precision", choices=["fp32", "bf16", "fp16"], default="bf16")
     p.add_argument(
@@ -334,7 +343,36 @@ def _build_train_cfg(args: argparse.Namespace, model_cfg: RDTConfig) -> Training
         recurrent_steps_ramp=args.recurrent_steps_ramp,
         seed=args.seed,
         resume=args.resume,
+        resume_skip_data=not args.no_resume_skip_data,
     )
+
+
+def _fast_forward_stream(batch_iter, resumed_step: int, train_cfg, rank: int) -> None:
+    """Skip the batches a resumed run already consumed.
+
+    The stream is deterministic (seeded shuffle, fixed shard order), so a
+    rebuilt iterator restarts at row 0 while ``state.step`` keeps counting;
+    consuming ``step * grad_accum_steps`` batches realigns the data with the
+    schedule. Read+collate only — no forward pass, so it is IO-bound.
+    """
+    skip = resumed_step * train_cfg.grad_accum_steps
+    if skip <= 0:
+        return
+    t0 = time.time()
+    for done in range(skip):
+        next(batch_iter)
+        if rank == 0 and (done + 1) % 5000 == 0:
+            print(
+                f"scripts/train_rdt: resume fast-forward {done + 1}/{skip} "
+                f"batches ({time.time() - t0:.0f}s elapsed)",
+                flush=True,
+            )
+    if rank == 0:
+        print(
+            f"scripts/train_rdt: resume fast-forwarded {skip} batches in "
+            f"{time.time() - t0:.0f}s (use --no-resume-skip-data to disable)",
+            flush=True,
+        )
 
 
 def _target_recurrent_steps_for_train(
@@ -682,6 +720,8 @@ def main(argv: list[str] | None = None) -> int:
             omvt_cfg=omvt_cfg,
         )
         batch_iter = iter(dataloader)
+        if train_cfg.resume and train_cfg.resume_skip_data and state.step > 0:
+            _fast_forward_stream(batch_iter, state.step, train_cfg, rank)
         eval_loader = None
         if train_cfg.eval_data:
             eval_loader = build_dataloader(

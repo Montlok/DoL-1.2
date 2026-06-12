@@ -252,5 +252,32 @@ class CacheRejectionTest(unittest.TestCase):
             model.generate(ids, max_new_tokens=2, greedy=True, use_cache=True)
 
 
+class ActCacheExclusionTest(unittest.TestCase):
+    """ACT (PonderNet) and the decode cache are mutually exclusive by
+    construction: ``use_cache`` requires the two_stage/segmented cores
+    (model.py) and both of those cores reject ``use_act=True``. Pin the
+    guards from both sides so a refactor that lifts either one must handle
+    the combination explicitly — variable ponder depth would silently
+    desync a cache that assumes one refinement call per token.
+    """
+
+    def test_two_stage_core_rejects_act(self):
+        cfg = _two_stage_cfg()
+        object.__setattr__(cfg, "use_act", True)
+        object.__setattr__(cfg, "act_max_steps", 4)
+        with self.assertRaisesRegex(ValueError, "use_act"):
+            RDTForCausalLM(cfg)
+
+    def test_segmented_core_rejects_act(self):
+        from Model.segmented import SegmentedCore  # noqa: F401  (guard lives there)
+
+        cfg = _two_stage_cfg()
+        object.__setattr__(cfg, "core_type", "segmented")
+        object.__setattr__(cfg, "use_act", True)
+        object.__setattr__(cfg, "act_max_steps", 4)
+        with self.assertRaisesRegex(ValueError, "use_act"):
+            RDTForCausalLM(cfg)
+
+
 if __name__ == "__main__":
     unittest.main()

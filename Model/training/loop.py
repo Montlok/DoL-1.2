@@ -169,7 +169,8 @@ def train_one_step(
     ):
         rec_steps = recurrent_steps_for_step(state.step, cfg, target_recurrent_steps)
 
-    for _ in range(cfg.grad_accum_steps):
+    is_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
+    for micro in range(cfg.grad_accum_steps):
         batch = next(batch_iter)
         # Count tokens on the CPU mask **before** moving to device so the
         # ``.sum()`` does not force a host-sync against the GPU stream.
@@ -178,25 +179,38 @@ def train_one_step(
             token_count += int(cpu_mask.sum().item())
         batch = _to_device(batch, device)
 
-        with _autocast_ctx(cfg.precision, device_type):
-            out = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch.get("attention_mask"),
-                labels=batch["labels"],
-                word_pos=batch.get("word_pos"),
-                morph_depth=batch.get("morph_depth"),
-                pixel_values=batch.get("pixel_values"),
-                steps=rec_steps,
-                bptt_window=cfg.bptt_window,
-                return_logits=not cfg.use_loss_chunking,
-            )
-        loss = out["loss"] / cfg.grad_accum_steps
-        if not bool(torch.isfinite(loss.detach())):
-            raise FloatingPointError(f"non-finite training loss at step {state.step}")
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        # DDP all-reduces gradients during every backward; with accumulation
+        # only the final micro-batch's reduction is needed. ``no_sync`` must
+        # wrap the forward too — DDP samples the sync flag at forward time.
+        # FSDP is left to sync every micro-batch on purpose: its no_sync keeps
+        # full unsharded grads alive and trades the bandwidth for peak memory.
+        sync_ctx = (
+            model.no_sync()
+            if is_ddp and micro < cfg.grad_accum_steps - 1
+            else contextlib.nullcontext()
+        )
+        with sync_ctx:
+            with _autocast_ctx(cfg.precision, device_type):
+                out = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                    labels=batch["labels"],
+                    word_pos=batch.get("word_pos"),
+                    morph_depth=batch.get("morph_depth"),
+                    pixel_values=batch.get("pixel_values"),
+                    steps=rec_steps,
+                    bptt_window=cfg.bptt_window,
+                    return_logits=not cfg.use_loss_chunking,
+                )
+            loss = out["loss"] / cfg.grad_accum_steps
+            if not bool(torch.isfinite(loss.detach())):
+                raise FloatingPointError(
+                    f"non-finite training loss at step {state.step}"
+                )
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
         # Keep the per-microstep loss as a detached tensor; we only sync
         # to host once per optimizer step to avoid stalling the training

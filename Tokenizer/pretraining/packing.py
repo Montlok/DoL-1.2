@@ -70,6 +70,12 @@ def iter_pack_samples(
         extra_offsets = list(sample.token_offsets)
         extra_word_pos = list(sample.word_pos)
         extra_morph_depth = list(sample.morph_depth)
+        # Documents are packed back-to-back with one EOS separator and NO
+        # cross-document attention isolation: attention and Mamba state may
+        # flow across the boundary. Deliberate — the official Mamba kernel has
+        # no affordable mid-sequence state reset, so block-diagonal masking
+        # could only ever isolate the attention half of the hybrid; EOS is the
+        # learned boundary signal instead (GPT-2/3-style packing).
         if current.input_ids:
             word_base = _next_word_pos(current.word_pos)
             extra_ids = [eos_id] + extra_ids
