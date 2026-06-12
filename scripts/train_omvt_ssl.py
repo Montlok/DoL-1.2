@@ -18,7 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
+import random
 import shutil
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -40,6 +43,7 @@ from Model.omvt import (
     orientation_loss,
 )
 from Model.training import RankZeroLogger, build_optimizer, clip_or_check_grad_norm
+from Model.training.optim import build_scheduler
 from Model.config import TrainingConfig
 from Tokenizer.multimodal import PILImageProcessor
 
@@ -64,10 +68,54 @@ def parse_args(argv=None):
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--patch-preset",
+        choices=("derived", "prod"),
+        default="derived",
+        help="'derived' keeps the legacy smoke geometry (patches scaled from "
+        "--image-size); 'prod' uses the OMVTConfig dataclass multi-scale "
+        "defaults (32x8 / 8x32 / 16x16 / 56x56), intended for real pages.",
+    )
+    p.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="'auto' = cuda if available else cpu (legacy behavior)",
+    )
+    p.add_argument(
+        "--precision",
+        choices=("auto", "fp32", "bf16"),
+        default="auto",
+        help="'auto' = bf16 on cuda, fp32 elsewhere",
+    )
+    p.add_argument("--warmup-steps", type=int, default=200)
+    p.add_argument(
+        "--ema-decay", type=float, default=0.999,
+        help="EMA decay for the tower weights (0 disables); the EMA tower is "
+        "saved as 'tower_ema' in checkpoints and preferred by eval",
+    )
+    p.add_argument(
+        "--crop-prob", type=float, default=0.0,
+        help="probability of replacing a page with a random square crop "
+        "(glyph-scale augmentation). Cropped rows train without OCR labels.",
+    )
+    p.add_argument("--crop-min", type=float, default=0.30,
+                   help="min crop side as a fraction of the short page side")
+    p.add_argument("--crop-max", type=float, default=0.60)
+    p.add_argument("--prefetch", type=int, default=4,
+                   help="batches prepared ahead by a loader thread (0 = off)")
     return p.parse_args(argv)
 
 
 def _omvt_cfg(args) -> OMVTConfig:
+    if getattr(args, "patch_preset", "derived") == "prod":
+        # Dataclass defaults are the production multi-scale geometry; only
+        # the run-specific knobs come from the CLI.
+        return OMVTConfig(
+            image_size=args.image_size,
+            d_vision=args.d_vision,
+            compress_to=args.compress_to,
+        )
     cfg = OMVTConfig(
         image_size=args.image_size,
         d_vision=args.d_vision,
@@ -106,6 +154,9 @@ def _iter_real_jsonl(
     image_processor: PILImageProcessor,
     *,
     seed: int,
+    crop_prob: float = 0.0,
+    crop_min: float = 0.30,
+    crop_max: float = 0.60,
 ) -> Iterator[dict]:
     """Yield batched real-image samples from a JSONL spec.
 
@@ -113,9 +164,16 @@ def _iter_real_jsonl(
     ``ocr_labels`` / ``reading_order`` lists (``None`` when no row in the
     micro-batch supplies them). The iterator wraps around forever so the
     caller controls termination via ``--steps``.
+
+    With ``crop_prob`` > 0 a row is sometimes replaced by a random square
+    crop of its page: at full-page resolution individual glyphs are only a
+    few pixels tall, so crops are what teach the tower glyph-scale detail.
+    A crop is no longer described by the page's transcription, so its OCR
+    label is dropped (the trainer already trains label-free rows).
     """
 
     rng = torch.Generator().manual_seed(seed)
+    pyrng = random.Random(seed)
     while True:
         with open(path, "r", encoding="utf-8") as fh:
             buf: list[dict] = []
@@ -129,9 +187,25 @@ def _iter_real_jsonl(
                 buf.append(row)
                 if len(buf) < batch_size:
                     continue
-                imgs = [row["images"][0] for row in buf]
+                imgs: list = []
+                ocr: list = []
+                for row in buf:
+                    spec = row["images"][0]
+                    label = _first_seq(row.get("ocr_labels"))
+                    if crop_prob > 0 and pyrng.random() < crop_prob:
+                        from PIL import Image as _Image
+
+                        img = _Image.open(spec)
+                        img.load()
+                        short = min(img.size)
+                        side = max(32, int(short * pyrng.uniform(crop_min, crop_max)))
+                        x = pyrng.randint(0, max(img.width - side, 0))
+                        y = pyrng.randint(0, max(img.height - side, 0))
+                        spec = img.crop((x, y, x + side, y + side))
+                        label = None
+                    imgs.append(spec)
+                    ocr.append(label)
                 stacked = image_processor(imgs)
-                ocr = [_first_seq(row.get("ocr_labels")) for row in buf]
                 ro = [_first_seq(row.get("reading_order")) for row in buf]
                 yield {
                     "images": stacked,
@@ -140,6 +214,57 @@ def _iter_real_jsonl(
                     "rng": rng,
                 }
                 buf = []
+
+
+def _prefetch(it: Iterator[dict], depth: int) -> Iterator[dict]:
+    """Run ``it`` in a daemon thread, keeping up to ``depth`` batches ready.
+
+    Image decode + resize is otherwise serialized with the optimizer step;
+    on GPU runs that data starvation was measured to cost ~40% wall clock.
+    """
+
+    if depth <= 0:
+        yield from it
+        return
+    q: "queue.Queue" = queue.Queue(maxsize=depth)
+    _END = object()
+
+    def _fill() -> None:
+        try:
+            for item in it:
+                q.put(item)
+            q.put(_END)
+        except BaseException as exc:  # propagate loader crashes to the main loop
+            q.put(exc)
+
+    threading.Thread(target=_fill, daemon=True, name="ssl-prefetch").start()
+    while True:
+        item = q.get()
+        if item is _END:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
+
+
+class _Ema:
+    """Exponential moving average of a module's floating-point state."""
+
+    def __init__(self, module: torch.nn.Module, decay: float) -> None:
+        self.decay = float(decay)
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in module.state_dict().items()
+            if v.dtype.is_floating_point
+        }
+
+    @torch.no_grad()
+    def update(self, module: torch.nn.Module) -> None:
+        for k, v in module.state_dict().items():
+            if k in self.shadow:
+                self.shadow[k].mul_(self.decay).add_(
+                    v.detach(), alpha=1.0 - self.decay
+                )
 
 
 def _rotate_batch(images: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -209,21 +334,25 @@ def _save_checkpoint(
     ori_head: OrientationHead,
     layout_head: LayoutOrderHead,
     optimizer: torch.optim.Optimizer,
+    ema: "_Ema | None" = None,
 ) -> Path:
     out = Path(output)
     step_dir = out / f"step_{step:08d}"
     step_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step": int(step),
+        "omvt_config": asdict(cfg),
+        "tower": tower.state_dict(),
+        "ocr_head": ocr_head.state_dict(),
+        "masked_patch_head": mp_head.state_dict(),
+        "orientation_head": ori_head.state_dict(),
+        "layout_head": layout_head.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }
+    if ema is not None:
+        payload["tower_ema"] = ema.shadow
     torch.save(
-        {
-            "step": int(step),
-            "omvt_config": asdict(cfg),
-            "tower": tower.state_dict(),
-            "ocr_head": ocr_head.state_dict(),
-            "masked_patch_head": mp_head.state_dict(),
-            "orientation_head": ori_head.state_dict(),
-            "layout_head": layout_head.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        },
+        payload,
         step_dir / "omvt_ssl.pt",
     )
     latest = out / "latest"
@@ -267,7 +396,10 @@ def _load_checkpoint(
 def main(argv=None):
     args = parse_args(argv)
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if getattr(args, "device", "auto") == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     cfg = _omvt_cfg(args)
     tower = OMVTVisionTower(cfg).to(device)
@@ -277,6 +409,9 @@ def main(argv=None):
     layout_head = LayoutOrderHead(cfg.d_vision, max_positions=cfg.compress_to).to(device)
 
     modules = torch.nn.ModuleList([tower, ocr_head, mp_head, ori_head, layout_head])
+    use_bf16 = args.precision == "bf16" or (
+        args.precision == "auto" and device.type == "cuda"
+    )
     train_cfg = TrainingConfig(
         train_data="",
         seq_len=cfg.compress_to,
@@ -284,10 +419,12 @@ def main(argv=None):
         learning_rate=args.lr,
         weight_decay=0.05,
         max_steps=args.steps,
-        warmup_steps=1,
-        precision="fp32",
+        warmup_steps=max(1, args.warmup_steps),
+        precision="bf16" if use_bf16 else "fp32",
     )
     optimizer = build_optimizer(modules, train_cfg)
+    scheduler = build_scheduler(optimizer, train_cfg)
+    ema = _Ema(tower, args.ema_decay) if args.ema_decay > 0 else None
     start_step = 0
     if args.resume:
         start_step = _load_checkpoint(
@@ -299,6 +436,12 @@ def main(argv=None):
             layout_head,
             optimizer,
         )
+        for _ in range(start_step):
+            scheduler.step()
+        if ema is not None:
+            # Re-seed the EMA from the restored tower; close enough after a
+            # few hundred steps and avoids a checkpoint format dependency.
+            ema = _Ema(tower, args.ema_decay)
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
     logger = RankZeroLogger(args.output, enable_tensorboard=False)
@@ -306,11 +449,17 @@ def main(argv=None):
     t0 = time.time()
     real_iter = None
     if args.data:
-        real_iter = _iter_real_jsonl(
-            args.data,
-            args.batch_size,
-            PILImageProcessor(image_size=args.image_size),
-            seed=args.seed,
+        real_iter = _prefetch(
+            _iter_real_jsonl(
+                args.data,
+                args.batch_size,
+                PILImageProcessor(image_size=args.image_size),
+                seed=args.seed,
+                crop_prob=args.crop_prob,
+                crop_min=args.crop_min,
+                crop_max=args.crop_max,
+            ),
+            args.prefetch,
         )
 
     last_step = start_step
@@ -329,7 +478,13 @@ def main(argv=None):
             ocr_labels_real = sample["ocr_labels"]
             ro_real = sample["reading_order"]
 
-        feats = tower(images)["compressed"]  # [B, compress_to, d_vision]
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            feats = tower(images)["compressed"]  # [B, compress_to, d_vision]
+        # Heads and losses stay fp32: they are tiny, and CE/MSE in bf16 buys
+        # nothing but noise.
+        feats = feats.float()
 
         ocr_logits = ocr_head(feats)
         if real_iter is None or all(x is None for x in (ocr_labels_real or [])):
@@ -348,7 +503,10 @@ def main(argv=None):
             loss_ocr = ocr_reconstruction_loss(ocr_logits, padded)
             w_ocr = cfg.w_ocr
 
-        loss_mp = _masked_patch_step(tower, mp_head, images, cfg)
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            loss_mp = _masked_patch_step(tower, mp_head, images, cfg).float()
 
         ori_logits = ori_head(feats)
         if real_iter is None:
@@ -382,6 +540,9 @@ def main(argv=None):
         loss.backward()
         clip_or_check_grad_norm(modules, 1.0, step=step)
         optimizer.step()
+        scheduler.step()
+        if ema is not None:
+            ema.update(tower)
 
         logger.log(step, {
             "loss": float(loss.detach()),
@@ -389,6 +550,7 @@ def main(argv=None):
             "mp": float(loss_mp.detach()),
             "ori": float(loss_ori.detach()),
             "layout": float(loss_layout.detach()),
+            "lr": float(scheduler.get_last_lr()[0]),
         })
         if args.save_every and step % args.save_every == 0 and not args.smoke:
             _save_checkpoint(
@@ -401,6 +563,7 @@ def main(argv=None):
                 ori_head,
                 layout_head,
                 optimizer,
+                ema,
             )
 
     logger.close()
@@ -415,6 +578,7 @@ def main(argv=None):
             ori_head,
             layout_head,
             optimizer,
+            ema,
         )
     dt = time.time() - t0
     mode = "real-data" if args.data else "smoke"
