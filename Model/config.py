@@ -757,6 +757,13 @@ class TrainingConfig:
     save_every: int = 1000
     keep_last_n: int = 3
     resume: str = ""  # path to a checkpoint dir or ""
+    # On resume, fast-forward the (deterministic) data stream past the batches
+    # the checkpointed run already consumed. Without this the stream restarts
+    # at row 0 while step keeps counting — the run silently retrains on the
+    # head of the corpus instead of continuing (OPT-class replay). Costs one
+    # pass of read+collate over the skipped rows; disable only for smoke-style
+    # resumes where data order doesn't matter.
+    resume_skip_data: bool = True
 
     # logging
     log_every: int = 10

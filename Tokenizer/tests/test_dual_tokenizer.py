@@ -68,6 +68,31 @@ class DualTokenizerTest(unittest.TestCase):
             [("general", "hello"), ("space", NNBSP), ("general", "world")],
         )
 
+    def test_digits_inside_mongolian_run_round_trip_segmentation(self):
+        # Mixed-script boundary inside one word-like run: segmentation must
+        # reconstruct the original text exactly (lossless routing), with the
+        # digits on the general track.
+        text = "ᠮᠣᠩᠭᠣᠯ123ᠪᠢᠴᠢᠭ"
+        spans = segment_by_language(text)
+        self.assertEqual("".join(span.text for span in spans), text)
+        self.assertEqual([span.lang for span in spans], ["mn", "general", "mn"])
+
+    def test_cyrillic_between_mongolian_round_trips(self):
+        text = "ᠮᠣᠩᠭᠣᠯ бичиг ᠪᠢᠴᠢᠭ"
+        spans = segment_by_language(text)
+        self.assertEqual("".join(span.text for span in spans), text)
+        self.assertEqual(
+            [span.lang for span in spans],
+            ["mn", "space", "general", "space", "mn"],
+        )
+
+    def test_nnbsp_adjacent_to_plain_space_round_trips(self):
+        # NNBSP straddling a Mongolian word and a plain space: whatever track
+        # the router picks, the concatenation of spans must stay lossless.
+        text = "ᠨᠡᠷ" + NNBSP + " ᠦᠦ"
+        spans = segment_by_language(text)
+        self.assertEqual("".join(span.text for span in spans), text)
+
     def test_cjk_punctuation_routes_to_general(self):
         spans = segment_by_language("这。图")
         self.assertEqual(
