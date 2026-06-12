@@ -39,7 +39,7 @@ import time
 import unicodedata
 import zipfile
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from multiprocessing import Pool
 from typing import Iterable, Iterator, Optional
 
