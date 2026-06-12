@@ -46,6 +46,7 @@ from Model.training.omvt_checkpoint import (
     load_omvt_payload,
     tower_state_from_payload,
 )
+from Model.training.status import StatusReporter
 from Tokenizer.multimodal import PILImageProcessor
 from Tokenizer.multimodal.image_placeholders import image_patch_count
 from scripts.train_rdt import CONFIG_CHOICES, _resolve_mamba_backend
@@ -319,6 +320,19 @@ def main(argv=None):
 
     Path(args.output).mkdir(parents=True, exist_ok=True)
     logger = RankZeroLogger(args.output, enable_tensorboard=False)
+    # Feed monitor/ so `scripts.rdt_monitor serve|tui|status --run <output>`
+    # (and its web dashboard) work on VLM runs, not just train_rdt.
+    reporter = StatusReporter(
+        args.output,
+        run_metadata={"phase": "vlm_align", "config": args.config},
+        max_steps=args.steps,
+    )
+
+    def report(step: int, loss: float) -> None:
+        reporter.update(
+            step,
+            {"loss": loss, "lr": optimizer.param_groups[0]["lr"]},
+        )
 
     t0 = time.time()
     completed = False
@@ -348,6 +362,7 @@ def main(argv=None):
                     device=device,
                 )
                 logger.log(state.step, {"loss": metrics["loss"]})
+                report(state.step, metrics["loss"])
                 if args.save_every and state.step % args.save_every == 0:
                     save_checkpoint(
                         args.output,
@@ -394,6 +409,7 @@ def main(argv=None):
                 state.step = step
 
                 logger.log(step, {"loss": float(loss.detach())})
+                report(step, float(loss.detach()))
                 if args.save_every and step % args.save_every == 0:
                     save_checkpoint(
                         args.output,
@@ -406,6 +422,7 @@ def main(argv=None):
         completed = True
     finally:
         logger.close()
+        reporter.finish("finished" if completed else "crashed")
         if completed and not args.smoke:
             save_checkpoint(
                 args.output,
