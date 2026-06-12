@@ -376,6 +376,8 @@ button:hover { border-color:var(--muted); cursor:pointer; }
     <select id="ref"><option value="2000">2s</option>
     <option value="5000" selected>5s</option><option value="15000">15s</option>
     <option value="0">pause</option></select></label>
+  <label class="muted" title="include warmup outliers in the y axis">
+    <input type="checkbox" id="fully"> full y</label>
   <span id="ctl"></span>
 </div>
 <div id="bar"><div></div></div>
@@ -400,7 +402,15 @@ function fmtNum(v) {
   if (typeof v !== "number") return String(v);
   if (v !== 0 && (Math.abs(v) < 1e-3 || Math.abs(v) >= 1e5))
     return v.toExponential(2);
-  return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(4);
+  return String(parseFloat(v.toPrecision(5)));
+}
+function yRange(values) {
+  const v = values.slice().sort((a, b) => a - b);
+  const q = (p) => v[Math.min(v.length - 1, Math.round(p * (v.length - 1)))];
+  let lo = q(0.01), hi = q(0.99);
+  if (!(hi > lo)) { lo = v[0]; hi = v[v.length - 1]; }
+  const pad = (hi - lo) * 0.08 || Math.abs(hi) * 0.05 || 1;
+  return [lo - pad, hi + pad];
 }
 function smooth(data, w) {
   if (data.length < w * 2) return null;
@@ -417,7 +427,6 @@ function ensureChart(key) {
   const box = document.createElement("div");
   box.className = "chart";
   box.innerHTML = "<h2>" + key + "</h2><div style='position:relative;height:220px'><canvas></canvas></div>";
-  const anchors = Object.keys(charts);
   $("charts").appendChild(box);
   const css = getComputedStyle(document.body);
   const c = new Chart(box.querySelector("canvas"), {
@@ -495,6 +504,14 @@ function render(st, rows) {
     c.data.datasets[0].data = data;
     const sm = key === "loss" ? smooth(data, Math.max(5, Math.round(data.length / 40))) : null;
     c.data.datasets[1].data = sm || [];
+    if ($("fully").checked) {
+      c.options.scales.y.min = undefined;
+      c.options.scales.y.max = undefined;
+    } else {
+      const [lo, hi] = yRange(data.map((p) => p.y));
+      c.options.scales.y.min = lo;
+      c.options.scales.y.max = hi;
+    }
     c.update("none");
   }
 }
@@ -517,6 +534,7 @@ async function init() {
   };
   $("ref").onchange = arm;
   $("pts").onchange = tick;
+  $("fully").onchange = tick;
   arm();
   tick();
 }
