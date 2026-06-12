@@ -192,8 +192,19 @@ class DualTrackTokenizer:
         self.general_global_to_local: dict[int, int] = {}
         for token, local_id in general.get_vocab().items():
             global_id = unified_vocab.get(token)
-            if global_id is not None and gen_lo <= global_id < gen_hi:
-                self.general_local_to_global[local_id] = global_id
+            if global_id is None:
+                continue
+            # A surface string present in BOTH tracks (ASCII letters, digits,
+            # punctuation picked up by MorphBPE from Latin fragments in the
+            # Mongolian corpus) owns a single unified id in the MorphBPE
+            # segment. The general track must still map onto that shared id:
+            # gating the forward map on the general segment range turned every
+            # such piece — including the byte-level fallback atoms — into
+            # <unk>, destroying ~27% of English and ~29% of code tokens.
+            self.general_local_to_global[local_id] = global_id
+            if gen_lo <= global_id < gen_hi:
+                # The reverse map stays segment-scoped: out-of-segment ids
+                # decode through the unified id->token table instead.
                 self.general_global_to_local[global_id] = local_id
 
     @property
