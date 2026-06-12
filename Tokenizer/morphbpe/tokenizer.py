@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any
 
 from Tokenizer.traditional_mongolian.stemmer import MongolStemmer
-from Tokenizer.traditional_mongolian.unicode_norm import strip_all_with_map
+from Tokenizer.traditional_mongolian.unicode_norm import CTRL_ALL, strip_all_with_map
 
 from . import serialization
 from .offsets import MorphToken, Piece, split_on_ascii_space
@@ -27,6 +27,11 @@ class MorphBPETokenizer:
         self.min_boundary_confidence = min_boundary_confidence
         self.seed_alphabet = seed_alphabet
         self._id_to_token = {i: tok for tok, i in self.vocab.items()}
+        # MVS/FVS preservation is gated on the vocab: vocabularies that carry
+        # the control characters as tokens (v3+ builds) keep them in the id
+        # stream; older vocabularies fold them exactly as before, so v2
+        # bundles stay bit-identical.
+        self._preserve_controls = all(ch in self.vocab for ch in CTRL_ALL)
 
     # ---- io ----
 
@@ -62,6 +67,38 @@ class MorphBPETokenizer:
         return tokens
 
     def tokenize_word(self, word: str, base_start: int = 0) -> list[MorphToken]:
+        if not self._preserve_controls:
+            return self._tokenize_clean_word(word, base_start)
+
+        # Controls are hard segmentation boundaries: each control character
+        # becomes its own token at its original position and BPE runs on the
+        # control-free segments between them. MVS only ever marks the
+        # stem/separated-suffix junction, so splitting there is exactly the
+        # morpheme boundary MorphBPE wants anyway; FVS/NIRUGU are rare (2.4‰)
+        # word-internal marks where the fertility cost is negligible. Within
+        # a clean segment skeleton offsets equal original offsets, which also
+        # sidesteps the skeleton-vs-original coordinate drift the legacy path
+        # has for multi-boundary words with embedded controls.
+        tokens: list[MorphToken] = []
+        seg_start = 0
+        for i, ch in enumerate(word):
+            if ch not in CTRL_ALL:
+                continue
+            if i > seg_start:
+                tokens.extend(
+                    self._tokenize_clean_word(word[seg_start:i], base_start + seg_start)
+                )
+            tokens.append(
+                MorphToken(ch, self.vocab[ch], base_start + i, base_start + i + 1)
+            )
+            seg_start = i + 1
+        if seg_start < len(word):
+            tokens.extend(
+                self._tokenize_clean_word(word[seg_start:], base_start + seg_start)
+            )
+        return tokens
+
+    def _tokenize_clean_word(self, word: str, base_start: int = 0) -> list[MorphToken]:
         skeleton, boundary_map = strip_all_with_map(word)
         if not skeleton:
             return []
