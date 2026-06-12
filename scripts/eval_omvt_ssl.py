@@ -59,6 +59,13 @@ from scripts.train_omvt_ssl import (  # noqa: E402
 
 def _iter_batches(path: str, batch_size: int, proc: PILImageProcessor, limit: int):
     """One finite pass over a JSONL, yielding image batches + optional labels."""
+
+    def _batch(rows: list[dict]) -> dict:
+        return {
+            "images": proc([r["images"][0] for r in rows]),
+            "ocr_labels": [_first_seq(r.get("ocr_labels")) for r in rows],
+        }
+
     buf: list[dict] = []
     yielded = 0
     with open(path, "r", encoding="utf-8") as fh:
@@ -72,14 +79,15 @@ def _iter_batches(path: str, batch_size: int, proc: PILImageProcessor, limit: in
             buf.append(row)
             if len(buf) < batch_size:
                 continue
-            yield {
-                "images": proc([r["images"][0] for r in buf]),
-                "ocr_labels": [_first_seq(r.get("ocr_labels")) for r in buf],
-            }
+            yield _batch(buf)
             buf = []
             yielded += 1
             if limit and yielded >= limit:
                 return
+    if buf:
+        # Flush the final partial batch: on a small eval set, dropping it
+        # would silently discard up to batch_size-1 rows from the metrics.
+        yield _batch(buf)
 
 
 @torch.no_grad()
@@ -202,6 +210,8 @@ def main(argv=None) -> int:
             patch_pixels=cfg.square_patch[0] * cfg.square_patch[1] * cfg.in_channels,
         ).to(device),
         "ori": OrientationHead(cfg.d_vision).to(device),
+        # Loaded only to validate the checkpoint is complete; no layout metric
+        # is computed because page datasets carry no reading-order labels.
         "layout": LayoutOrderHead(cfg.d_vision, max_positions=cfg.compress_to).to(device),
     }
     heads["ocr"].load_state_dict(payload["ocr_head"])

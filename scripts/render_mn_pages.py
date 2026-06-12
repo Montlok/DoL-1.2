@@ -381,8 +381,9 @@ def main() -> int:
     pdf_dir.mkdir(parents=True, exist_ok=True)
     page_dir.mkdir(parents=True, exist_ok=True)
 
-    # Resume support: a doc whose rows are already in meta.jsonl is complete
-    # (rows are written only after its PDF + all pages succeed) — skip it.
+    # Resume support: a doc with any row in meta.jsonl is complete — meta rows
+    # are written and flushed only after the doc's PDF, every page PNG and all
+    # of its (already flushed) ssl rows — so skip it.
     done_ids: set[str] = set()
     meta_path = out_dir / "meta.jsonl"
     if meta_path.exists():
@@ -482,6 +483,8 @@ def main() -> int:
             pdf.save(pdf_path, deflate=True)
             pdf.close()
 
+            doc_ssl_rows: list[str] = []
+            doc_meta_rows: list[str] = []
             for pi, p in enumerate(pages):
                 png_path = page_dir / f"{doc_id}_p{pi:03d}.png"
                 img = Image.open(png_path).convert("L")
@@ -491,21 +494,31 @@ def main() -> int:
 
                 ids = bundle.encode(p["text"], add_bos=False, add_eos=False)
                 ids = ids[: args.max_label_tokens]
-                ssl_fh.write(json.dumps({
+                doc_ssl_rows.append(json.dumps({
                     "images": [str(png_path.resolve())],
                     "image_sizes": [[img.height, img.width]],
                     "ocr_labels": [ids],
-                }, ensure_ascii=False) + "\n")
-                meta_fh.write(json.dumps({
+                }, ensure_ascii=False))
+                doc_meta_rows.append(json.dumps({
                     "doc_id": doc_id,
                     "pdf": str(pdf_path.resolve()),
                     "page_index": pi,
                     "kind": p["kind"],
                     "n_label_tokens": len(ids),
                     "text": p["text"],
-                }, ensure_ascii=False) + "\n")
+                }, ensure_ascii=False))
                 n_pages += 1
                 n_snippets += p["kind"] == "snippet"
+
+            # Commit the whole doc at once, ssl rows flushed BEFORE the meta
+            # rows that mark it done for resume. A crash inside this window
+            # can only re-render the doc on the next run (duplicate ssl rows
+            # at worst); it can never mark a doc done whose ssl rows were
+            # still sitting in a lost write buffer.
+            ssl_fh.write("".join(row + "\n" for row in doc_ssl_rows))
+            ssl_fh.flush()
+            meta_fh.write("".join(row + "\n" for row in doc_meta_rows))
+            meta_fh.flush()
             n_docs += 1
             if n_docs % 10 == 0:
                 print(f"[render-mn] {n_docs} docs, {n_pages} pages", flush=True)

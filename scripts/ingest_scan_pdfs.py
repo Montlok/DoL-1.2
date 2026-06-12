@@ -35,6 +35,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import unicodedata
@@ -139,6 +140,13 @@ def main() -> int:
             n_pdf += 1
             stem = unicodedata.normalize("NFC", pdf_path.stem)
             stem = "".join(ch if ch.isalnum() else "_" for ch in stem)[:64]
+            # Sanitized+truncated stems can collide across books (same title in
+            # different dirs would silently skip or overwrite each other); a
+            # path digest keeps page names — and the resume keys derived from
+            # them — unique per source file.
+            stem += "_" + hashlib.sha1(
+                str(pdf_path.resolve()).encode("utf-8")
+            ).hexdigest()[:8]
             limit = args.max_pages_per_pdf or page_count
             rotation = 0
             for key, deg in rotate_map.items():
@@ -158,7 +166,11 @@ def main() -> int:
                     )
                     img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
                     if rotation:
-                        img = img.rotate(rotation, expand=True)
+                        # Paper-colored fill: non-right-angle rotations must
+                        # not introduce black corners ahead of the ink filter.
+                        img = img.rotate(
+                            rotation, expand=True, fillcolor=args.pad_fill
+                        )
 
                     halves: list[tuple[str, Image.Image]] = []
                     aspect = img.width / max(img.height, 1)
@@ -183,10 +195,15 @@ def main() -> int:
                         half = _pad_square(half, args.pad_fill)
                         png_path = page_dir / name
                         half.save(png_path)
+                        # The ssl row is flushed before its meta row so that
+                        # the resume key (meta presence) implies the ssl row
+                        # is on disk; a crash in between re-emits the page on
+                        # rerun — a duplicate row at worst, never a lost one.
                         ssl_fh.write(json.dumps({
                             "images": [str(png_path.resolve())],
                             "image_sizes": [[half.height, half.width]],
                         }, ensure_ascii=False) + "\n")
+                        ssl_fh.flush()
                         meta_row = {
                             "image": name,
                             "pdf": str(pdf_path.resolve()),
@@ -203,6 +220,7 @@ def main() -> int:
                         meta_fh.write(
                             json.dumps(meta_row, ensure_ascii=False) + "\n"
                         )
+                        meta_fh.flush()
                         n_page += 1
                 except Exception as exc:
                     n_err += 1

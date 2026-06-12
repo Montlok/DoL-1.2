@@ -482,8 +482,8 @@ def main(argv=None):
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
             feats = tower(images)["compressed"]  # [B, compress_to, d_vision]
-        # Heads and losses stay fp32: they are tiny, and CE/MSE in bf16 buys
-        # nothing but noise.
+        # The OCR/orientation/layout heads and their CE losses run fp32: they
+        # are tiny, and CE in bf16 buys nothing but noise.
         feats = feats.float()
 
         ocr_logits = ocr_head(feats)
@@ -503,6 +503,9 @@ def main(argv=None):
             loss_ocr = ocr_reconstruction_loss(ocr_logits, padded)
             w_ocr = cfg.w_ocr
 
+        # The masked-patch step is dominated by its own square-encoder
+        # forward, so the whole step (head included) runs under autocast like
+        # the main tower pass; mse_loss is autocast-promoted back to fp32.
         with torch.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=use_bf16
         ):
