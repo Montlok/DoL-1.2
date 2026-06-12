@@ -10,7 +10,7 @@ from typing import Iterable
 
 from Tokenizer.traditional_mongolian.alphabet import MONGOLIAN_LETTERS
 from Tokenizer.traditional_mongolian.stemmer import MongolStemmer
-from Tokenizer.traditional_mongolian.unicode_norm import strip_all_with_map
+from Tokenizer.traditional_mongolian.unicode_norm import CTRL_ALL, strip_all_with_map
 
 from .offsets import split_on_ascii_space
 from .tokenizer import MorphBPETokenizer
@@ -52,6 +52,14 @@ class MorphBPETrainer:
         if self.seed_alphabet:
             for ch in MONGOLIAN_LETTERS:
                 vocab.setdefault(ch, len(vocab))
+        # Register MVS/FVS/NIRUGU/NNBSP as standalone tokens: their presence
+        # in the vocab is what switches MorphBPETokenizer into control-
+        # preserving mode (encode keeps them in the id stream instead of
+        # folding them — the GPT-2-Turkish-İ class of loss, 2.65% of mn
+        # corpus chars). BPE itself still runs on control-free segments, so
+        # merges never cross or include them.
+        for ch in sorted(CTRL_ALL):
+            vocab.setdefault(ch, len(vocab))
         for syms, _ends, _forbidden, _count in words:
             for piece in syms:
                 vocab.setdefault(piece, len(vocab))
