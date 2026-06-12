@@ -34,8 +34,13 @@ from Tokenizer.unified.vocab import SPECIAL_TOKENS, make_byte_tokens
 
 
 def iter_texts(paths: list[str], sample_rows: int):
-    seen = 0
+    # Spread the sample budget evenly across files instead of reading the
+    # glob in path order: a sorted multi-corpus glob would otherwise spend
+    # the whole budget on the alphabetically-first domain (e.g. code/) and
+    # report every other language's tokens as zero-hit.
+    per_file = max(1, sample_rows // max(1, len(paths))) if sample_rows > 0 else 0
     for path in paths:
+        taken = 0
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -49,9 +54,9 @@ def iter_texts(paths: list[str], sample_rows: int):
                 if not text:
                     continue
                 yield text
-                seen += 1
-                if 0 < sample_rows <= seen:
-                    return
+                taken += 1
+                if 0 < per_file <= taken:
+                    break
 
 
 def compute_coverage(bundle: TokenizerBundle, texts) -> dict:
