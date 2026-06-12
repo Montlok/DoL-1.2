@@ -97,4 +97,44 @@ def build_ocr_row(
     }
 
 
-__all__ = ["build_ocr_row"]
+def split_ocr_row(
+    row: dict[str, Any],
+    *,
+    ignore_index: int = -100,
+    eos_id: int | None = None,
+) -> tuple[list[int], list[int], Any]:
+    """Invert :func:`build_ocr_row`: recover ``(prompt, target, image_ref)``.
+
+    The prompt is the leading run of positions whose label is ``ignore_index``
+    (BOS + image slots + instruction); the supervised tail is the reference
+    transcription. With ``eos_id`` set, one trailing EOS is stripped from the
+    target so the reference matches the transcription text exactly.
+
+    Generative evaluation feeds the prompt to ``generate`` and scores the
+    sampled continuation against the returned target.
+    """
+    input_ids = [int(t) for t in row["input_ids"]]
+    labels = [int(t) for t in row["labels"]]
+    if len(input_ids) != len(labels):
+        raise ValueError("input_ids and labels must have aligned lengths")
+    split = 0
+    while split < len(labels) and labels[split] == ignore_index:
+        split += 1
+    if split == 0 or split == len(labels):
+        raise ValueError(
+            "OCR row must start with a masked prompt followed by a "
+            "supervised target"
+        )
+    if any(t == ignore_index for t in labels[split:]):
+        raise ValueError("supervised target must be a contiguous tail")
+    target = input_ids[split:]
+    if eos_id is not None and target and target[-1] == eos_id:
+        target = target[:-1]
+    if not target:
+        raise ValueError("target is empty after stripping EOS")
+    images = row.get("images") or []
+    image_ref = images[0] if images else None
+    return input_ids[:split], target, image_ref
+
+
+__all__ = ["build_ocr_row", "split_ocr_row"]
