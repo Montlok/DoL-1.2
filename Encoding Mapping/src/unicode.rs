@@ -133,18 +133,27 @@ fn is_mvs_ae_word(index: usize, segment: &[u32]) -> bool {
 }
 
 fn convert_word_contextually(word: &[u32]) -> Vec<u32> {
+    let word = strip_glide_ya(word);
+    let word = word.as_slice();
     let base_indices: Vec<usize> = word
         .iter()
         .enumerate()
         .filter_map(|(index, &cp)| (!mongol::is_control(cp)).then_some(index))
         .collect();
     if base_indices.is_empty() {
-        return Vec::new();
+        // A bare separator word (corpus noise): keep the suffix gap visible
+        // instead of silently dropping it.
+        return word
+            .iter()
+            .filter(|&&cp| cp == mongol::MVS)
+            .map(|_| 0xE263)
+            .collect();
     }
 
     let first = *base_indices.first().unwrap();
     let last = *base_indices.last().unwrap();
     let mut output = Vec::new();
+    let mut prev_base: Option<usize> = None;
 
     for &index in &base_indices {
         let cp = word[index];
@@ -165,7 +174,20 @@ fn convert_word_contextually(word: &[u32]) -> Vec<u32> {
             .filter(|&next| mongol::is_fvs(next))
             .unwrap_or(0);
 
+        // base_indices treats MVS (inside the is_control range) as a control
+        // and drops it, which used to swallow the suffix separator of every
+        // word the fixed table does not list (᠊ᠪᠠᠨ, ᠊ᠲᠠᠢ, …). Re-emit it as
+        // the Menksoft gap E263 — except before a separated final vowel,
+        // whose post-MVS glyphs (E26A/E274/…) carry the gap themselves.
+        let gap_lo = prev_base.map_or(0, |p| p + 1);
+        if word[gap_lo..index].contains(&mongol::MVS)
+            && !(matches!(cp, mongol::A | mongol::E) && index == last)
+        {
+            output.push(0xE263);
+        }
+
         output.push(map_letter(word, index, cp, location, above, below, fvs));
+        prev_base = Some(index);
     }
 
     output
@@ -180,6 +202,27 @@ fn map_letter(
     below: u32,
     fvs: u32,
 ) -> u32 {
+    // Right after the suffix separator a letter takes its dedicated
+    // suffix-initial form where Menksoft defines one (GB/T fixed sequences:
+    // ᠊ᠲ E309, ᠊ᠳ E310, ᠊ᠶ E321, ᠊ᠤ E292, ᠊ᠦ E2AC, single ᠊ᠢ E282); letters
+    // without one (ᠪ …) keep their regular positional form. ᠠ/ᠡ are handled
+    // by their own post-MVS branches below.
+    if above == mongol::MVS && fvs == 0 {
+        match cp {
+            mongol::TA => return 0xE309,
+            mongol::DA => return 0xE310,
+            mongol::YA => return 0xE321,
+            mongol::U => return 0xE292,
+            mongol::UE => return 0xE2AC,
+            mongol::I if below == 0 => return 0xE282,
+            // Suffix-initial ᠠ/ᠡ stay headless (the separated forms the
+            // fixed ᠊ᠠᠴᠠ sequence uses) — the regular word-initial forms
+            // carry a crown and would read as a fresh word.
+            mongol::A => return 0xE26A,
+            mongol::E => return 0xE274,
+            _ => {}
+        }
+    }
     match cp {
         mongol::A => match location {
             Location::Isol => match fvs {
@@ -819,7 +862,13 @@ fn map_qg(location: Location, below: u32, fvs: u32, is_ga: bool) -> u32 {
                     }
                 }
                 _ => {
-                    if wants_tooth(below) {
+                    if selects_feminine_qg(below) {
+                        if is_ou_vowel(below) {
+                            0xE2E6
+                        } else {
+                            0xE2E3
+                        }
+                    } else if wants_tooth(below) {
                         0xE2E1
                     } else {
                         0xE2E4
@@ -854,7 +903,13 @@ fn map_qg(location: Location, below: u32, fvs: u32, is_ga: bool) -> u32 {
                     }
                 }
                 _ => {
-                    if is_ou_vowel(below) {
+                    if selects_feminine_qg(below) {
+                        if is_ou_vowel(below) {
+                            0xE2ED
+                        } else {
+                            0xE2EB
+                        }
+                    } else if is_ou_vowel(below) {
                         0xE2EC
                     } else {
                         0xE2EE
@@ -899,7 +954,13 @@ fn map_qg(location: Location, below: u32, fvs: u32, is_ga: bool) -> u32 {
                 }
             }
             _ => {
-                if wants_tooth(below) {
+                if selects_feminine_qg(below) {
+                    if is_ou_vowel(below) {
+                        0xE2D4
+                    } else {
+                        0xE2D0
+                    }
+                } else if wants_tooth(below) {
                     0xE2CE
                 } else {
                     0xE2D2
@@ -929,6 +990,12 @@ fn map_qg(location: Location, below: u32, fvs: u32, is_ga: bool) -> u32 {
             _ => {
                 if below == mongol::MVS {
                     0xE2D6
+                } else if selects_feminine_qg(below) {
+                    if is_ou_vowel(below) {
+                        0xE2DD
+                    } else {
+                        0xE2DA
+                    }
                 } else if wants_tooth(below) {
                     0xE2D8
                 } else {
@@ -1045,6 +1112,30 @@ fn context_calls_for_double_tooth_i(word: &[u32], index: usize, above: u32, belo
             && !mongol::needs_long_tooth_u(word, index - 1))
 }
 
+/// Drop the glide ᠶ of a vowel+ᠶᠢ cluster. Menksoft writes that whole
+/// cluster as the double-tooth i (E281) with no separate yod glyph — real
+/// Menksoft text layers never put a ya-code before an i-code — so the ᠶ
+/// must not emit its own letterform; the following ᠢ then sees the vowel
+/// as ``above`` and takes E281 via the double-tooth rule. Word-initial and
+/// FVS-marked ᠶ (᠊ᠶ᠋ᠢᠨ etc.) keep their explicit glyphs.
+fn strip_glide_ya(word: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(word.len());
+    for (index, &cp) in word.iter().enumerate() {
+        if cp == mongol::YA
+            && !word.get(index + 1).copied().is_some_and(mongol::is_fvs)
+            && matches!(
+                previous_base(word, index),
+                mongol::A | mongol::E | mongol::O | mongol::U | mongol::OE | mongol::UE
+            )
+            && next_base(word, index) == mongol::I
+        {
+            continue;
+        }
+        out.push(cp);
+    }
+    out
+}
+
 fn previous_base(word: &[u32], index: usize) -> u32 {
     word[..index]
         .iter()
@@ -1102,6 +1193,14 @@ fn wants_tooth(codepoint: u32) -> bool {
 
 fn is_ou_vowel(codepoint: u32) -> bool {
     matches!(codepoint, mongol::O | mongol::U | mongol::OE | mongol::UE)
+}
+
+/// ᠬ/ᠭ take their feminine letterforms — the glyphs FVS2 forces by hand —
+/// before the feminine vowels ᠡ/ᠥ/ᠦ and before the neutral ᠢ: ki/gi is
+/// written with the feminine form regardless of the word's vowel class
+/// (cf. ᠬᠢᠲᠠᠳ, and the ᠊ᠳᠠᠬᠢ fixed sequence which uses E2DA).
+fn selects_feminine_qg(codepoint: u32) -> bool {
+    matches!(codepoint, mongol::E | mongol::OE | mongol::UE | mongol::I)
 }
 
 fn is_round_letter_including_qg(codepoint: u32) -> bool {
