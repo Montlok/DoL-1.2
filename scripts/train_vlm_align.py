@@ -103,6 +103,12 @@ def parse_args(argv=None):
         help="OMVT tower width for from-scratch towers; ignored when "
         "--init-omvt-checkpoint provides its own omvt_config",
     )
+    p.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="'auto' = cuda if available else cpu (legacy behavior)",
+    )
     return p.parse_args(argv)
 
 
@@ -244,7 +250,10 @@ def main(argv=None):
         return 2
 
     torch.manual_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if getattr(args, "device", "auto") == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     rdt_cfg = CONFIG_CHOICES[args.config]()
     # cap seq_len to the synthetic layout (tiny config is 2048 by default but
