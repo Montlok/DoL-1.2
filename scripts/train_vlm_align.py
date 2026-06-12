@@ -78,20 +78,55 @@ def parse_args(argv=None):
     p.add_argument("--output", default="outputs/vlm_align")
     p.add_argument("--init-rdt-checkpoint", default="")
     p.add_argument("--init-omvt-checkpoint", default="")
+    p.add_argument(
+        "--use-ema-tower",
+        action="store_true",
+        help="when --init-omvt-checkpoint carries 'tower_ema', overlay the EMA "
+        "weights on the tower state before loading",
+    )
     p.add_argument("--resume", default="")
     p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--precision",
+        choices=("auto", "fp32", "bf16"),
+        default="fp32",
+        help="'auto' = bf16 on cuda, fp32 elsewhere; default keeps the legacy "
+        "fp32 smoke behavior",
+    )
+    p.add_argument("--warmup-steps", type=int, default=1)
+    p.add_argument(
+        "--d-vision",
+        type=int,
+        default=64,
+        help="OMVT tower width for from-scratch towers; ignored when "
+        "--init-omvt-checkpoint provides its own omvt_config",
+    )
     return p.parse_args(argv)
 
 
 def _build_omvt_cfg(args) -> OMVTConfig:
+    if args.init_omvt_checkpoint:
+        # The checkpoint's own omvt_config is the only authoritative source of
+        # tower geometry: building a CLI-derived config here and loading a
+        # prod-geometry tower (e.g. d_vision=512, dataclass patch shapes) into
+        # it would fail on shape mismatch.
+        payload = _load_omvt_payload(args.init_omvt_checkpoint)
+        if isinstance(payload, dict) and "omvt_config" in payload:
+            cfg = OMVTConfig(**payload["omvt_config"])
+            if args.image_size != cfg.image_size:
+                print(
+                    f"[init] --image-size {args.image_size} -> {cfg.image_size} "
+                    "(from OMVT checkpoint)",
+                )
+            return cfg
     n_image_tokens = args.n_image_tokens
     if n_image_tokens is None:
         n_image_tokens = image_patch_count(args.image_size, args.image_size)
     return OMVTConfig(
         image_size=args.image_size,
-        d_vision=64,
+        d_vision=args.d_vision,
         vertical_patch=(args.image_size // 2, args.image_size // 4),
         horizontal_patch=(args.image_size // 4, args.image_size // 2),
         square_patch=(args.image_size // 4, args.image_size // 4),
@@ -140,7 +175,7 @@ def _load_rdt_init(model: RDTForCausalLM, path: str) -> None:
         )
 
 
-def _resolve_omvt_state(path: str):
+def _load_omvt_payload(path: str):
     p = Path(path)
     if p.is_dir():
         candidates = [
@@ -153,16 +188,29 @@ def _resolve_omvt_state(path: str):
                 break
     if not p.exists():
         raise FileNotFoundError(f"OMVT checkpoint not found: {path}")
-    payload = torch.load(p, map_location="cpu", weights_only=False)
-    return payload["tower"] if isinstance(payload, dict) and "tower" in payload else payload
+    return torch.load(p, map_location="cpu", weights_only=False)
 
 
-def _load_omvt_init(model: RDTForCausalLM, path: str) -> None:
+def _resolve_omvt_state(path: str, use_ema: bool = False):
+    payload = _load_omvt_payload(path)
+    if not (isinstance(payload, dict) and "tower" in payload):
+        return payload
+    state = payload["tower"]
+    if use_ema and payload.get("tower_ema"):
+        # EMA shadows cover only floating-point entries; overlay them so
+        # buffers keep their trained values.
+        state = dict(state)
+        state.update(payload["tower_ema"])
+        print("[init] using EMA tower weights")
+    return state
+
+
+def _load_omvt_init(model: RDTForCausalLM, path: str, use_ema: bool = False) -> None:
     if not path:
         return
     if model.vision.omvt is None:
         raise ValueError("OMVT injector must be installed before loading tower weights")
-    model.vision.omvt.tower.load_state_dict(_resolve_omvt_state(path))
+    model.vision.omvt.tower.load_state_dict(_resolve_omvt_state(path, use_ema=use_ema))
 
 
 def main(argv=None):
@@ -221,7 +269,7 @@ def main(argv=None):
     model.vision._omvt_cfg = omvt_cfg
     model.vision.omvt = OMVTInjector(rdt_cfg, omvt_cfg).to(device)
     _load_rdt_init(model, args.init_rdt_checkpoint)
-    _load_omvt_init(model, args.init_omvt_checkpoint)
+    _load_omvt_init(model, args.init_omvt_checkpoint, use_ema=args.use_ema_tower)
 
     if args.freeze_rdt:
         for p in model.parameters():
@@ -232,6 +280,10 @@ def main(argv=None):
         for p in model.vision.omvt.tower.parameters():
             p.requires_grad_(False)
 
+    if args.precision == "auto":
+        precision = "bf16" if device.type == "cuda" else "fp32"
+    else:
+        precision = args.precision
     train_cfg = TrainingConfig(
         train_data=args.data,
         seq_len=args.seq_len,
@@ -239,8 +291,8 @@ def main(argv=None):
         learning_rate=args.lr,
         weight_decay=0.05,
         max_steps=args.steps,
-        warmup_steps=1,
-        precision="fp32",
+        warmup_steps=max(1, args.warmup_steps),
+        precision=precision,
         output_dir=args.output,
         save_every=args.save_every,
         resume=args.resume,
