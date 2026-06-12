@@ -60,32 +60,65 @@ def build_image_processor(args: argparse.Namespace) -> Any | None:
     return PILImageProcessor(image_size=args.image_size)
 
 
-def build_omvt_cfg(args: argparse.Namespace) -> OMVTConfig | None:
-    """Construct a balanced :class:`OMVTConfig` from CLI args.
+def make_omvt_cfg(
+    image_size: int,
+    d_vision: int,
+    compress_to: int | None = None,
+    *,
+    preset: str = "derived",
+) -> OMVTConfig:
+    """Single source of truth for CLI-driven OMVT tower geometry.
 
-    The four patch grids cover the canonical OMVT layout: a half-half
-    vertical/horizontal split, a quarter-square grid, and a single
-    layout-level macro patch. Tweak via dataclass replace at the call
-    site if a specialised tower geometry is needed.
+    ``preset="derived"`` is the legacy smoke layout (patch grids scaled from
+    ``image_size``: half-half vertical/horizontal split, quarter-square grid,
+    one layout-level macro patch). ``preset="prod"`` keeps the OMVTConfig
+    dataclass multi-scale defaults (32x8 / 8x32 / 16x16 / 56x56), which is
+    what real-page training uses. Every trainer CLI builds its tower through
+    here so the entry points cannot drift apart again.
     """
 
-    if not getattr(args, "multimodal", False):
-        return None
-    s = args.image_size
-    if s <= 0 or s % 4 != 0:
-        raise ValueError(f"--image-size must be a positive multiple of 4, got {s}")
-    n_image_tokens = args.n_image_tokens
-    if n_image_tokens is None:
-        n_image_tokens = image_patch_count(s, s)
+    if image_size <= 0 or image_size % 4 != 0:
+        raise ValueError(
+            f"image_size must be a positive multiple of 4, got {image_size}"
+        )
+    if preset not in ("derived", "prod"):
+        raise ValueError(f"unknown OMVT preset: {preset!r}")
+    if compress_to is None:
+        compress_to = image_patch_count(image_size, image_size)
+    if preset == "prod":
+        return OMVTConfig(
+            image_size=image_size,
+            d_vision=d_vision,
+            compress_to=compress_to,
+        )
+    s = image_size
     return OMVTConfig(
         image_size=s,
-        d_vision=args.d_vision,
+        d_vision=d_vision,
         vertical_patch=(s // 2, s // 4),
         horizontal_patch=(s // 4, s // 2),
         square_patch=(s // 4, s // 4),
         layout_patch=(s, s),
-        compress_to=n_image_tokens,
+        compress_to=compress_to,
     )
 
 
-__all__ = ["add_multimodal_args", "build_image_processor", "build_omvt_cfg"]
+def build_omvt_cfg(args: argparse.Namespace) -> OMVTConfig | None:
+    """Construct an :class:`OMVTConfig` from CLI args (None when not multimodal)."""
+
+    if not getattr(args, "multimodal", False):
+        return None
+    return make_omvt_cfg(
+        args.image_size,
+        args.d_vision,
+        args.n_image_tokens,
+        preset=getattr(args, "patch_preset", "derived"),
+    )
+
+
+__all__ = [
+    "add_multimodal_args",
+    "build_image_processor",
+    "build_omvt_cfg",
+    "make_omvt_cfg",
+]
