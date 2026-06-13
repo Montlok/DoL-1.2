@@ -51,6 +51,14 @@ and grows as routing collapses, so adding it to the loss pushes the experts to
 divide the token space. An optional router z-loss (the mean squared
 ``logsumexp`` of the router logits) keeps the logits from drifting large.
 
+Padding is excluded from these statistics. When an ``attn_mask`` is threaded in
+(the recurrent blocks pass the model's ``[B, L]`` mask), masked positions are
+dropped from both ``f_i`` and ``P_i`` so a heavily padded batch (SFT / eval) does
+not let near-identical pad hidden states all argmax onto one expert and bias the
+balancer -- the same valid-token denominator convention the ACT ponder cost and
+eval losses already use. With no mask (the bare-FFN path) every position counts,
+matching the original behaviour.
+
 These statistics are computed inside :meth:`forward` and *accumulated* on the
 module across the recurrent loop's repeated calls (the recurrent FFN is weight-
 shared, so one instance is invoked once per step). The accumulators hold live
@@ -184,7 +192,12 @@ class MixtureLoRAFFN(nn.Module):
         threshold = logits.topk(k, dim=-1).values[..., -1:]
         return logits.masked_fill(logits < threshold, float("-inf"))
 
-    def forward(self, x: torch.Tensor, step: int | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        step: int | None = None,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if x.shape[-1] != self.d_model:
             raise ValueError(f"expected last dim {self.d_model}, got {x.shape[-1]}")
 
@@ -207,7 +220,7 @@ class MixtureLoRAFFN(nn.Module):
         weights = torch.softmax(logits, dim=-1)  # [B, L, K]
 
         if self.collect_router_stats:
-            self._accumulate_router_stats(weights, dense_logits)
+            self._accumulate_router_stats(weights, dense_logits, attn_mask)
 
         # Per-token mixed LoRA delta on the w_in pre-activation:
         # expert e contributes (x @ A_e) @ B_e, then mix by router weights.
@@ -219,23 +232,35 @@ class MixtureLoRAFFN(nn.Module):
         return self.w_down(F.silu(gate) * up)
 
     def _accumulate_router_stats(
-        self, weights: torch.Tensor, dense_logits: torch.Tensor
+        self,
+        weights: torch.Tensor,
+        dense_logits: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
     ) -> None:
         """Fold this call's load-balancing statistics into the accumulators.
 
         ``weights`` is the post-softmax routing distribution ``[B, L, K]`` (already
         top-k-masked when ``top_k>0``); ``dense_logits`` is the pre-mask router
-        logits ``[B, L, K]`` for the z-loss. Statistics cover every position
-        (padding included): the FFN gets no attention mask and the pad fraction is
-        small, so -- as in the reference Switch/GShard implementations -- padding
-        is not excluded; this keeps the forward signature untouched.
+        logits ``[B, L, K]`` for the z-loss. ``attn_mask`` is the optional ``[B, L]``
+        valid-token mask: when given, padded positions are dropped from both ``f_i``
+        and ``P_i`` (and the z-loss) so a heavily padded batch does not let identical
+        pad hidden states all argmax onto one expert and bias the balancer. With no
+        mask every position counts (the original Switch/GShard behaviour).
         """
 
-        n_tokens = weights.shape[0] * weights.shape[1]
+        flat = weights.reshape(-1, self.n_experts)
+        dense_flat = dense_logits.reshape(-1, self.n_experts)
+
+        if attn_mask is not None:
+            keep = attn_mask.reshape(-1).to(torch.bool)
+            if keep.shape[0] != flat.shape[0]:
+                raise ValueError("attn_mask must match the [B, L] of the routing input")
+            flat = flat[keep]
+            dense_flat = dense_flat[keep]
+
+        n_tokens = flat.shape[0]
         if n_tokens == 0:
             return
-
-        flat = weights.reshape(n_tokens, self.n_experts)
 
         # P_i: mean router probability per expert.
         prob_mean = flat.mean(dim=0)  # [K]
@@ -256,8 +281,8 @@ class MixtureLoRAFFN(nn.Module):
 
         aux = self.n_experts * torch.sum(load_frac.detach() * prob_mean)
 
-        # z-loss: mean over tokens of logsumexp(logits)^2.
-        z = torch.logsumexp(dense_logits.reshape(n_tokens, self.n_experts), dim=-1)
+        # z-loss: mean over (valid) tokens of logsumexp(logits)^2.
+        z = torch.logsumexp(dense_flat, dim=-1)
         z_loss = torch.mean(z * z)
 
         if self._aux_loss is None:

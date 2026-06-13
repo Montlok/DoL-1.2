@@ -33,11 +33,14 @@ def _build_ffn(cfg):
     return SwiGLU(cfg.d_model, cfg.ffn_hidden)
 
 
-def _apply_ffn(ffn, x, step):
-    """Forward a ``_build_ffn`` FFN, threading the recurrent step index only into
-    a MixtureLoRAFFN (plain SwiGLU has no ``step`` kwarg and ignores it)."""
+def _apply_ffn(ffn, x, step, attn_mask=None):
+    """Forward a ``_build_ffn`` FFN, threading the recurrent step index and the
+    valid-token mask only into a MixtureLoRAFFN (plain SwiGLU takes neither kwarg).
+    The mask lets the MoL router drop padded positions from its load-balancing
+    statistics; it never touches the FFN output, so cold-start bit-compatibility is
+    unaffected."""
     if isinstance(ffn, MixtureLoRAFFN):
-        return ffn(x, step=step)
+        return ffn(x, step=step, attn_mask=attn_mask)
     return ffn(x)
 
 
@@ -108,7 +111,7 @@ class AttnSubLayer(nn.Module):
             cache=cache,
             pos_offset=pos_offset,
         )
-        x = x + _apply_ffn(self.ffn, self.ffn_norm(x), step)
+        x = x + _apply_ffn(self.ffn, self.ffn_norm(x), step, attn_mask)
         return x
 
 
@@ -131,7 +134,7 @@ class MambaSubLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         x = self.mamba(x, attn_mask=attn_mask, cache=cache)
-        x = x + _apply_ffn(self.ffn, self.ffn_norm(x), step)
+        x = x + _apply_ffn(self.ffn, self.ffn_norm(x), step, attn_mask)
 
         if attn_mask is not None:
             x = x * attn_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)

@@ -200,6 +200,63 @@ class AuxLossUnitTest(unittest.TestCase):
         ffn(torch.randn(0, 8, 64))
         self.assertIsNone(ffn.router_losses())
 
+    def test_attn_mask_excludes_padded_positions(self):
+        # The aux/z stats over a batch must equal the stats over only its valid
+        # rows: padding fed with attn_mask=0 contributes nothing. Build a [4, 8]
+        # batch, mask the second half of every row, and compare against the dense
+        # forward on just the kept [4, 4] slice.
+        ffn = self._ffn()
+        with torch.no_grad():
+            ffn.router_alpha.fill_(3.0)
+            ffn.router_proj.weight.normal_()
+        x = torch.randn(4, 8, 64)
+        mask = torch.ones(4, 8, dtype=torch.long)
+        mask[:, 4:] = 0  # second half is padding
+        # Make the padded half a constant (worst case: all argmax to one expert).
+        x[:, 4:] = 5.0
+
+        ffn.reset_router_stats()
+        ffn(x, attn_mask=mask)
+        aux_masked, z_masked = ffn.router_losses()
+
+        ffn.reset_router_stats()
+        ffn(x[:, :4])  # dense forward on the kept rows only
+        aux_kept, z_kept = ffn.router_losses()
+
+        self.assertAlmostEqual(aux_masked.item(), aux_kept.item(), places=5)
+        self.assertAlmostEqual(z_masked.item(), z_kept.item(), places=5)
+
+    def test_attn_mask_all_padding_no_accumulation(self):
+        # A fully padded call contributes no statistics (denominator would be 0).
+        ffn = self._ffn()
+        with torch.no_grad():
+            ffn.router_alpha.fill_(2.0)
+            ffn.router_proj.weight.normal_()
+        ffn.reset_router_stats()
+        ffn(torch.randn(4, 8, 64), attn_mask=torch.zeros(4, 8, dtype=torch.long))
+        self.assertIsNone(ffn.router_losses())
+        self.assertEqual(ffn._router_calls, 0)
+
+    def test_aux_no_mask_bit_identical_to_full_mask(self):
+        # Threading an all-ones mask must reproduce the no-mask statistics exactly
+        # (the v1 path is unchanged when nothing is padded).
+        ffn = self._ffn()
+        with torch.no_grad():
+            ffn.router_alpha.fill_(3.0)
+            ffn.router_proj.weight.normal_()
+        x = torch.randn(8, 16, 64)
+
+        ffn.reset_router_stats()
+        ffn(x)
+        aux_none, z_none = ffn.router_losses()
+
+        ffn.reset_router_stats()
+        ffn(x, attn_mask=torch.ones(8, 16, dtype=torch.long))
+        aux_full, z_full = ffn.router_losses()
+
+        self.assertEqual(aux_none.item(), aux_full.item())
+        self.assertEqual(z_none.item(), z_full.item())
+
 
 class ConfigValidationTest(unittest.TestCase):
     def test_defaults(self):
@@ -318,6 +375,124 @@ class ModelIntegrationTest(unittest.TestCase):
         self.assertTrue(all(g is not None for g in router_grads))
         self.assertTrue(all(torch.isfinite(g).all() for g in router_grads))
         self.assertGreater(sum(g.norm().item() for g in router_grads), 0.0)
+
+    def test_padded_batch_aux_stays_in_bounds(self):
+        # A heavily padded batch (75% padding, labels=ignore on pads) must keep the
+        # aux finite and within [1, n_experts], and must not drift far from the
+        # unpadded value. Before masking, identical pad hidden states all argmax to
+        # one expert and pushed aux *below* its 1.0 floor (an out-of-bounds value);
+        # excluding pad positions from the load stats fixes that.
+        torch.manual_seed(0)
+        model = RDTForCausalLM(self._cfg(mol_aux_weight=0.01, mol_z_weight=0.0)).eval()
+        # Warm + diverge the experts so routing is non-uniform and the bug, if
+        # present, would actually bite.
+        with torch.no_grad():
+            for ffn in _mol_modules(model):
+                ffn.router_alpha.fill_(2.0)
+                ffn.router_proj.weight.normal_(std=0.5)
+                ffn.lora_b.normal_(std=0.02)
+        n_experts = model.cfg.mol_experts
+
+        ids = torch.randint(300, 320, (4, 32))
+        with torch.no_grad():
+            unpadded = model(input_ids=ids, labels=ids)
+        aux_unpadded = unpadded["loss_parts"]["mol_aux"]
+
+        ids_pad = ids.clone()
+        ids_pad[:, 8:] = model.cfg.pad_id  # 8/32 real, 24/32 padding
+        labels_pad = ids_pad.clone()
+        labels_pad[:, 8:] = model.cfg.ignore_index
+        attn_mask = (ids_pad != model.cfg.pad_id).long()
+        with torch.no_grad():
+            padded = model(
+                input_ids=ids_pad, attention_mask=attn_mask, labels=labels_pad
+            )
+        aux_padded = padded["loss_parts"]["mol_aux"]
+
+        self.assertTrue(torch.isfinite(padded["loss"]))
+        self.assertGreaterEqual(aux_padded, 1.0 - 1e-4)  # the floor masking restores
+        self.assertLessEqual(aux_padded, n_experts + 1e-4)
+        # Same router, same real tokens -> the padded aux must stay close to the
+        # unpadded one rather than being dragged toward the pad expert.
+        self.assertLess(abs(aux_padded - aux_unpadded), 0.1)
+
+    def test_aux_keeps_expert_routing_balanced_over_training(self):
+        # The acid test that the aux is *not decoration*: training the FULL loss
+        # (CE + reverse + mol_aux_weight*aux) with the aux on must keep the router's
+        # mean expert distribution P_i far more balanced than training with the aux
+        # off, over several optimizer steps.
+        #
+        # We measure the entropy of P_i -- the per-expert mean routing probability,
+        # averaged over every token and every recurrent step (the same FFN runs once
+        # per step, so we accumulate across calls). P_i is the quantity the aux
+        # gradient actually acts on (f_i is detached in the Switch formulation), and
+        # it is continuous, so the assertion is faithful and not flaky. The argmax
+        # *hard* load can still collapse at a tiny step budget even while P_i is
+        # being flattened -- that is a property of dense routing, not a balancer
+        # failure, so we deliberately score the soft distribution, matching the
+        # degeneracy this feature targets ("balance population usage").
+        #
+        # Empirically (CPU, 20 SGD steps): aux-off collapses P_i onto one expert
+        # (entropy ~0.95) while aux-on drives it to ~uniform (entropy ~ln(K)=1.386).
+        # Warm the router and give the experts a nonzero lora_b so they *can* diverge
+        # and collapse if nothing balances them.
+        def mean_routing_entropy(model, ids):
+            ffn = _mol_modules(model)[0]
+            prob_sum = torch.zeros(ffn.n_experts)
+            calls = [0]
+
+            def hook(mod, inp, kwargs, _out):
+                ref = mod.router_norm(inp[0])
+                step = kwargs.get("step")
+                if mod.step_aware and step is not None and mod.step_embed is not None:
+                    idx = min(max(int(step), 0), mod.step_table - 1)
+                    ref = ref + mod.step_embed[idx]
+                logits = mod.router_bias + mod.router_alpha * torch.tanh(
+                    mod.router_proj(ref)
+                )
+                w = torch.softmax(logits / mod.router_temp, dim=-1).reshape(
+                    -1, mod.n_experts
+                )
+                prob_sum.add_(w.mean(dim=0))
+                calls[0] += 1
+
+            handle = ffn.register_forward_hook(hook, with_kwargs=True)
+            with torch.no_grad():
+                model(input_ids=ids, labels=ids)
+            handle.remove()
+            prob = prob_sum / max(calls[0], 1)
+            prob = prob / prob.sum().clamp(min=1e-12)
+            return float(-(prob * (prob + 1e-12).log()).sum())
+
+        def train(aux_weight, steps=20):
+            torch.manual_seed(0)
+            model = RDTForCausalLM(
+                self._cfg(mol_aux_weight=aux_weight, mol_z_weight=0.0)
+            )
+            with torch.no_grad():
+                for ffn in _mol_modules(model):
+                    ffn.router_alpha.fill_(1.0)
+                    ffn.router_proj.weight.normal_(std=0.5)
+                    ffn.lora_b.normal_(std=0.05)
+            opt = torch.optim.SGD(model.parameters(), lr=0.1)
+            torch.manual_seed(1)
+            ids = torch.randint(300, 320, (4, 24))
+            model.train()
+            for _ in range(steps):
+                out = model(input_ids=ids, labels=ids)
+                opt.zero_grad()
+                out["loss"].backward()
+                opt.step()
+            model.eval()
+            torch.manual_seed(1)
+            return mean_routing_entropy(model, torch.randint(300, 320, (4, 24)))
+
+        ent_off = train(0.0)
+        ent_on = train(1.0)
+        # aux-on must end up clearly more balanced. The observed gap is ~0.43; a
+        # 0.1 margin guards against a regression that silently neutralizes the
+        # balancer while staying comfortably non-flaky.
+        self.assertGreater(ent_on, ent_off + 0.1)
 
     def test_grad_ckpt_aux_matches_no_ckpt(self):
         # Load balancing must be grad-checkpoint safe: with grad_ckpt_recurrent
