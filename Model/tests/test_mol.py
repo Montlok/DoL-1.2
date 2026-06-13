@@ -3,13 +3,16 @@
 """Tests for step-aware Mixture-of-LoRAs in the recurrent FFN (MoL)."""
 
 import unittest
+import warnings
+from dataclasses import replace
 
 import torch
 
-from Model.config import mol_tiny_config
+from Model.config import mol_tiny_config, tiny_config
 from Model.layers.mixture_lora_ffn import MixtureLoRAFFN
 from Model.layers.swiglu import SwiGLU
 from Model.model import RDTForCausalLM
+from Model.recurrent import RecurrentCore
 
 
 def _mol_modules(model):
@@ -165,6 +168,80 @@ class MoLModelTest(unittest.TestCase):
             ffn.lora_b.normal_(std=0.02)
         x = torch.randn(2, 8, model.cfg.d_model)
         self.assertFalse(torch.allclose(ffn(x, step=0), ffn(x, step=2)))
+
+
+class MoLStepTableSizingTest(unittest.TestCase):
+    """The MoL step table must cover the deepest loop the config can be known to
+    run, so deep step indices get their own ``step_embed`` row instead of all
+    clamping onto the last one (a silent breadth-signal loss)."""
+
+    def test_table_covers_random_r_max(self):
+        # tiny: recurrent_steps=4. With random-r up to 8, the loop can run 8
+        # steps, so the table must be 8 (not 4).
+        cfg = replace(
+            tiny_config(),
+            use_mol=True,
+            mol_step_aware=True,
+            recurrent_random_r=True,
+            recurrent_r_min=1,
+            recurrent_r_max=8,
+        )
+        self.assertEqual(cfg.recurrence_step_table, 8)
+        ffn = next(
+            m for m in RDTForCausalLM(cfg).modules() if isinstance(m, MixtureLoRAFFN)
+        )
+        self.assertEqual(ffn.step_embed.shape[0], 8)
+
+    def test_table_is_recurrent_steps_when_no_random_r(self):
+        cfg = replace(tiny_config(), use_mol=True, mol_step_aware=True)
+        self.assertEqual(cfg.recurrence_step_table, cfg.recurrent_steps)
+
+    def test_table_is_act_bound_under_act(self):
+        from Model.config import mor_tiny_config
+
+        cfg = mor_tiny_config()
+        self.assertEqual(cfg.recurrence_step_table, cfg.act_max_steps)
+
+    def test_warns_once_when_steps_exceeds_table(self):
+        # A fixed-mode steps override deeper than the table (e.g. a Poisson depth
+        # draw, whose bound lives in TrainingConfig and is invisible here) clamps
+        # silently; the core must warn exactly once.
+        cfg = replace(tiny_config(), use_mol=True, mol_step_aware=True)  # table=4
+        core = RecurrentCore(cfg)
+        e0 = torch.randn(2, 8, cfg.d_model)
+        wp = torch.zeros(2, 8, dtype=torch.long)
+        md = torch.zeros(2, 8, dtype=torch.long)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            core(e0, word_pos=wp, morph_depth=md, steps=8)
+            core(e0, word_pos=wp, morph_depth=md, steps=8)
+        runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(len(runtime), 1)
+
+    def test_no_warn_when_steps_within_table(self):
+        cfg = replace(tiny_config(), use_mol=True, mol_step_aware=True)  # table=4
+        core = RecurrentCore(cfg)
+        e0 = torch.randn(2, 8, cfg.d_model)
+        wp = torch.zeros(2, 8, dtype=torch.long)
+        md = torch.zeros(2, 8, dtype=torch.long)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            core(e0, word_pos=wp, morph_depth=md, steps=4)
+        runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(len(runtime), 0)
+
+    def test_no_warn_without_step_aware_mol(self):
+        # Plain fixed-depth model (no MoL) must never emit the clamp warning.
+        cfg = tiny_config()
+        core = RecurrentCore(cfg)
+        e0 = torch.randn(2, 8, cfg.d_model)
+        wp = torch.zeros(2, 8, dtype=torch.long)
+        md = torch.zeros(2, 8, dtype=torch.long)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            core(e0, word_pos=wp, morph_depth=md, steps=99)
+        runtime = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        self.assertEqual(len(runtime), 0)
 
 
 if __name__ == "__main__":

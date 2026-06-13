@@ -85,5 +85,97 @@ class MoRModelTest(unittest.TestCase):
         self.assertTrue(getattr(model.recurrent.halt_step_bias, "_no_weight_decay", False))
 
 
+class ACTDepthKnobTest(unittest.TestCase):
+    """ACT decides its own depth; the fixed-depth knobs must not be silently
+    dropped. ``steps`` raises (it cannot override a learned halt); ``bptt_window``
+    IS honoured (truncated BPTT through the unrolled ACT loop)."""
+
+    def _model(self):
+        torch.manual_seed(0)
+        return RDTForCausalLM(_fast_mor_cfg()).eval()
+
+    def _io(self):
+        cfg = _fast_mor_cfg()
+        e0 = torch.randn(2, 8, cfg.d_model)
+        wp = torch.zeros(2, 8, dtype=torch.long)
+        md = torch.zeros(2, 8, dtype=torch.long)
+        return e0, wp, md
+
+    def test_steps_override_raises_under_act(self):
+        core = self._model().recurrent
+        e0, wp, md = self._io()
+        with self.assertRaises(ValueError):
+            core(e0, word_pos=wp, morph_depth=md, steps=3)
+
+    def test_forward_steps_override_raises(self):
+        model = self._model()
+        ids = torch.randint(300, 320, (2, 16))
+        with self.assertRaises(ValueError):
+            model(input_ids=ids, steps=2)
+
+    def test_generate_recurrent_steps_raises_under_act(self):
+        # The 'think harder' knob is meaningless for ACT (the halt head owns the
+        # depth) -- it used to be a silent no-op; now it raises.
+        model = self._model()
+        prompt = torch.tensor([[model.cfg.bos_id, 300, 301]])
+        with self.assertRaises(ValueError):
+            model.generate(prompt, max_new_tokens=2, greedy=True, recurrent_steps=2)
+
+    def test_generate_without_override_still_works_under_act(self):
+        # Plain generate() passes steps=None -> must not raise.
+        model = self._model()
+        prompt = torch.tensor([[model.cfg.bos_id, 300, 301]])
+        out = model.generate(prompt, max_new_tokens=2, greedy=True)
+        self.assertEqual(out.shape[1], prompt.shape[1] + 2)
+
+    def test_bptt_window_honoured_under_act(self):
+        core = self._model().recurrent
+        cfg = _fast_mor_cfg()
+        e0 = torch.randn(2, 8, cfg.d_model, requires_grad=True)
+        wp = torch.zeros(2, 8, dtype=torch.long)
+        md = torch.zeros(2, 8, dtype=torch.long)
+        out, _info = core(e0, word_pos=wp, morph_depth=md, bptt_window=2)
+        out.sum().backward()
+        self.assertIsNotNone(e0.grad)
+        self.assertTrue(torch.isfinite(e0.grad).all())
+
+    def test_bptt_window_truncates_act_graph(self):
+        # Truncation severs the early-step recurrent/inject path, so the gradient
+        # reaching e0 is strictly smaller than the full-BPTT gradient. If
+        # bptt_window were silently ignored (the bug), these would be equal.
+        cfg = replace(_fast_mor_cfg(), inject_embedding=True)
+        wp = torch.zeros(2, 8, dtype=torch.long)
+        md = torch.zeros(2, 8, dtype=torch.long)
+
+        torch.manual_seed(0)
+        core = RDTForCausalLM(cfg).eval().recurrent
+        e_full = torch.randn(2, 8, cfg.d_model, requires_grad=True)
+        e_trunc = e_full.detach().clone().requires_grad_(True)
+
+        core(e_full, word_pos=wp, morph_depth=md)[0].sum().backward()
+        core(e_trunc, word_pos=wp, morph_depth=md, bptt_window=1)[0].sum().backward()
+
+        self.assertLess(e_trunc.grad.norm().item(), e_full.grad.norm().item())
+
+    def test_bptt_window_equals_max_is_full_bptt(self):
+        # Boundary: window == act_max_steps must match no truncation exactly.
+        cfg = _fast_mor_cfg()
+        wp = torch.zeros(2, 8, dtype=torch.long)
+        md = torch.zeros(2, 8, dtype=torch.long)
+        e_a = torch.randn(2, 8, cfg.d_model, requires_grad=True)
+        e_b = e_a.detach().clone().requires_grad_(True)
+
+        torch.manual_seed(0)
+        RDTForCausalLM(cfg).eval().recurrent(
+            e_a, word_pos=wp, morph_depth=md
+        )[0].sum().backward()
+        torch.manual_seed(0)
+        RDTForCausalLM(cfg).eval().recurrent(
+            e_b, word_pos=wp, morph_depth=md, bptt_window=cfg.act_max_steps
+        )[0].sum().backward()
+
+        self.assertTrue(torch.allclose(e_a.grad, e_b.grad, atol=1e-6))
+
+
 if __name__ == "__main__":
     unittest.main()

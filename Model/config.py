@@ -506,9 +506,32 @@ class RDTConfig:
     @property
     def recurrence_step_table(self) -> int:
         """Number of distinct recurrent step indices the MoL router can be
-        conditioned on -- sized to the deepest loop any forward can run (the ACT
-        bound when use_act, else the fixed recurrent_steps)."""
-        return self.act_max_steps if self.use_act else self.recurrent_steps
+        conditioned on -- sized to the deepest loop any forward can statically
+        be known to run.
+
+        * ACT (``use_act``): the loop runs exactly ``act_max_steps`` iterations
+          (the early-halt is a soft weighting, not a loop break), so that is the
+          exact bound.
+        * Fixed depth: the loop runs ``recurrent_steps`` by default, but a
+          ``forward(steps=N)`` override or the Huginn random-r sampler
+          (``recurrent_random_r`` -> up to ``recurrent_r_max``) can run deeper.
+          Size to the largest depth knowable from the model config so those step
+          indices get their own ``step_embed`` row instead of clamping onto
+          ``step_embed[-1]``.
+
+        NOTE: an external ``steps`` override (e.g. the Geiping Poisson depth
+        curriculum, whose max lives in ``TrainingConfig`` not here, or a manual
+        ``generate(recurrent_steps=N)``) can still exceed this bound; the
+        recurrent core warns once and clamps in that case (see
+        ``RecurrentCore._forward_fixed``). The clamp is a silent quality loss,
+        not an error, so configure ``recurrent_r_max`` / the table to cover the
+        intended deep-inference regime when MoL step-awareness matters."""
+        if self.use_act:
+            return self.act_max_steps
+        upper = self.recurrent_steps
+        if self.recurrent_random_r:
+            upper = max(upper, self.recurrent_r_max)
+        return upper
 
 
 def tiny_config() -> RDTConfig:

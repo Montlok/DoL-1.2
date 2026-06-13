@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
@@ -20,6 +22,16 @@ class RecurrentCore(nn.Module):
         self.inject_scale = cfg.inject_scale
         self.use_act = cfg.use_act
         self.grad_ckpt = bool(getattr(cfg, "grad_ckpt_recurrent", False))
+
+        # MoL step-aware routing conditions the FFN on a per-step embedding sized
+        # to ``cfg.recurrence_step_table``. A ``steps`` override deeper than that
+        # table silently clamps onto the last row (a breadth-signal quality loss,
+        # not an error); warn once so the misconfiguration is visible.
+        self._mol_step_aware = bool(
+            getattr(cfg, "use_mol", False) and getattr(cfg, "mol_step_aware", False)
+        )
+        self._mol_step_table = int(getattr(cfg, "recurrence_step_table", 0))
+        self._warned_mol_clamp = False
 
         if self.inject_scale < 0:
             raise ValueError("inject_scale must be non-negative")
@@ -59,12 +71,25 @@ class RecurrentCore(nn.Module):
         self._check_inputs(e0, word_pos, morph_depth, attn_mask)
 
         if self.use_act:
+            # ACT runs a learned, token-level halt -- the loop length is decided
+            # by the halt head, not by an external knob. A ``steps`` override
+            # would otherwise be silently dropped (e.g. generate(recurrent_steps=N)
+            # is a no-op for an ACT/MoR model), so fail loudly instead of hiding
+            # the misconfiguration. ``bptt_window`` IS honoured (plumbed below).
+            if steps is not None:
+                raise ValueError(
+                    "steps override is not supported with use_act=True: ACT "
+                    "decides its own depth via the halt head, so an explicit "
+                    "step count (e.g. generate(recurrent_steps=N)) cannot "
+                    "'think harder'. Use a fixed-depth core to control depth."
+                )
             return self._forward_act(
                 e0=e0,
                 word_pos=word_pos,
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
+                bptt_window=bptt_window,
             )
 
         return self._forward_fixed(
@@ -91,6 +116,23 @@ class RecurrentCore(nn.Module):
 
         if total_steps <= 0:
             raise ValueError("steps must be positive")
+
+        if (
+            self._mol_step_aware
+            and total_steps > self._mol_step_table
+            and not self._warned_mol_clamp
+        ):
+            self._warned_mol_clamp = True
+            warnings.warn(
+                f"recurrent loop runs {total_steps} steps but the MoL step table "
+                f"has only {self._mol_step_table} rows; steps "
+                f">= {self._mol_step_table} reuse step_embed[-1], so the "
+                "step-aware breadth signal degenerates in the deeper half. "
+                "Raise recurrent_r_max (or otherwise size recurrence_step_table) "
+                "to cover the intended depth.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         if bptt_window is not None:
             if bptt_window <= 0:
@@ -160,9 +202,16 @@ class RecurrentCore(nn.Module):
         morph_depth: torch.Tensor | None,
         attn_mask: torch.Tensor | None,
         causal: bool,
+        bptt_window: int | None = None,
     ) -> tuple[torch.Tensor, dict]:
         bsz, seq_len, _ = e0.shape
         dtype = e0.dtype
+
+        total_steps = self.cfg.act_max_steps
+        if bptt_window is not None:
+            if bptt_window <= 0:
+                raise ValueError("bptt_window must be positive")
+            bptt_window = min(bptt_window, total_steps)
 
         h = e0
         output = torch.zeros_like(e0)
@@ -174,7 +223,14 @@ class RecurrentCore(nn.Module):
         if attn_mask is not None:
             running = running * attn_mask.to(device=e0.device, dtype=torch.float32)
 
-        for _idx in range(self.cfg.act_max_steps):
+        for _idx in range(total_steps):
+            # Truncated BPTT: cut the recurrent path more than ``bptt_window``
+            # steps from the end so activations for the early iterations need not
+            # be retained. The halt/weight bookkeeping below still runs every
+            # step; only the gradient through the block recurrence is truncated.
+            if bptt_window is not None and _idx < total_steps - bptt_window:
+                h = h.detach()
+
             if self.inject:
                 h = h + self.inject_scale * e0
 
