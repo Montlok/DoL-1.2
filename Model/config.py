@@ -234,6 +234,14 @@ class RDTConfig:
     mol_top_k: int = 0  # 0 => dense softmax over all experts (v1 default)
     mol_step_aware: bool = True
 
+    # Depth (MoR, arXiv:2507.10524): upgrade the ACT scalar halt to be
+    # step-aware via a per-step bias on the halt logit, so token-level dynamic
+    # depth becomes routed (the stopping decision depends on which recurrent
+    # step we are at), not just a probability threshold. Depends on use_act and
+    # shares the "condition on the recurrent step" idea with MoL above. The bias
+    # is zero-initialized -> reduces exactly to plain ACT at init.
+    use_mor: bool = False
+
     mamba_d_state: int = 128
     mamba_d_conv: int = 4
     mamba_expand: int = 2
@@ -475,6 +483,13 @@ class RDTConfig:
             if not (0 <= self.mol_top_k <= self.mol_experts):
                 raise ValueError("mol_top_k must be in [0, mol_experts]")
 
+        if self.use_mor and not self.use_act:
+            raise ValueError(
+                "use_mor=True requires use_act=True: MoR enhances the ACT "
+                "halting head with a step-aware bias, and ACT itself is "
+                "implemented only for core_type='interleaved'"
+            )
+
     @property
     def block_layers(self) -> int:
         return self.mamba_per_block + self.attn_per_block
@@ -491,9 +506,32 @@ class RDTConfig:
     @property
     def recurrence_step_table(self) -> int:
         """Number of distinct recurrent step indices the MoL router can be
-        conditioned on -- sized to the deepest loop any forward can run (the ACT
-        bound when use_act, else the fixed recurrent_steps)."""
-        return self.act_max_steps if self.use_act else self.recurrent_steps
+        conditioned on -- sized to the deepest loop any forward can statically
+        be known to run.
+
+        * ACT (``use_act``): the loop runs exactly ``act_max_steps`` iterations
+          (the early-halt is a soft weighting, not a loop break), so that is the
+          exact bound.
+        * Fixed depth: the loop runs ``recurrent_steps`` by default, but a
+          ``forward(steps=N)`` override or the Huginn random-r sampler
+          (``recurrent_random_r`` -> up to ``recurrent_r_max``) can run deeper.
+          Size to the largest depth knowable from the model config so those step
+          indices get their own ``step_embed`` row instead of clamping onto
+          ``step_embed[-1]``.
+
+        NOTE: an external ``steps`` override (e.g. the Geiping Poisson depth
+        curriculum, whose max lives in ``TrainingConfig`` not here, or a manual
+        ``generate(recurrent_steps=N)``) can still exceed this bound; the
+        recurrent core warns once and clamps in that case (see
+        ``RecurrentCore._forward_fixed``). The clamp is a silent quality loss,
+        not an error, so configure ``recurrent_r_max`` / the table to cover the
+        intended deep-inference regime when MoL step-awareness matters."""
+        if self.use_act:
+            return self.act_max_steps
+        upper = self.recurrent_steps
+        if self.recurrent_random_r:
+            upper = max(upper, self.recurrent_r_max)
+        return upper
 
 
 def tiny_config() -> RDTConfig:
@@ -523,6 +561,22 @@ def mol_tiny_config() -> RDTConfig:
     """
     return replace(
         tiny_config(),
+        use_mol=True,
+        mol_experts=4,
+        mol_rank=8,
+        mol_step_aware=True,
+    )
+
+
+def mor_tiny_config() -> RDTConfig:
+    """Tiny config with the full recurrent router: ACT depth (use_act) + MoR
+    step-aware halting + MoL step-aware breadth -- the two faces of the loop
+    router. CPU smoke vehicle (interleaved core + NaiveSSM).
+    """
+    return replace(
+        tiny_config(),
+        use_act=True,
+        use_mor=True,
         use_mol=True,
         mol_experts=4,
         mol_rank=8,

@@ -672,6 +672,9 @@ class RDTForCausalLM(nn.Module):
         ("think harder") per token without emitting any extra tokens; lowering
         it trades quality for speed. The override is constant for the whole call
         so the incremental KV/state cache stays consistent across positions.
+        This knob applies to fixed-depth cores only: with ``use_act=True`` the
+        loop length is decided by the learned halt head, so passing
+        ``recurrent_steps`` raises (rather than being silently ignored).
 
         ``pixel_values`` optionally supplies image features for prompts containing
         ``<image_patch>`` slots. Cached decoding consumes them only during the

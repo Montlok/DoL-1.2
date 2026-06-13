@@ -11,6 +11,9 @@ mkdir -p "$OUT"
 echo "==> [1/5] text RDT smoke (single process)"
 python3 -m scripts.train_rdt --config tiny --smoke --precision fp32 --output "$OUT/rdt_single"
 
+echo "==> [1b/5] recurrent-router smoke (MoL breadth + MoR depth + ACT)"
+python3 -m scripts.train_rdt --config mor_tiny --smoke --precision fp32 --output "$OUT/rdt_router"
+
 echo "==> [2/5] text RDT smoke (DDP 2 workers, gloo)"
 python3 -m torch.distributed.run --nproc_per_node=2 --master_port=29512 \
     scripts/train_rdt.py --config tiny --smoke --dist ddp --precision fp32 \
