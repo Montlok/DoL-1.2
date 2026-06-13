@@ -103,6 +103,7 @@ class RecurrentCore(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
+                step=idx,
             )
 
         return h, {
@@ -117,7 +118,11 @@ class RecurrentCore(nn.Module):
         morph_depth: torch.Tensor | None,
         attn_mask: torch.Tensor | None,
         causal: bool,
+        step: int | None = None,
     ) -> torch.Tensor:
+        # ``step`` is a Python int (the recurrent-loop index), closed over like
+        # ``word_pos`` so it stays a constant under gradient checkpointing -- it
+        # only matters when the block FFN is a step-aware MixtureLoRAFFN.
         if self.grad_ckpt and self.training and h.requires_grad:
             def _fn(h_in):
                 return self.block(
@@ -126,6 +131,7 @@ class RecurrentCore(nn.Module):
                     morph_depth=morph_depth,
                     attn_mask=attn_mask,
                     causal=causal,
+                    step=step,
                 )
 
             return checkpoint(_fn, h, use_reentrant=False)
@@ -135,6 +141,7 @@ class RecurrentCore(nn.Module):
             morph_depth=morph_depth,
             attn_mask=attn_mask,
             causal=causal,
+            step=step,
         )
 
     def _forward_act(
@@ -168,6 +175,7 @@ class RecurrentCore(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
+                step=_idx,
             )
 
             p = torch.sigmoid(self.halt_proj(self.halt_norm(h))).squeeze(-1).float()
