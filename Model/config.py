@@ -234,11 +234,15 @@ class RDTConfig:
     mol_top_k: int = 0  # 0 => dense softmax over all experts (v1 default)
     mol_step_aware: bool = True
 
-    # MoL v2 load balancing. Dense softmax lets every token draw a similar convex
-    # mix of all experts, so the experts never specialise; a Switch/GShard load-
-    # balancing aux loss (arXiv:2101.03961) pushes routing toward uniform expert
-    # usage so the pool actually divides the token space. mol_aux_weight scales
-    # that term; mol_z_weight scales an optional router z-loss (ST-MoE
+    # MoL v2 load balancing. A Switch/GShard aux loss (arXiv:2101.03961) pushes
+    # *population* expert usage (the token-mean P_i) toward uniform and so prevents
+    # dead experts. NOTE it is a population balancer, not a specialisation driver:
+    # it is symmetric between "every token = uniform mix" and "per-token sharp but
+    # balanced", so it pays off mainly with mol_top_k>0 (the top-k mask already
+    # forces specialisation); under the dense default (mol_top_k=0) it does little
+    # to break the averaged-expert degeneracy and can even nudge routing toward the
+    # uniform per-token mix -- see Model/layers/mixture_lora_ffn.py. mol_aux_weight
+    # scales that term; mol_z_weight scales an optional router z-loss (ST-MoE
     # arXiv:2202.08906) that keeps the router logits from drifting large. Both
     # are pure extra training-loss terms -- they never touch the main logits, so
     # cold start (lora_b=0) stays bit-identical to plain SwiGLU. Set to 0 to

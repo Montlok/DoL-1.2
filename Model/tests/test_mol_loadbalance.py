@@ -422,6 +422,14 @@ class ModelIntegrationTest(unittest.TestCase):
         # mean expert distribution P_i far more balanced than training with the aux
         # off, over several optimizer steps.
         #
+        # SCOPE: this verifies *population* balance only -- that the aux keeps the
+        # token-mean P_i from collapsing onto one expert (i.e. no dead experts). It
+        # does NOT verify per-token specialisation, and must not be read as doing so:
+        # the Switch aux is symmetric between "every token = uniform mix" and
+        # "per-token sharp but balanced" (both score aux=1), and under the dense
+        # default it tends toward the *uniform* per-token mix. So we score the
+        # population distribution P_i, the exact quantity this term targets.
+        #
         # We measure the entropy of P_i -- the per-expert mean routing probability,
         # averaged over every token and every recurrent step (the same FFN runs once
         # per step, so we accumulate across calls). P_i is the quantity the aux
@@ -493,6 +501,103 @@ class ModelIntegrationTest(unittest.TestCase):
         # 0.1 margin guards against a regression that silently neutralizes the
         # balancer while staying comfortably non-flaky.
         self.assertGreater(ent_on, ent_off + 0.1)
+
+    def test_train_one_step_surfaces_mol_aux_in_metrics(self):
+        # Observability: the balance signal must reach the training metrics so an
+        # operator can watch it (console / TensorBoard / monitor) and catch a router
+        # collapse early. train_one_step previously dropped loss_parts entirely, so
+        # mol_aux/mol_z were unobservable during training. The returned metrics dict
+        # must now carry the raw aux (and forward) terms.
+        from Model.config import TrainingConfig
+        from Model.training import (
+            PretrainingCollator,
+            TrainState,
+            build_optimizer,
+            build_scheduler,
+            train_one_step,
+        )
+
+        torch.manual_seed(0)
+        cfg = self._cfg(mol_aux_weight=0.01, mol_z_weight=0.001)
+        train_cfg = TrainingConfig(
+            train_data="",
+            micro_batch_size=2,
+            grad_accum_steps=1,
+            num_workers=0,
+            learning_rate=1e-3,
+            max_steps=2,
+            warmup_steps=1,
+            precision="fp32",
+            grad_clip=1.0,
+        )
+        model = RDTForCausalLM(cfg)
+        optim = build_optimizer(model, train_cfg)
+        sched = build_scheduler(optim, train_cfg)
+        state = TrainState()
+
+        seq = [cfg.bos_id, 300, 301, 302, 303, 304, 305, cfg.eos_id]
+        row = {"input_ids": seq, "attention_mask": [1] * len(seq), "labels": seq}
+        batch = PretrainingCollator()([row, row])
+
+        def _iter():
+            while True:
+                yield batch
+
+        metrics = train_one_step(
+            model, _iter(), optim, sched, train_cfg, state,
+            device=torch.device("cpu"),
+        )
+        self.assertIn("mol_aux", metrics)
+        self.assertIn("mol_z", metrics)
+        self.assertIn("forward", metrics)
+        self.assertGreaterEqual(metrics["mol_aux"], 1.0 - 1e-4)
+        self.assertTrue(metrics["mol_aux"] == metrics["mol_aux"])  # not NaN
+
+    def test_train_one_step_no_mol_keys_without_mol(self):
+        # When MoL is off, no mol_aux/mol_z keys leak into the metrics (the plain
+        # path is unchanged); forward is still surfaced.
+        from Model.config import TrainingConfig
+        from Model.training import (
+            PretrainingCollator,
+            TrainState,
+            build_optimizer,
+            build_scheduler,
+            train_one_step,
+        )
+
+        torch.manual_seed(0)
+        cfg = tiny_config()
+        train_cfg = TrainingConfig(
+            train_data="",
+            micro_batch_size=2,
+            grad_accum_steps=1,
+            num_workers=0,
+            learning_rate=1e-3,
+            max_steps=2,
+            warmup_steps=1,
+            precision="fp32",
+            grad_clip=1.0,
+        )
+        model = RDTForCausalLM(cfg)
+        optim = build_optimizer(model, train_cfg)
+        sched = build_scheduler(optim, train_cfg)
+        state = TrainState()
+
+        seq = [cfg.bos_id, 300, 301, 302, 303, 304, 305, cfg.eos_id]
+        row = {"input_ids": seq, "attention_mask": [1] * len(seq), "labels": seq}
+        batch = PretrainingCollator()([row, row])
+
+        def _iter():
+            while True:
+                yield batch
+
+        metrics = train_one_step(
+            model, _iter(), optim, sched, train_cfg, state,
+            device=torch.device("cpu"),
+        )
+        self.assertNotIn("mol_aux", metrics)
+        self.assertNotIn("mol_z", metrics)
+        self.assertIn("forward", metrics)
 
     def test_grad_ckpt_aux_matches_no_ckpt(self):
         # Load balancing must be grad-checkpoint safe: with grad_ckpt_recurrent

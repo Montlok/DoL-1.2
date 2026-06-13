@@ -149,6 +149,13 @@ def train_one_step(
     device_type = device.type if device.type in ("cuda", "cpu") else "cpu"
     loss_terms: list[torch.Tensor] = []
     token_count = 0
+    # Carry the model's per-term loss breakdown out to the caller for logging.
+    # ``out["loss_parts"]`` (forward/reverse/ponder/mol_aux/mol_z) is otherwise
+    # only read by evaluate(); without this the MoL load-balancing signal --
+    # whose whole point is to detect router collapse early -- never reaches the
+    # console logger, TensorBoard, or the monitor. We keep the last micro-batch's
+    # breakdown (the optimizer-step granularity at which metrics are reported).
+    last_loss_parts: dict[str, float] = {}
 
     # fp16 needs loss scaling; persist the scaler across steps via state.extra
     # so its dynamic scale factor is preserved (and can be checkpointed).
@@ -203,6 +210,9 @@ def train_one_step(
                     return_logits=not cfg.use_loss_chunking,
                 )
             loss = out["loss"] / cfg.grad_accum_steps
+            parts = out.get("loss_parts")
+            if isinstance(parts, dict):
+                last_loss_parts = parts
             if not bool(torch.isfinite(loss.detach())):
                 raise FloatingPointError(
                     f"non-finite training loss at step {state.step}"
@@ -253,13 +263,23 @@ def train_one_step(
     state.step += 1
     state.tokens_seen += token_count
     state.last_loss = loss_sum / max(1, cfg.grad_accum_steps)
-    return {
+    metrics = {
         "loss": state.last_loss,
         "grad_norm": grad_norm_val,
         "lr": float(scheduler.get_last_lr()[0]),
         "tokens": float(token_count),
         "rec_steps": float(rec_steps) if rec_steps is not None else float("nan"),
     }
+    # Surface the model's per-term loss breakdown (raw, pre-weight) so an operator
+    # can watch the MoL balancer / reverse / ponder terms live. mol_aux ~ 1.0 is
+    # balanced and ~ n_experts means routing has collapsed onto one expert, so
+    # this is the early-warning signal for the load-balancing feature. Keys absent
+    # from loss_parts (e.g. when MoL is off) are simply not reported.
+    for key in ("forward", "reverse", "ponder", "mol_aux", "mol_z"):
+        val = last_loss_parts.get(key)
+        if val is not None:
+            metrics[key] = float(val)
+    return metrics
 
 
 @torch.no_grad()

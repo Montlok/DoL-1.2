@@ -36,20 +36,33 @@ re-checking the call sites:
 ``nn.Embedding``) precisely so the model-level ``apply(_init_weights)`` -- which
 re-inits every ``nn.Linear``/``nn.Embedding`` -- leaves their zero init intact.
 
-Load balancing (v2). With dense softmax (``top_k=0``) every token tends to draw
-a *similar* convex mix of all experts, so the experts never specialise -- the
-breadth degenerates into one averaged expert. To break that symmetry the router
-exposes a Switch-Transformer / GShard load-balancing auxiliary loss
-(arXiv:2101.03961 / 2006.16668)::
+Load balancing (v2). The router exposes the Switch-Transformer / GShard load-
+balancing auxiliary loss (arXiv:2101.03961 / 2006.16668)::
 
     aux = n_experts * sum_i f_i * P_i
 
 where ``f_i`` is the fraction of tokens that *select* expert ``i`` (argmax for
 dense routing, top-k membership when ``top_k>0``) and ``P_i`` is the mean router
-probability of expert ``i``. ``aux`` is minimised (=1) by perfectly uniform load
-and grows as routing collapses, so adding it to the loss pushes the experts to
-divide the token space. An optional router z-loss (the mean squared
-``logsumexp`` of the router logits) keeps the logits from drifting large.
+probability of expert ``i``. ``aux`` is minimised (=1) by perfectly uniform
+*population* load and grows toward ``n_experts`` as routing collapses onto one
+expert, so adding it to the loss pushes the population usage toward uniform and
+prevents dead experts. An optional router z-loss (the mean squared ``logsumexp``
+of the router logits) keeps the logits from drifting large.
+
+Scope, precisely (do not over-read this term). ``aux`` is a *population*
+balancer: it acts on the token-mean ``P_i`` and is blind to whether the per-token
+distributions are sharp or flat. It cannot distinguish (A) every token drawing
+the same uniform mix from (B) each token routing sharply to a different expert
+with balanced totals -- both score ``aux=1``. So with ``top_k>0`` (discrete
+selection) it correctly keeps experts alive without harming the specialisation
+the top-k mask already enforces; but with the **dense default** (``top_k=0``) it
+does *not* by itself break the averaged-expert degeneracy -- flattening every
+token is the cheapest way to flatten ``P_i``, so a strong aux can actually push
+dense routing *toward* the uniform per-token mix. Dense breadth therefore relies
+on the LoRA experts / step conditioning to differentiate, not on this aux; use
+``top_k>0`` if you want the balancer to drive specialisation. To fight the dense
+averaged-expert collapse directly you would add a per-token sharpness reward, not
+this (population-symmetric) term.
 
 Padding is excluded from these statistics. When an ``attn_mask`` is threaded in
 (the recurrent blocks pass the model's ``[B, L]`` mask), masked positions are
