@@ -234,6 +234,22 @@ class RDTConfig:
     mol_top_k: int = 0  # 0 => dense softmax over all experts (v1 default)
     mol_step_aware: bool = True
 
+    # MoL v2 load balancing. A Switch/GShard aux loss (arXiv:2101.03961) pushes
+    # *population* expert usage (the token-mean P_i) toward uniform and so prevents
+    # dead experts. NOTE it is a population balancer, not a specialisation driver:
+    # it is symmetric between "every token = uniform mix" and "per-token sharp but
+    # balanced", so it pays off mainly with mol_top_k>0 (the top-k mask already
+    # forces specialisation); under the dense default (mol_top_k=0) it does little
+    # to break the averaged-expert degeneracy and can even nudge routing toward the
+    # uniform per-token mix -- see Model/layers/mixture_lora_ffn.py. mol_aux_weight
+    # scales that term; mol_z_weight scales an optional router z-loss (ST-MoE
+    # arXiv:2202.08906) that keeps the router logits from drifting large. Both
+    # are pure extra training-loss terms -- they never touch the main logits, so
+    # cold start (lora_b=0) stays bit-identical to plain SwiGLU. Set to 0 to
+    # disable (mol_z_weight defaults off). Only active when use_mol=True.
+    mol_aux_weight: float = 0.01
+    mol_z_weight: float = 0.0
+
     # Depth (MoR, arXiv:2507.10524): upgrade the ACT scalar halt to be
     # step-aware via a per-step bias on the halt logit, so token-level dynamic
     # depth becomes routed (the stopping decision depends on which recurrent
@@ -482,6 +498,10 @@ class RDTConfig:
                 raise ValueError("mol_router_temp must be positive")
             if not (0 <= self.mol_top_k <= self.mol_experts):
                 raise ValueError("mol_top_k must be in [0, mol_experts]")
+            if self.mol_aux_weight < 0:
+                raise ValueError("mol_aux_weight must be non-negative")
+            if self.mol_z_weight < 0:
+                raise ValueError("mol_z_weight must be non-negative")
 
         if self.use_mor and not self.use_act:
             raise ValueError(
