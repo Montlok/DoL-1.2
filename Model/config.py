@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 # Canonical source of special-token ids / vocab segmentation is
@@ -218,6 +218,21 @@ class RDTConfig:
     act_threshold: float = 0.99
     act_max_steps: int = 32
     act_ponder_cost: float = 0.01
+
+    # Mixture-of-LoRAs (MoL, arXiv:2512.12880) sunk into the recurrent FFN: each
+    # recurrent-block FFN keeps one shared base SwiGLU plus mol_experts low-rank
+    # LoRA experts on the gate/up projection, mixed per token by a router
+    # (MHC-style; router_alpha=0 init -> uniform, lora_b=0 init -> the FFN is
+    # bit-identical to plain SwiGLU at init). When mol_step_aware, the router is
+    # additionally conditioned on the recurrent step index, so the same token is
+    # routed to different experts at different depths -- breadth along the loop's
+    # time axis. Only supported for core_type='interleaved'.
+    use_mol: bool = False
+    mol_experts: int = 4
+    mol_rank: int = 8
+    mol_router_temp: float = 1.0
+    mol_top_k: int = 0  # 0 => dense softmax over all experts (v1 default)
+    mol_step_aware: bool = True
 
     mamba_d_state: int = 128
     mamba_d_conv: int = 4
@@ -444,6 +459,22 @@ class RDTConfig:
             if self.segmented_local_layers <= 0:
                 raise ValueError("segmented_local_layers must be positive")
 
+        if self.use_mol:
+            if self.core_type != "interleaved":
+                raise ValueError(
+                    "use_mol=True is only implemented for core_type='interleaved' "
+                    "(the two_stage/segmented refine loops do not thread the "
+                    f"recurrent step index into the FFN); got {self.core_type!r}"
+                )
+            if self.mol_experts <= 0:
+                raise ValueError("mol_experts must be positive when use_mol=True")
+            if self.mol_rank <= 0:
+                raise ValueError("mol_rank must be positive when use_mol=True")
+            if self.mol_router_temp <= 0:
+                raise ValueError("mol_router_temp must be positive")
+            if not (0 <= self.mol_top_k <= self.mol_experts):
+                raise ValueError("mol_top_k must be in [0, mol_experts]")
+
     @property
     def block_layers(self) -> int:
         return self.mamba_per_block + self.attn_per_block
@@ -456,6 +487,13 @@ class RDTConfig:
     @property
     def actual_layers(self) -> int:
         return self.n_prelude + self.block_layers + self.n_coda
+
+    @property
+    def recurrence_step_table(self) -> int:
+        """Number of distinct recurrent step indices the MoL router can be
+        conditioned on -- sized to the deepest loop any forward can run (the ACT
+        bound when use_act, else the fixed recurrent_steps)."""
+        return self.act_max_steps if self.use_act else self.recurrent_steps
 
 
 def tiny_config() -> RDTConfig:
@@ -475,6 +513,20 @@ def tiny_config() -> RDTConfig:
         recurrent_steps=4,
         max_seq_len=2048,
         use_official_mamba=False,
+    )
+
+
+def mol_tiny_config() -> RDTConfig:
+    """Tiny config with step-aware Mixture-of-LoRAs in the recurrent FFN.
+
+    CPU smoke vehicle: interleaved core + NaiveSSM, K=4 experts, rank 8.
+    """
+    return replace(
+        tiny_config(),
+        use_mol=True,
+        mol_experts=4,
+        mol_rank=8,
+        mol_step_aware=True,
     )
 
 

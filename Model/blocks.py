@@ -7,8 +7,38 @@ import torch.nn as nn
 
 from Model.layers.mla import MLA
 from Model.layers.mamba3_layer import Mamba3Layer
+from Model.layers.mixture_lora_ffn import MixtureLoRAFFN
 from Model.layers.rmsnorm import RMSNorm
 from Model.layers.swiglu import SwiGLU
+
+
+def _build_ffn(cfg):
+    """Recurrent-block FFN: step-aware Mixture-of-LoRAs when ``use_mol``, else the
+    plain shared SwiGLU. Prelude/coda (``StandardBlock``) always use plain SwiGLU
+    -- they are non-recurrent, so step-aware expert routing has no step to
+    condition on."""
+    if getattr(cfg, "use_mol", False):
+        return MixtureLoRAFFN(
+            cfg.d_model,
+            cfg.ffn_hidden,
+            cfg.mol_experts,
+            cfg.mol_rank,
+            cfg.recurrence_step_table,
+            step_aware=cfg.mol_step_aware,
+            router_temp=cfg.mol_router_temp,
+            top_k=cfg.mol_top_k,
+            init_std=cfg.init_std,
+            rmsnorm_eps=cfg.rmsnorm_eps,
+        )
+    return SwiGLU(cfg.d_model, cfg.ffn_hidden)
+
+
+def _apply_ffn(ffn, x, step):
+    """Forward a ``_build_ffn`` FFN, threading the recurrent step index only into
+    a MixtureLoRAFFN (plain SwiGLU has no ``step`` kwarg and ignores it)."""
+    if isinstance(ffn, MixtureLoRAFFN):
+        return ffn(x, step=step)
+    return ffn(x)
 
 
 class StandardBlock(nn.Module):
@@ -56,7 +86,7 @@ class AttnSubLayer(nn.Module):
         self.attn = MLA(cfg)
 
         self.ffn_norm = RMSNorm(cfg.d_model, eps=cfg.rmsnorm_eps)
-        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_hidden)
+        self.ffn = _build_ffn(cfg)
 
     def forward(
         self,
@@ -67,6 +97,7 @@ class AttnSubLayer(nn.Module):
         causal: bool = True,
         cache=None,
         pos_offset: int = 0,
+        step: int | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.attn_norm(x),
@@ -77,7 +108,7 @@ class AttnSubLayer(nn.Module):
             cache=cache,
             pos_offset=pos_offset,
         )
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + _apply_ffn(self.ffn, self.ffn_norm(x), step)
         return x
 
 
@@ -89,17 +120,18 @@ class MambaSubLayer(nn.Module):
 
         self.mamba = Mamba3Layer(cfg, layer_idx=layer_idx)
         self.ffn_norm = RMSNorm(cfg.d_model, eps=cfg.rmsnorm_eps)
-        self.ffn = SwiGLU(cfg.d_model, cfg.ffn_hidden)
+        self.ffn = _build_ffn(cfg)
 
     def forward(
         self,
         x: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         cache=None,
+        step: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         x = self.mamba(x, attn_mask=attn_mask, cache=cache)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + _apply_ffn(self.ffn, self.ffn_norm(x), step)
 
         if attn_mask is not None:
             x = x * attn_mask.to(device=x.device, dtype=x.dtype).unsqueeze(-1)
@@ -174,6 +206,7 @@ class RecurrentBlock(nn.Module):
         morph_depth: torch.Tensor | None = None,
         attn_mask: torch.Tensor | None = None,
         causal: bool = True,
+        step: int | None = None,
     ) -> torch.Tensor:
         for layer in self.layers:
             x = layer(
@@ -182,6 +215,7 @@ class RecurrentBlock(nn.Module):
                 morph_depth=morph_depth,
                 attn_mask=attn_mask,
                 causal=causal,
+                step=step,
             )
 
         return x
