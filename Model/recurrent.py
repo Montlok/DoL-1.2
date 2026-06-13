@@ -36,6 +36,15 @@ class RecurrentCore(nn.Module):
             # across recurrent steps, which would otherwise saturate the
             # sigmoid and make halting depth-dependent at init.
             self.halt_norm = RMSNorm(cfg.d_model, eps=cfg.rmsnorm_eps)
+            # MoR: a per-step bias on the halt logit makes the stopping decision
+            # step-aware -- token-level dynamic depth becomes routed rather than
+            # a bare probability threshold. Zero init -> identical to plain ACT.
+            self.use_mor = bool(getattr(cfg, "use_mor", False))
+            if self.use_mor:
+                self.halt_step_bias = nn.Parameter(torch.zeros(cfg.act_max_steps))
+                self.halt_step_bias._no_weight_decay = True
+            else:
+                self.register_parameter("halt_step_bias", None)
 
     def forward(
         self,
@@ -178,7 +187,11 @@ class RecurrentCore(nn.Module):
                 step=_idx,
             )
 
-            p = torch.sigmoid(self.halt_proj(self.halt_norm(h))).squeeze(-1).float()
+            halt_logit = self.halt_proj(self.halt_norm(h)).squeeze(-1)
+            if self.use_mor:
+                # Step-aware halting: bias the stop decision by the current depth.
+                halt_logit = halt_logit + self.halt_step_bias[_idx]
+            p = torch.sigmoid(halt_logit).float()
             p = p * running
 
             new_halt = halt_accum + p
