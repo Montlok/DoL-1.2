@@ -11,6 +11,7 @@ from torch.utils.checkpoint import checkpoint
 
 from Model.blocks import StandardBlock
 from Model.config import RDTConfig
+from Model.layers.mixture_lora_ffn import MixtureLoRAFFN
 from Model.layers.rmsnorm import RMSNorm
 from Model.recurrent import RecurrentCore
 from Model.segmented import SegmentedCore
@@ -62,6 +63,19 @@ class RDTForCausalLM(nn.Module):
         # bidirectional reverse-LM auxiliary loss so it does not pollute the
         # supervised/preference gradient. Pretraining keeps it enabled.
         self.reverse_loss_enabled = True
+
+        # Cache the (weight-shared) MoL FFNs so the load-balancing aux/z loss can
+        # be reset before and collected after each forward without walking the
+        # whole module tree on the hot path. Empty unless ``use_mol``; whether the
+        # aux/z terms actually contribute is further gated on the loss weights.
+        self._mol_ffns: tuple[MixtureLoRAFFN, ...] = tuple(
+            m for m in self.modules() if isinstance(m, MixtureLoRAFFN)
+        )
+        self._mol_aux_active = bool(
+            getattr(cfg, "use_mol", False)
+            and (cfg.mol_aux_weight > 0.0 or cfg.mol_z_weight > 0.0)
+            and self._mol_ffns
+        )
 
         self.apply(self._init_weights)
         self._scale_residual_projections()
@@ -171,6 +185,16 @@ class RDTForCausalLM(nn.Module):
                 attention_mask=attention_mask,
             )
 
+        # MoL load balancing: only collect router stats when a loss is being
+        # computed (and the aux/z terms are enabled). Reset the per-forward
+        # accumulators up front so a recompute under grad checkpointing starts
+        # clean and stats never leak across forwards. The pure-logits / generate
+        # path leaves collection off so it pays nothing.
+        collect_mol = self._mol_aux_active and labels is not None
+        for ffn in self._mol_ffns:
+            ffn.collect_router_stats = collect_mol
+            ffn.reset_router_stats()
+
         h = self.embed(input_ids)
 
         if pixel_values is not None:
@@ -257,7 +281,55 @@ class RDTForCausalLM(nn.Module):
             loss = loss + self.cfg.act_ponder_cost * ponder
             parts["ponder"] = float(ponder.detach())
 
+        loss = self._add_mol_router_losses(loss, parts, ref=forward)
+
         return loss, parts
+
+    def _add_mol_router_losses(
+        self,
+        loss: torch.Tensor,
+        parts: dict[str, float],
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """Add the MoL load-balancing aux + z loss to ``loss`` and log the raw
+        (pre-weight) values into ``parts`` for monitoring.
+
+        Averages each FFN's accumulated stats, then averages across FFNs so the
+        magnitude is independent of layer count (one number per term). No-ops when
+        MoL load balancing is inactive (``loss_parts`` then carries no aux/z keys,
+        matching the plain path). ``ref`` supplies the device/dtype for the added
+        terms.
+        """
+
+        if not self._mol_aux_active:
+            return loss
+
+        aux_terms = []
+        z_terms = []
+        for ffn in self._mol_ffns:
+            rl = ffn.router_losses()
+            if rl is None:
+                continue
+            aux_terms.append(rl[0])
+            z_terms.append(rl[1])
+
+        if not aux_terms:
+            # ``use_mol`` but no routing ran (e.g. a labels-only path that somehow
+            # skipped the core). Keep the schema stable with zeros.
+            parts.setdefault("mol_aux", 0.0)
+            parts.setdefault("mol_z", 0.0)
+            return loss
+
+        aux = torch.stack(aux_terms).mean()
+        z = torch.stack(z_terms).mean()
+        parts["mol_aux"] = float(aux.detach())
+        parts["mol_z"] = float(z.detach())
+
+        if self.cfg.mol_aux_weight > 0.0:
+            loss = loss + self.cfg.mol_aux_weight * aux.to(ref.dtype)
+        if self.cfg.mol_z_weight > 0.0:
+            loss = loss + self.cfg.mol_z_weight * z.to(ref.dtype)
+        return loss
 
     def _losses_chunked(
         self,
@@ -284,6 +356,8 @@ class RDTForCausalLM(nn.Module):
         if self.cfg.use_act and isinstance(ponder, torch.Tensor):
             loss = loss + self.cfg.act_ponder_cost * ponder
             parts["ponder"] = float(ponder.detach())
+
+        loss = self._add_mol_router_losses(loss, parts, ref=forward)
 
         return loss, parts
 

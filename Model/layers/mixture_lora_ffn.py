@@ -35,6 +35,32 @@ re-checking the call sites:
 ``step_embed``/``router_bias``/``router_alpha`` are plain ``nn.Parameter`` (not
 ``nn.Embedding``) precisely so the model-level ``apply(_init_weights)`` -- which
 re-inits every ``nn.Linear``/``nn.Embedding`` -- leaves their zero init intact.
+
+Load balancing (v2). With dense softmax (``top_k=0``) every token tends to draw
+a *similar* convex mix of all experts, so the experts never specialise -- the
+breadth degenerates into one averaged expert. To break that symmetry the router
+exposes a Switch-Transformer / GShard load-balancing auxiliary loss
+(arXiv:2101.03961 / 2006.16668)::
+
+    aux = n_experts * sum_i f_i * P_i
+
+where ``f_i`` is the fraction of tokens that *select* expert ``i`` (argmax for
+dense routing, top-k membership when ``top_k>0``) and ``P_i`` is the mean router
+probability of expert ``i``. ``aux`` is minimised (=1) by perfectly uniform load
+and grows as routing collapses, so adding it to the loss pushes the experts to
+divide the token space. An optional router z-loss (the mean squared
+``logsumexp`` of the router logits) keeps the logits from drifting large.
+
+These statistics are computed inside :meth:`forward` and *accumulated* on the
+module across the recurrent loop's repeated calls (the recurrent FFN is weight-
+shared, so one instance is invoked once per step). The accumulators hold live
+autograd tensors so the aux/z gradient flows to the router parameters; this is
+grad-checkpoint safe under ``use_reentrant=False`` (the recompute reconciles the
+cached tensor without double-counting). The model resets the accumulators at the
+start of every :meth:`RDTForCausalLM.forward` and reads them back after the core
+runs (see ``RDTForCausalLM._mol_router_losses``). They carry zero training
+signal on the main logits path -- with ``lora_b=0`` (cold start) the FFN output
+is still bit-identical to a plain SwiGLU; only the extra loss term differs.
 """
 
 from __future__ import annotations
@@ -111,7 +137,28 @@ class MixtureLoRAFFN(nn.Module):
         else:
             self.register_parameter("step_embed", None)
 
+        # Load-balancing accumulators. Plain (non-parameter) attributes holding
+        # live autograd tensors, summed across the recurrent loop's repeated
+        # calls and read by the model after the core runs. ``None`` means "no
+        # routing happened since the last reset" -> the model contributes 0.
+        # collect_router_stats is toggled off during cache-free generate /
+        # inference so the eval path pays nothing.
+        self.collect_router_stats = True
+        self._aux_loss: torch.Tensor | None = None
+        self._z_loss: torch.Tensor | None = None
+        self._router_calls: int = 0
+
         self.reset_parameters()
+
+    def reset_router_stats(self) -> None:
+        """Clear the per-forward load-balancing accumulators. Called by the model
+        at the start of each forward so the aux/z statistics never leak across
+        forward calls (and so a recompute under grad checkpointing starts clean).
+        """
+
+        self._aux_loss = None
+        self._z_loss = None
+        self._router_calls = 0
 
     def reset_parameters(self) -> None:
         # LoRA-A nonzero (standard), LoRA-B zero -> expert delta is exactly 0 at
@@ -151,9 +198,16 @@ class MixtureLoRAFFN(nn.Module):
             ref = ref + self.step_embed[idx]
         logits = self.router_bias + self.router_alpha * torch.tanh(self.router_proj(ref))
         logits = logits / self.router_temp
+        # Pre-mask logits feed the router z-loss (the canonical ST-MoE form,
+        # arXiv:2202.08906): top-k masking sets -inf, which would drop kept
+        # experts out of the logsumexp.
+        dense_logits = logits
         if 0 < self.top_k < self.n_experts:
             logits = self._topk_mask(logits, self.top_k)
         weights = torch.softmax(logits, dim=-1)  # [B, L, K]
+
+        if self.collect_router_stats:
+            self._accumulate_router_stats(weights, dense_logits)
 
         # Per-token mixed LoRA delta on the w_in pre-activation:
         # expert e contributes (x @ A_e) @ B_e, then mix by router weights.
@@ -163,6 +217,68 @@ class MixtureLoRAFFN(nn.Module):
 
         gate, up = (h_in + delta).chunk(2, dim=-1)
         return self.w_down(F.silu(gate) * up)
+
+    def _accumulate_router_stats(
+        self, weights: torch.Tensor, dense_logits: torch.Tensor
+    ) -> None:
+        """Fold this call's load-balancing statistics into the accumulators.
+
+        ``weights`` is the post-softmax routing distribution ``[B, L, K]`` (already
+        top-k-masked when ``top_k>0``); ``dense_logits`` is the pre-mask router
+        logits ``[B, L, K]`` for the z-loss. Statistics cover every position
+        (padding included): the FFN gets no attention mask and the pad fraction is
+        small, so -- as in the reference Switch/GShard implementations -- padding
+        is not excluded; this keeps the forward signature untouched.
+        """
+
+        n_tokens = weights.shape[0] * weights.shape[1]
+        if n_tokens == 0:
+            return
+
+        flat = weights.reshape(n_tokens, self.n_experts)
+
+        # P_i: mean router probability per expert.
+        prob_mean = flat.mean(dim=0)  # [K]
+
+        # f_i: fraction of tokens that *select* expert i. Dense routing selects
+        # the argmax; top-k selects the k experts with nonzero weight. One-hot /
+        # k-hot is detached -- the discrete assignment carries no gradient, the
+        # aux gradient flows only through P_i (the standard Switch formulation).
+        if 0 < self.top_k < self.n_experts:
+            select = (flat > 0).to(flat.dtype)  # k-hot membership
+            denom = float(self.top_k)
+        else:
+            top1 = flat.argmax(dim=-1)
+            select = F.one_hot(top1, self.n_experts).to(flat.dtype)
+            denom = 1.0
+        # Normalise so sum_i f_i == 1 (k-hot rows each contribute k selections).
+        load_frac = select.mean(dim=0) / denom  # [K], detached below
+
+        aux = self.n_experts * torch.sum(load_frac.detach() * prob_mean)
+
+        # z-loss: mean over tokens of logsumexp(logits)^2.
+        z = torch.logsumexp(dense_logits.reshape(n_tokens, self.n_experts), dim=-1)
+        z_loss = torch.mean(z * z)
+
+        if self._aux_loss is None:
+            self._aux_loss = aux
+            self._z_loss = z_loss
+        else:
+            self._aux_loss = self._aux_loss + aux
+            self._z_loss = self._z_loss + z_loss
+        self._router_calls += 1
+
+    def router_losses(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Mean aux / z load-balancing loss over the calls since the last reset.
+
+        Returns ``(aux, z)`` averaged across the recurrent loop's repeated calls,
+        or ``None`` if no routing happened (so the model contributes nothing).
+        """
+
+        if self._aux_loss is None or self._router_calls == 0:
+            return None
+        scale = 1.0 / self._router_calls
+        return self._aux_loss * scale, self._z_loss * scale
 
 
 def _check() -> None:

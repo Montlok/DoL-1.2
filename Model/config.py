@@ -234,6 +234,18 @@ class RDTConfig:
     mol_top_k: int = 0  # 0 => dense softmax over all experts (v1 default)
     mol_step_aware: bool = True
 
+    # MoL v2 load balancing. Dense softmax lets every token draw a similar convex
+    # mix of all experts, so the experts never specialise; a Switch/GShard load-
+    # balancing aux loss (arXiv:2101.03961) pushes routing toward uniform expert
+    # usage so the pool actually divides the token space. mol_aux_weight scales
+    # that term; mol_z_weight scales an optional router z-loss (ST-MoE
+    # arXiv:2202.08906) that keeps the router logits from drifting large. Both
+    # are pure extra training-loss terms -- they never touch the main logits, so
+    # cold start (lora_b=0) stays bit-identical to plain SwiGLU. Set to 0 to
+    # disable (mol_z_weight defaults off). Only active when use_mol=True.
+    mol_aux_weight: float = 0.01
+    mol_z_weight: float = 0.0
+
     # Depth (MoR, arXiv:2507.10524): upgrade the ACT scalar halt to be
     # step-aware via a per-step bias on the halt logit, so token-level dynamic
     # depth becomes routed (the stopping decision depends on which recurrent
@@ -482,6 +494,10 @@ class RDTConfig:
                 raise ValueError("mol_router_temp must be positive")
             if not (0 <= self.mol_top_k <= self.mol_experts):
                 raise ValueError("mol_top_k must be in [0, mol_experts]")
+            if self.mol_aux_weight < 0:
+                raise ValueError("mol_aux_weight must be non-negative")
+            if self.mol_z_weight < 0:
+                raise ValueError("mol_z_weight must be non-negative")
 
         if self.use_mor and not self.use_act:
             raise ValueError(
