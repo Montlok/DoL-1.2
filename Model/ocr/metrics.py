@@ -9,15 +9,28 @@ space (NNBSP, U+202F) and positional/presentation variants. Comparing raw
 code points therefore conflates genuine recognition errors with harmless
 encoding/rendering differences.
 
-We report two character error rates:
+A second, independent measurement problem is that a single character can be a
+base letter plus one or more Unicode combining marks; comparing Python
+code points then charges a single missed/extra mark as an error on top of
+whatever else differs at that position, over-counting relative to what a
+human reader perceives as one mistake.
 
-- **normalized CER** (primary): both prediction and reference are first folded to
+We report three character error rates:
+
+- **grapheme CER** (headline, ``OCRReport.grapheme_cer``): both sides are
+  clustered into user-perceived graphemes (see :func:`grapheme_clusters`) on
+  the RAW (unfolded) text, then compared. This is the number that best
+  matches "how many visual mistakes did the model make" — it still counts
+  genuine rendering-variant differences (unlike normalized CER below) but
+  does not fragment one combining-mark miss into several code-point errors
+  (unlike raw CER below).
+- **normalized CER**: both prediction and reference are first folded to
   nominal Mongolian Unicode, then compared. Folding prefers the repository's Rust
   normalizer (``normalize_to_nominal_unicode`` via
   :mod:`Tokenizer.tools.normalize_mongolian`); when ``cargo`` is unavailable it
   falls back to a light Python folding that strips FVS/MVS/joiners. This keeps the
   metric meaningful (no rendering-noise penalty) without a hard Rust dependency.
-- **raw CER** (secondary): compares the unmodified code points, exposing the true
+- **raw CER**: compares the unmodified code points, exposing the true
   encoding gap.
 
 Plus word accuracy (WER over whitespace tokens) and an exact line-match rate.
@@ -28,6 +41,7 @@ a model.
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -40,6 +54,51 @@ _BOM = {0xFEFF, 0xFFFE}
 _NNBSP = 0x202F  # narrow no-break space -> regular space
 
 _FALLBACK_DELETE = _FVS | _MVS | _JOINERS | _BOM
+
+# Categories that attach to the preceding base character as combining marks:
+# nonspacing (Mn), spacing-combining (Mc), enclosing (Me). FVS is deliberately
+# checked as an explicit code-point set rather than relying on its Unicode
+# category: FVS4 (U+180F) was only formally assigned category Mn in a later
+# Unicode revision, and depending on the Python interpreter's bundled
+# `unicodedata` version it can report as Cn (unassigned) instead. Grapheme
+# clustering must not silently split FVS4 off as its own grapheme just
+# because an older Unicode database has not caught up — that would make the
+# metric's behavior depend on the interpreter it happens to run under.
+_COMBINING_CATEGORIES = ("Mn", "Mc", "Me")
+
+
+def grapheme_clusters(text: str) -> list[str]:
+    """Split ``text`` into user-perceived grapheme clusters (Mongolian-scoped).
+
+    A cluster is a base character followed by any run of trailing combining
+    marks: characters in ``_FVS`` (explicit set, see above) or characters
+    whose ``unicodedata.category`` is one of Mn/Mc/Me. Everything else starts
+    a new cluster.
+
+    MVS (U+180E, category Cf — format control) and NNBSP (U+202F, category
+    Zs — space separator) are deliberately treated as their own standalone
+    clusters, not attached to a neighbor: both are morpheme/word boundary
+    markers in Mongolian text, not decorations on the character next to them,
+    so an OCR miss on either is exactly one grapheme error — not zero (if it
+    silently attached) and not conflated with the neighboring letter.
+
+    This is intentionally *not* a full UAX #29 extended-grapheme-cluster
+    implementation: no emoji ZWJ-sequence handling, no Hangul jamo
+    composition, no regional-indicator pairing. Traditional Mongolian OCR
+    output does not produce those sequences, so the narrower FVS/Mn/Mc/Me
+    rule above covers what this corpus actually needs without pulling in a
+    dependency or a large exception table.
+    """
+    clusters: list[str] = []
+    for ch in text:
+        attaches = clusters and (
+            ord(ch) in _FVS or unicodedata.category(ch) in _COMBINING_CATEGORIES
+        )
+        if attaches:
+            clusters[-1] += ch
+        else:
+            clusters.append(ch)
+    return clusters
 
 
 def _python_fold(text: str) -> str:
@@ -182,11 +241,24 @@ def cer(
     *,
     normalize: bool = True,
     backend: str = "auto",
+    unit: str = "codepoint",
 ) -> float:
     """Corpus character error rate. When ``normalize`` is true, both sides are
-    folded to nominal Unicode first (the primary, render-robust metric)."""
+    folded to nominal Unicode first (the primary, render-robust metric).
+
+    ``unit``: ``"codepoint"`` (default) compares raw Python characters.
+    ``"grapheme"`` clusters each side with :func:`grapheme_clusters` *after*
+    the optional fold and compares clusters instead — a missed/extra
+    combining mark then counts as one error, not one error per constituent
+    code point. Any other value raises ``ValueError``.
+    """
+    if unit not in ("codepoint", "grapheme"):
+        raise ValueError(f"unknown unit {unit!r}; expected 'codepoint' or 'grapheme'")
     if normalize:
         preds, refs, _ = _fold_pair(preds, refs, backend=backend)
+    if unit == "grapheme":
+        preds = [grapheme_clusters(p) for p in preds]
+        refs = [grapheme_clusters(r) for r in refs]
     rate, _, _ = _corpus_rate(preds, refs)
     return rate
 
@@ -210,6 +282,7 @@ class OCRReport:
     n: int
     norm_cer: float
     raw_cer: float
+    grapheme_cer: float
     wer: float
     line_exact: float
     rejection_rate: float
@@ -252,6 +325,14 @@ def ocr_report(
 
     norm_cer, _, _ = _corpus_rate(norm_p, norm_r)
     raw_cer, _, _ = _corpus_rate(kp, kr)
+    # Grapheme CER is the OCR headline number: clustered on the RAW (unfolded)
+    # text, so it reflects what the model actually emitted (rendering-variant
+    # differences still count, unlike norm_cer) while still not double-charging
+    # a single missed combining mark as multiple code-point errors (unlike
+    # raw_cer).
+    grapheme_p = [grapheme_clusters(p) for p in kp]
+    grapheme_r = [grapheme_clusters(r) for r in kr]
+    grapheme_cer_rate, _, _ = _corpus_rate(grapheme_p, grapheme_r)
     wer_rate, _, _ = _corpus_rate(
         [p.split() for p in norm_p], [r.split() for r in norm_r]
     )
@@ -262,6 +343,7 @@ def ocr_report(
         n=len(keep),
         norm_cer=norm_cer,
         raw_cer=raw_cer,
+        grapheme_cer=grapheme_cer_rate,
         wer=wer_rate,
         line_exact=line_exact,
         rejection_rate=rejection_rate,
@@ -273,6 +355,7 @@ __all__ = [
     "OCRReport",
     "cer",
     "edit_distance",
+    "grapheme_clusters",
     "nominal_normalize",
     "ocr_report",
     "wer",

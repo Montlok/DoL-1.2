@@ -7,14 +7,16 @@ import unittest
 from Model.ocr.metrics import (
     cer,
     edit_distance,
+    grapheme_clusters,
     nominal_normalize,
     ocr_report,
     wer,
 )
 
-# Free variation selector and Mongolian vowel separator — pure encoding
+# Free variation selectors and Mongolian vowel separator — pure encoding
 # variation that normalized CER must ignore.
 FVS1 = "\u180b"
+FVS4 = "\u180f"
 MVS = "\u180e"
 NNBSP = "\u202f"
 # A short traditional-Mongolian letter run (nominal code points).
@@ -87,6 +89,55 @@ class TestCER(unittest.TestCase):
         ref = ["a\nb"]
         self.assertAlmostEqual(cer(pred, ref, backend="auto"), 0.0)
 
+    def test_grapheme_unit_differs_from_codepoint_unit(self):
+        # pred is missing the FVS1 that ref carries. Under codepoint units
+        # that is 1 substitution-equivalent edit over a 2-codepoint ref ->
+        # 0.5. Under grapheme units the ref clusters to a single grapheme
+        # (base + FVS1), so the whole thing is 1 edit over a 1-grapheme ref
+        # -> 1.0. This is the core grapheme-vs-codepoint distinction.
+        pred = [MONG[0]]
+        ref = [MONG[0] + FVS1]
+        self.assertAlmostEqual(cer(pred, ref, normalize=False), 0.5)
+        self.assertAlmostEqual(
+            cer(pred, ref, normalize=False, unit="grapheme"), 1.0
+        )
+
+    def test_unknown_unit_raises(self):
+        with self.assertRaises(ValueError):
+            cer(["a"], ["a"], unit="bogus")
+
+
+class TestGraphemeClusters(unittest.TestCase):
+    def test_fvs1_attaches_to_base(self):
+        self.assertEqual(grapheme_clusters(MONG[0] + FVS1), [MONG[0] + FVS1])
+
+    def test_fvs4_attaches_regardless_of_unicodedata_category(self):
+        # FVS4 (U+180F) must attach whether or not the running interpreter's
+        # unicodedata reports it as category Mn (see the _FVS comment in
+        # Model/ocr/metrics.py): the explicit code-point set is load-bearing.
+        self.assertEqual(grapheme_clusters(MONG[0] + FVS4), [MONG[0] + FVS4])
+
+    def test_mvs_and_nnbsp_are_standalone_clusters(self):
+        self.assertEqual(
+            grapheme_clusters(MONG[0] + MVS + MONG[0]),
+            [MONG[0], MVS, MONG[0]],
+        )
+        self.assertEqual(
+            grapheme_clusters(MONG[0] + NNBSP + MONG[0]),
+            [MONG[0], NNBSP, MONG[0]],
+        )
+
+    def test_combining_acute_forms_one_cluster(self):
+        # "e" + COMBINING ACUTE ACCENT (U+0301) is the decomposed form of "é".
+        self.assertEqual(grapheme_clusters("é"), ["é"])
+
+    def test_leading_combining_mark_is_its_own_cluster(self):
+        # No preceding base character to attach to.
+        self.assertEqual(grapheme_clusters("́a"), ["́", "a"])
+
+    def test_empty_text_yields_no_clusters(self):
+        self.assertEqual(grapheme_clusters(""), [])
+
 
 class TestWER(unittest.TestCase):
     def test_word_error(self):
@@ -122,6 +173,18 @@ class TestOCRReport(unittest.TestCase):
         # ref length 3+3=6, total dist 1 -> 1/6.
         self.assertAlmostEqual(rep.norm_cer, 1 / 6)
         self.assertGreaterEqual(rep.raw_cer, rep.norm_cer)
+
+    def test_grapheme_cer_matches_cer_grapheme_unit_on_raw_text(self):
+        # grapheme_cer is computed on the RAW (unfolded) kept texts, so it
+        # must equal cer(..., normalize=False, unit="grapheme") on the same
+        # pairs -- not the normalized/folded pairs.
+        preds = [MONG[0], "abc"]
+        refs = [MONG[0] + FVS1, "abd"]
+        rep = ocr_report(preds, refs, backend="python")
+        self.assertAlmostEqual(
+            rep.grapheme_cer,
+            cer(preds, refs, normalize=False, unit="grapheme"),
+        )
 
 
 if __name__ == "__main__":
