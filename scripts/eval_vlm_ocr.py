@@ -306,7 +306,8 @@ def main(argv=None) -> int:
     refs = [decode(ids) for ids in refs_ids]
     rep = ocr_report(preds, refs)
     print(
-        f"[eval] n={rep.n} norm_cer={rep.norm_cer:.4f} raw_cer={rep.raw_cer:.4f} "
+        f"[eval] n={rep.n} grapheme_cer={rep.grapheme_cer:.4f} "
+        f"norm_cer={rep.norm_cer:.4f} raw_cer={rep.raw_cer:.4f} "
         f"wer={rep.wer:.4f} line_exact={rep.line_exact:.4f}"
     )
 
@@ -322,7 +323,8 @@ def main(argv=None) -> int:
         )]
         rep_blank = ocr_report(preds_blank, refs)
         print(
-            f"[eval/blank] n={rep_blank.n} norm_cer={rep_blank.norm_cer:.4f} "
+            f"[eval/blank] n={rep_blank.n} grapheme_cer={rep_blank.grapheme_cer:.4f} "
+            f"norm_cer={rep_blank.norm_cer:.4f} "
             f"raw_cer={rep_blank.raw_cer:.4f} wer={rep_blank.wer:.4f}"
         )
         print(
